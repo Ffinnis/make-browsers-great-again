@@ -62,7 +62,7 @@ test of the mechanics.
 
 ```sh
 bench/trials.py --scenario battery-busy defaults 60hz defaults 60hz
-bench/trials.py --scenario speedometer defaults no-low-end-mode
+bench/trials.py --scenario speedometer defaults no-optimize-for-size
 ```
 
 A trial passes extra switches through `MBGA_ENGINE_SWITCHES` (feature lists
@@ -109,7 +109,7 @@ Kept as defaults:
 | Purge renderers when backgrounded or when a page freezes (`MemoryPurgeInBackground`, `MemoryPurgeOnFreeze`) | About −3% to −6%, larger over time. |
 | Freezing hidden Today tabs (DevTools `Page.setWebLifecycleState`) | About −2.5% memory, stops background growth, cuts idle CPU. |
 | Release off-screen tiles when idle (`ReclaimPrepaintTilesWhenIdle`, `ReclaimOldPrepaintTiles`) | About −2%. |
-| Low-end device mode, V8 `--optimize-for-size`, no prerendering, no spare renderer | Individually within noise, together a few percent. |
+| V8 `--optimize-for-size`, no prerendering, no spare renderer | Individually within noise, together a few percent. |
 
 Measured and rejected:
 
@@ -121,6 +121,7 @@ Measured and rejected:
 | V8 `--memory-saver-mode` | No effect. |
 | V8 `--max-semi-space-size=1` | Within noise, costs CPU on allocation-heavy pages. |
 | Disabling Media Router, Translate, phishing detection, sync | No effect. |
+| Low-end device mode | Within noise, and it tells every process the Mac has 512 MB of RAM: a renderer's JavaScript heap stops at ~270 MB, so heavy sites froze and crashed. |
 
 A simulated critical memory-pressure signal freed only ~35 MB, all of it in
 the network service: what remains is live page data (JavaScript heaps and

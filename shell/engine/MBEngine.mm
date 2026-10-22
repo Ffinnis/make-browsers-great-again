@@ -506,7 +506,7 @@ bool IsReservedShortcut(NSEvent* event) {
   return false;
 }
 
-// MBGA_ENGINE_OMIT="enable-low-end-device-mode Prerender2" drops built-in
+// MBGA_ENGINE_OMIT="js-flags Prerender2" drops built-in
 // defaults by switch or feature name, for measuring what each one costs.
 bool Omitted(const std::string& name) {
   static const std::set<std::string> omitted = [] {
@@ -639,8 +639,11 @@ class BrowserApp : public CefApp {
     AppendToListSwitch(command_line, "disable-features",
                        "SpareRendererForSitePerProcess,OptimizationHints,"
                        "AudioServiceOutOfProcess,Prerender2");
-    // Smaller caches and heap budgets throughout Blink and V8.
-    AppendDefaultSwitch(command_line, "enable-low-end-device-mode");
+    // V8 favours smaller code and heaps over peak speed. Low-end device mode
+    // is not used: it makes every process believe the Mac has 512 MB of RAM,
+    // which caps a renderer's JavaScript heap at ~270 MB. All tabs sharing a
+    // renderer share that heap, so heavy sites stalled in garbage collection
+    // and then crashed with "out of memory", freezing every tab beside them.
     AppendDefaultSwitch(command_line, "js-flags", "--optimize-for-size");
 
     if (g_pipe_write >= 0) {
