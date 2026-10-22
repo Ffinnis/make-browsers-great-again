@@ -13,12 +13,9 @@ path = "src/bin/uniffi-bindgen.rs"
 required-features = ["bindgen"]
 
 [dependencies]
-# Without "single-thread" the engine can be shared with the network thread.
-# "resource-assembler" reads uBlock Origin's scriptlets.
 adblock = { version = "0.13.3", default-features = false, features = ["embedded-domain-resolver", "full-regex-handling", "resource-assembler"] }
 base64 = "0.22.1"
 plist = "1.10.2"
-# Tells which hosts belong to one site, for offering passwords.
 psl = "2.1.244"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,7 +31,6 @@ lto = true
 codegen-units = 1
 opt-level = 3
 
-# scripts/check.sh runs clippy with -D warnings, so every lint here fails it.
 [lints.rust]
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
@@ -42,16 +38,13 @@ unused_qualifications = "warn"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# UniFFI hands exported functions owned values.
 needless_pass_by_value = "allow"
 must_use_candidate = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
-# Colors read best as 0xRRGGBB, and UniFFI records carry plain flags.
 unreadable_literal = "allow"
 struct_excessive_bools = "allow"
-# Not left behind in shipped code.
 dbg_macro = "warn"
 todo = "warn"
 unimplemented = "warn"

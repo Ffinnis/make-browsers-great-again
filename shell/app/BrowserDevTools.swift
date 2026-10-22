@@ -1,14 +1,9 @@
 import Foundation
 
-/// The engine's browser-wide DevTools connection, over the pipe main.swift
-/// claims at launch: it reaches every target (extensions' service workers
-/// too), where a tab's own connection reaches only its page. No port is
-/// opened.
 @MainActor
 final class BrowserDevTools {
     typealias Reply = (_ result: [String: Any]?, _ error: String?) -> Void
 
-    /// Events (method, params, session id or nil for the browser's own).
     var onEvent: ((String, [String: Any], String?) -> Void)?
     let available: Bool
     private var nextID = 0

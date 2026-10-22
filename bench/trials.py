@@ -25,13 +25,11 @@ import speed
 from browsers import MBGA
 from common import HERE, WORK, build_tools, log
 
-# BENCH_LATE=180 also samples memory 180 s after the last tab opened.
 LATE = int(os.environ.get("BENCH_LATE", "0"))
 
 TRIALS = {
     "defaults": "",
     "strict-isolation": "--site-per-process",
-    # Power: candidates found in the engine's feature list.
     "60hz": "--enable-features=ThrottleMainFrameTo60Hz",
     "unimportant-frames": "--enable-features=ThrottleUnimportantFrameTimers,ThrottleUnimportantFrameRate",
     "unimportant-frames-250ms": (
@@ -49,7 +47,6 @@ TRIALS = {
     ),
     "intensive-throttling-60s": "--enable-features=IntensiveWakeUpThrottling:grace_period_seconds/60",
     "invisible-svg": "--enable-features=InvisibleSVGAnimationThrottling",
-    # Speed: what the memory defaults cost.
     "no-optimize-for-size": "-js-flags",
     "low-end-mode": "--enable-low-end-device-mode",
 }

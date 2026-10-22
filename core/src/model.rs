@@ -1,8 +1,3 @@
-//! Browser state: profiles, spaces, favorites, pinned trees and today tabs.
-//!
-//! Everything here is plain data plus the operations the shell performs on it.
-//! The FFI layer in `lib.rs` wraps a `State` in a mutex and exposes it to Swift.
-
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -24,31 +19,23 @@ pub struct Tab {
     pub title: String,
     #[serde(default)]
     pub favicon: Option<String>,
-    /// The URL a pinned tab or favorite returns to when it is closed.
     #[serde(default)]
     pub pinned_url: Option<String>,
     #[serde(default)]
     pub last_active_ms: u64,
-    /// The person chose to keep this tab loaded: it is never put to sleep,
-    /// frozen or archived, and loads at launch.
     #[serde(default)]
     pub always_awake: bool,
-    /// A web view currently exists for this tab. Never persisted: every tab
-    /// starts asleep and is loaded on first activation.
     #[serde(skip)]
     pub live: bool,
     #[serde(skip)]
     pub audible: bool,
     #[serde(skip)]
     pub frozen: bool,
-    /// When its web view was last made. A tab loaded ahead of being shown
-    /// (warmed) isn't put back to sleep or frozen as idle right away.
     #[serde(skip)]
     pub woke_ms: u64,
 }
 
 impl Tab {
-    /// When it was last shown or loaded, whichever is later.
     fn last_used_ms(&self) -> u64 {
         self.last_active_ms.max(self.woke_ms)
     }
@@ -74,11 +61,9 @@ pub struct Space {
     pub id: Id,
     pub name: String,
     pub icon: String,
-    /// 0xRRGGBB.
     pub color: u32,
     pub profile_id: Id,
     pub pinned: Vec<Node>,
-    /// Newest first, like Arc.
     pub today: Vec<Id>,
     pub active_tab: Option<Id>,
 }
@@ -86,30 +71,15 @@ pub struct Space {
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 #[serde(default)]
 pub struct Policy {
-    /// Background tabs idle for longer than this are put to sleep. 0 never
-    /// puts them to sleep for being idle (memory pressure still does).
     pub sleep_after_secs: u64,
-    /// Upper bound on simultaneously loaded tabs (the visible tab excluded).
-    /// 0 is no limit (memory pressure still applies one).
     pub max_live_tabs: u32,
-    /// Hidden Today tabs idle for longer than this are frozen: they keep
-    /// their state but run no JavaScript until shown again.
     pub freeze_after_secs: u64,
-    /// One renderer process per site, as in desktop Chrome. Off by default:
-    /// sites share a few processes and only sign-in pages and sites that ask
-    /// for it (COOP) get their own, as in Chrome on Android. Applies at launch.
     pub strict_site_isolation: bool,
-    /// Today tabs untouched for this long are archived (closed, and
-    /// restorable for the session). 0 turns it off, the default until the
-    /// person chooses otherwise.
     pub archive_after_hours: u32,
 }
 
 impl Default for Policy {
     fn default() -> Self {
-        // Tabs stay loaded for hours, as in Edge (2 h) and Chrome, rather
-        // than reloading whenever you come back after a short break; memory
-        // pressure still puts them to sleep sooner.
         Policy {
             sleep_after_secs: 2 * 60 * 60,
             max_live_tabs: 24,
@@ -121,9 +91,6 @@ impl Default for Policy {
 }
 
 impl Policy {
-    /// States saved with the first defaults (10 minutes, 8 tabs, frozen
-    /// after a minute) get the current ones. Nothing let people choose
-    /// those values.
     pub fn upgrade_first_defaults(&mut self) {
         if (self.sleep_after_secs, self.max_live_tabs, self.freeze_after_secs) == (600, 8, 60) {
             let current = Policy::default();
@@ -134,8 +101,6 @@ impl Policy {
     }
 }
 
-/// Sign-in origins that keep a dedicated process when strict site isolation
-/// is off, so credentials never share a process with other sites.
 pub const ALWAYS_ISOLATED_ORIGINS: [&str; 8] = [
     "https://accounts.google.com",
     "https://login.microsoftonline.com",
@@ -147,25 +112,19 @@ pub const ALWAYS_ISOLATED_ORIGINS: [&str; 8] = [
     "https://www.paypal.com",
 ];
 
-/// Something closed that can be brought back: a Today tab, a cleared Today
-/// list or a deleted folder. Kept for the session only.
 #[derive(Clone, Debug)]
 pub struct Closed {
     pub space_id: Id,
     pub kind: ClosedKind,
-    /// The closed tabs, in sidebar order.
     pub tabs: Vec<Tab>,
 }
 
 #[derive(Clone, Debug)]
 pub enum ClosedKind {
-    /// Today tabs, with the position each had.
     Today { indices: Vec<usize> },
-    /// A pinned folder with its contents, and where it was.
     Folder { node: Node, parent: Option<Id>, index: usize },
 }
 
-/// Most closing actions that can be undone.
 pub const MAX_CLOSED: usize = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,8 +141,6 @@ pub enum Section {
     Today,
 }
 
-/// Where a tab or folder lives. Favorites belong to a profile and are shared
-/// by every space using it; pinned and today tabs belong to one space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Container {
     Favorites { profile_id: Id },
@@ -196,7 +153,6 @@ pub struct State {
     pub version: u32,
     pub next_id: Id,
     pub profiles: Vec<Profile>,
-    /// Keyed by profile id.
     pub favorites: HashMap<Id, Vec<Id>>,
     pub spaces: Vec<Space>,
     pub tabs: HashMap<Id, Tab>,
@@ -205,32 +161,20 @@ pub struct State {
     pub policy: Policy,
     #[serde(default = "default_search_template")]
     pub search_template: String,
-    /// Profiles deleted while their storage may still be in use. Their
-    /// directories are removed on the next launch, before the engine starts.
     #[serde(default)]
     pub doomed_profiles: Vec<Id>,
-    /// False until the first-launch onboarding has been shown. State files
-    /// from before onboarding existed count as onboarded.
     #[serde(default = "default_onboarded")]
     pub onboarded: bool,
-    /// Sites (see `site_of`) whose tabs are never put to sleep or frozen,
-    /// such as mail or chat that must keep delivering notifications.
     #[serde(default)]
     pub keep_awake: Vec<String>,
-    /// The person has answered the offer to tidy up old Today tabs.
     #[serde(default)]
     pub cleanup_answered: bool,
-    /// Block ads and trackers.
     #[serde(default = "default_block_ads")]
     pub block_ads: bool,
-    /// Sites (see `site_of`) where ads and trackers are allowed.
     #[serde(default)]
     pub ads_allowed: Vec<String>,
-    /// Closed tabs and folders that can be reopened, newest last.
     #[serde(skip)]
     pub closed: Vec<Closed>,
-    /// Tabs on screen outside the main window (little windows). Like the
-    /// visible tab, they are never put to sleep or frozen.
     #[serde(skip)]
     pub shown_elsewhere: Vec<Id>,
 }
@@ -282,8 +226,6 @@ impl State {
         id
     }
 
-    // ---------------------------------------------------------------- lookups
-
     pub fn space(&self, id: Id) -> Option<&Space> {
         self.spaces.iter().find(|s| s.id == id)
     }
@@ -309,7 +251,6 @@ impl State {
         None
     }
 
-    /// The profile whose storage a tab must be loaded with.
     pub fn profile_of_tab(&self, id: Id) -> Option<Id> {
         match self.locate(id)? {
             Container::Favorites { profile_id } => Some(profile_id),
@@ -319,12 +260,9 @@ impl State {
         }
     }
 
-    /// The tab currently on screen.
     pub fn visible_tab(&self) -> Option<Id> {
         self.space(self.active_space).and_then(|s| s.active_tab)
     }
-
-    // --------------------------------------------------------------- profiles
 
     pub fn create_profile(&mut self, name: &str) -> Id {
         let id = self.alloc();
@@ -339,8 +277,6 @@ impl State {
         }
     }
 
-    /// Deletes a profile no space uses any more. Returns the favorites that
-    /// were closed with it.
     pub fn delete_profile(&mut self, id: Id) -> Option<Vec<Id>> {
         if self.profiles.len() <= 1 || self.spaces.iter().any(|s| s.profile_id == id) {
             return None;
@@ -353,8 +289,6 @@ impl State {
         self.doomed_profiles.push(id);
         Some(closed)
     }
-
-    // ----------------------------------------------------------------- spaces
 
     pub fn create_space(&mut self, name: &str, icon: &str, color: u32, profile_id: Id) -> Id {
         let profile_id =
@@ -381,8 +315,6 @@ impl State {
         }
     }
 
-    /// Switches the storage a space uses. Its tabs must be reloaded with the
-    /// new profile, so they are put to sleep and returned.
     pub fn set_space_profile(&mut self, id: Id, profile_id: Id) -> Vec<Id> {
         if !self.profiles.iter().any(|p| p.id == profile_id) {
             return Vec::new();
@@ -394,7 +326,6 @@ impl State {
             return Vec::new();
         }
         space.profile_id = profile_id;
-        // Favorites belong to the old profile and disappear from this space.
         if let Some(active) = space.active_tab {
             if !space.today.contains(&active) && find_parent(&space.pinned, active, None).is_none() {
                 space.active_tab = None;
@@ -411,7 +342,6 @@ impl State {
         ids
     }
 
-    /// Deletes a space and every tab it owns. Returns the closed tabs.
     pub fn delete_space(&mut self, id: Id) -> Option<Vec<Id>> {
         if self.spaces.len() <= 1 {
             return None;
@@ -452,8 +382,6 @@ impl State {
         }
     }
 
-    // ------------------------------------------------------------------- tabs
-
     pub fn open_tab(&mut self, space_id: Id, url: &str, activate: bool, now: u64) -> Option<Id> {
         self.space(space_id)?;
         let id = self.alloc();
@@ -480,8 +408,6 @@ impl State {
         Some(id)
     }
 
-    /// Makes `tab_id` the selected tab of `space_id`. Favorites are shared, so
-    /// the space has to be passed explicitly.
     pub fn activate_tab(&mut self, space_id: Id, tab_id: Id, now: u64) {
         if !self.tabs.contains_key(&tab_id) || self.space(space_id).is_none() {
             return;
@@ -506,9 +432,6 @@ impl State {
         }
     }
 
-    /// Closes a tab the way Arc does: today tabs are removed, pinned tabs and
-    /// favorites are put to sleep and reset to their pinned URL.
-    /// Returns (tab was removed, tab to select next in the visible space).
     pub fn close_tab(&mut self, id: Id, now: u64) -> (bool, Option<Id>) {
         let Some(container) = self.locate(id) else {
             return (false, None);
@@ -547,8 +470,6 @@ impl State {
         (removed, next_visible)
     }
 
-    /// Arc moves to the tab below a closed today tab, then the one above;
-    /// for pinned tabs it returns to the most recently used tab.
     fn next_after_close(&self, id: Id, container: Container, _now: u64) -> Option<Id> {
         let space = self.space(self.active_space)?;
         if space.active_tab != Some(id) {
@@ -576,7 +497,6 @@ impl State {
             .map(|t| t.id)
     }
 
-    /// Archives every today tab of a space ("Clear" in Arc).
     pub fn clear_today(&mut self, space_id: Id) -> Vec<Id> {
         let Some(space) = self.space_mut(space_id) else {
             return Vec::new();
@@ -598,8 +518,6 @@ impl State {
             t.favicon = Some(path.to_string());
         }
     }
-
-    // ---------------------------------------------------------------- folders
 
     pub fn create_folder(&mut self, space_id: Id, name: &str, parent: Option<Id>) -> Option<Id> {
         self.space(space_id)?;
@@ -632,7 +550,6 @@ impl State {
         }
     }
 
-    /// Deletes a folder together with its contents. Returns the closed tabs.
     pub fn delete_folder(&mut self, id: Id) -> Vec<Id> {
         let mut closed = Vec::new();
         let mut removed = None;
@@ -653,8 +570,6 @@ impl State {
         closed
     }
 
-    // ------------------------------------------------------------ reopening
-
     fn remember(&mut self, closed: Closed) {
         self.closed.push(closed);
         if self.closed.len() > MAX_CLOSED {
@@ -662,13 +577,10 @@ impl State {
         }
     }
 
-    /// Closed tabs that can be reopened, most recently closed first.
     pub fn closed_tabs(&self) -> impl Iterator<Item = &Tab> {
         self.closed.iter().rev().flat_map(|c| c.tabs.iter())
     }
 
-    /// Undoes the most recent close, clear or folder deletion. Returns the
-    /// space and the tabs brought back, asleep.
     pub fn reopen_last(&mut self) -> Option<(Id, Vec<Id>)> {
         let closed = self.closed.pop()?;
         let space_id = if self.space(closed.space_id).is_some() { closed.space_id } else { self.active_space };
@@ -699,8 +611,6 @@ impl State {
         Some((space_id, ids))
     }
 
-    /// Reopens one closed tab at the top of its space's Today list.
-    /// Returns its space.
     pub fn reopen_tab(&mut self, id: Id) -> Option<Id> {
         let entry = self.closed.iter().position(|c| c.tabs.iter().any(|t| t.id == id))?;
         let closed = &mut self.closed[entry];
@@ -730,10 +640,6 @@ impl State {
         Some(space_id)
     }
 
-    /// Selects a tab in a space that has tabs but none selected (after an
-    /// import, say): the most recently used, ties going to sidebar order
-    /// (Today, then pinned). Favorites are shared between spaces, so a space
-    /// with only those stays empty. Returns the tab if one was chosen.
     pub fn select_default_tab(&mut self, space_id: Id, now: u64) -> Option<Id> {
         let space = self.space(space_id)?;
         if space.active_tab.is_some_and(|t| self.tabs.contains_key(&t)) {
@@ -752,8 +658,6 @@ impl State {
         Some(id)
     }
 
-    /// Moves the main window off `id` (popped out into its own window) to
-    /// the tab Arc would show after closing it. Returns that tab.
     pub fn step_away(&mut self, id: Id, now: u64) -> Option<Id> {
         let container = self.locate(id)?;
         let space = self.space(self.active_space)?;
@@ -768,10 +672,6 @@ impl State {
         next
     }
 
-    // -------------------------------------------------------------- tidying
-
-    /// Today tabs of a space untouched for at least `hours`, except the
-    /// visible tab, tabs playing sound and sites kept awake.
     pub fn idle_today(&self, space_id: Id, hours: u32, now: u64) -> Vec<Id> {
         let visible = self.visible_tab();
         let after_ms = u64::from(hours) * 3_600_000;
@@ -789,7 +689,6 @@ impl State {
             .collect()
     }
 
-    /// Archives idle Today tabs of a space as one undoable step. Returns them.
     pub fn archive_idle(&mut self, space_id: Id, hours: u32, now: u64) -> Vec<Id> {
         let idle = self.idle_today(space_id, hours, now);
         if idle.is_empty() {
@@ -811,7 +710,6 @@ impl State {
         idle
     }
 
-    /// Applies the archive policy to every space. Returns the archived tabs.
     pub fn archive_by_policy(&mut self, now: u64) -> Vec<Id> {
         let hours = self.policy.archive_after_hours;
         if hours == 0 {
@@ -821,11 +719,6 @@ impl State {
         spaces.into_iter().flat_map(|s| self.archive_idle(s, hours, now)).collect()
     }
 
-    // ------------------------------------------------------------ drag & drop
-
-    /// Moves a tab or folder. `index` is the drop position in the target list
-    /// as seen before the item was removed (what list drop delegates report).
-    /// Returns the tabs that must be reloaded because they changed profile.
     pub fn move_item(&mut self, id: Id, target: Container, index: usize) -> Option<Vec<Id>> {
         let source = self.locate(id)?;
         let is_folder = !self.tabs.contains_key(&id);
@@ -835,7 +728,6 @@ impl State {
         let source_profile = self.container_profile(source)?;
         let target_profile = self.container_profile(target)?;
         if let Container::Pinned { space_id, folder_id: Some(folder) } = target {
-            // The target folder must exist and must not be inside the item.
             let space = self.space(space_id)?;
             let moved = find_node(&space.pinned, id);
             find_node(&space.pinned, folder)?;
@@ -881,7 +773,6 @@ impl State {
             }
         }
 
-        // A tab leaving a space must not stay selected there.
         let target_space = match target {
             Container::Pinned { space_id, .. } | Container::Today { space_id } => Some(space_id),
             Container::Favorites { .. } => None,
@@ -941,11 +832,8 @@ impl State {
         }
     }
 
-    // -------------------------------------------------------------- lifecycle
-
     pub fn set_live(&mut self, id: Id, live: bool, now: u64) {
         if let Some(t) = self.tabs.get_mut(&id) {
-            // A new or destroyed web view is never frozen.
             t.live = live;
             t.frozen = false;
             if live {
@@ -956,9 +844,6 @@ impl State {
         }
     }
 
-    /// Picks hidden Today tabs to freeze, marks them frozen and returns them.
-    /// Pinned tabs and favorites are usually web apps (mail, chat) that must
-    /// keep running to deliver notifications, so they are never frozen.
     pub fn collect_freezers(&mut self, now: u64) -> Vec<Id> {
         let visible = self.visible_tab();
         let after_ms = self.policy.freeze_after_secs * 1000;
@@ -984,7 +869,6 @@ impl State {
         frozen
     }
 
-    /// Marks a tab as running again. Returns true if it was frozen.
     pub fn thaw(&mut self, id: Id) -> bool {
         match self.tabs.get_mut(&id) {
             Some(t) if t.frozen => {
@@ -1005,7 +889,6 @@ impl State {
         self.ads_allowed.contains(&site_of(url))
     }
 
-    /// Turns ad blocking off for the site of `url`, or back on.
     pub fn set_ads_allowed(&mut self, url: &str, allowed: bool) {
         let site = site_of(url);
         if site.is_empty() {
@@ -1021,19 +904,16 @@ impl State {
         covers(&self.keep_awake, &site_of(url))
     }
 
-    /// The tab, or its site, is exempt from sleeping, freezing and archiving.
     pub fn stays_awake(&self, t: &Tab) -> bool {
         t.always_awake || self.keeps_awake(&t.url)
     }
 
-    /// Keeps one tab loaded whatever the policy, or lets it sleep again.
     pub fn set_always_awake(&mut self, id: Id, awake: bool) {
         if let Some(t) = self.tabs.get_mut(&id) {
             t.always_awake = awake;
         }
     }
 
-    /// Tabs the person chose to keep loaded, for the shell to load at launch.
     pub fn always_awake_tabs(&self) -> Vec<Id> {
         let mut ids: Vec<Id> =
             self.tabs.values().filter(|t| t.always_awake && !t.url.is_empty()).map(|t| t.id).collect();
@@ -1041,7 +921,6 @@ impl State {
         ids
     }
 
-    /// Exempts the site of `url` from sleeping and freezing, or stops doing so.
     pub fn set_keep_awake(&mut self, url: &str, keep: bool) {
         let site = site_of(url);
         if site.is_empty() {
@@ -1052,13 +931,10 @@ impl State {
                 self.keep_awake.push(site);
             }
         } else {
-            // Including a parent domain that covers it.
             self.keep_awake.retain(|s| !covers(std::slice::from_ref(s), &site));
         }
     }
 
-    /// Replaces the sites kept awake, as typed in Settings: bare domains
-    /// ("slack.com") or addresses, each also covering its subdomains.
     pub fn set_keep_awake_sites(&mut self, sites: &[String]) {
         let mut kept: Vec<String> = Vec::new();
         for entry in sites {
@@ -1071,8 +947,6 @@ impl State {
         self.keep_awake = kept;
     }
 
-    /// Picks the tabs to put to sleep, marks them asleep and returns them.
-    /// The visible tab and tabs playing audio are never chosen.
     pub fn collect_sleepers(&mut self, now: u64, pressure: Pressure) -> Vec<Id> {
         let visible = self.visible_tab();
         let after_ms = match self.policy.sleep_after_secs {
@@ -1085,12 +959,9 @@ impl State {
         };
         let (timeout_ms, max_live) = match pressure {
             Pressure::Normal => (after_ms, limit),
-            // Without a limit of their own, tabs beyond the default count.
             Pressure::Warning => (after_ms / 4, (limit.min(Policy::default().max_live_tabs as usize) / 2).max(1)),
             Pressure::Critical => (0, 0),
         };
-        // Each space's current tab stays loaded unless memory is critical,
-        // so switching spaces shows it at once.
         let fronts: HashSet<Id> = match pressure {
             Pressure::Critical => HashSet::new(),
             _ => self.spaces.iter().filter_map(|s| s.active_tab).collect(),
@@ -1125,9 +996,6 @@ impl State {
     }
 }
 
-// ------------------------------------------------------------- tree helpers
-
-/// Returns `Some(parent folder)` if `id` is in the tree.
 #[expect(clippy::option_option, reason = "None: not in the tree; Some(None): at the top level")]
 fn find_parent(nodes: &[Node], id: Id, parent: Option<Id>) -> Option<Option<Id>> {
     for n in nodes {
@@ -1178,7 +1046,6 @@ fn folder_children_mut(nodes: &mut [Node], id: Id) -> Option<&mut Vec<Node>> {
     }
 }
 
-/// Removes `id` from the tree. Returns the node, its index and its parent.
 fn detach(nodes: &mut Vec<Node>, id: Id, parent: Option<Id>) -> Option<(Node, usize, Option<Id>)> {
     if let Some(i) = nodes.iter().position(|n| n.id() == id) {
         return Some((nodes.remove(i), i, parent));
@@ -1203,14 +1070,6 @@ pub fn collect_tabs(nodes: &[Node], out: &mut Vec<Id>) {
     }
 }
 
-// --------------------------------------------------------------- omnibox
-
-/// Turns omnibox text into a URL: URLs and hostnames load directly,
-/// everything else is searched.
-/// The site a URL belongs to, as shown to people: the lowercase host
-/// without "www.", user info or port ("mail.google.com"). Empty for URLs
-/// without a host, such as about:blank.
-/// `site` is one of `sites` or a subdomain of one.
 pub fn covers(sites: &[String], site: &str) -> bool {
     !site.is_empty()
         && sites.iter().any(|s| site == s || site.strip_suffix(s.as_str()).is_some_and(|sub| sub.ends_with('.')))
@@ -1274,7 +1133,6 @@ pub fn resolve_input(text: &str, search_template: &str) -> String {
     search_url(text, search_template)
 }
 
-/// A web search for `text`, whatever it looks like.
 pub fn search_url(text: &str, search_template: &str) -> String {
     search_template.replace("%s", &percent_encode(text.trim()))
 }

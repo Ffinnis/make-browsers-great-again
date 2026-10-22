@@ -1,5 +1,1 @@
-# Formatting-only commits, which `git blame` skips (GitHub does too; locally
-# run `git config blame.ignoreRevsFile .git-blame-ignore-revs`, which
-# scripts/build.sh does for you).
-# Format all code with one style per language
 3cb9c69ef44ba24686a1a9e52f13c4be1f4455db

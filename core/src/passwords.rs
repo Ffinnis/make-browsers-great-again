@@ -1,9 +1,3 @@
-//! Saved passwords, per profile. Kept in their own file; each password is
-//! sealed (AES-256-CBC, then HMAC-SHA256 over the IV and ciphertext) with a
-//! key the shell keeps in the keychain and hands over when a password is
-//! first needed. Sites and usernames stay readable, so suggestions and the
-//! list in Settings work before that.
-
 use crate::crypto::{self, Cipher, Hash};
 use crate::import::passwords::ImportedLogin;
 use crate::model::Id;
@@ -14,11 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct Login {
     pub id: u64,
     pub profile: Id,
-    /// "<https://example.com>" or "http://localhost:3000": scheme, host and
-    /// port of the page it was saved on.
     pub origin: String,
     pub username: String,
-    /// Sealed, in base64.
     pub password: String,
     pub created_ms: u64,
     pub used_ms: u64,
@@ -28,15 +19,11 @@ pub struct Login {
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Store {
     pub logins: Vec<Login>,
-    /// Origins, per profile, whose passwords are never offered for saving.
     pub never: Vec<(Id, String)>,
-    /// A fixed text sealed with the key, telling the right key from another
-    /// (say, after the keychain item was deleted).
     pub check: Option<String>,
     pub next_id: u64,
 }
 
-/// The key in two halves: one encrypts, the other authenticates.
 #[derive(Clone)]
 pub struct Key {
     cipher: Vec<u8>,
@@ -46,7 +33,6 @@ pub struct Key {
 const CHECK: &[u8] = b"MBGA passwords";
 
 impl Key {
-    /// Derives both halves from the shell's 32 random bytes.
     pub fn new(secret: &[u8]) -> Option<Key> {
         if secret.len() < 32 {
             return None;
@@ -80,13 +66,10 @@ impl Key {
     }
 }
 
-/// What to ask after a sign-in form was sent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Offer {
-    /// Saved already, or never saved on this site.
     Nothing,
     Save,
-    /// The login with this username has another password now.
     Update(u64),
 }
 
@@ -97,7 +80,6 @@ pub struct Merged {
     pub kept: u32,
 }
 
-/// "<https://example.com>" for a web page's URL; None for other schemes.
 pub fn origin_of(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     matches!(parsed.scheme(), "https" | "http").then(|| parsed.origin().ascii_serialization())
@@ -108,8 +90,6 @@ fn host_of(origin: &str) -> &str {
     rest.rsplit_once(':').filter(|(_, port)| port.bytes().all(|b| b.is_ascii_digit())).map_or(rest, |(h, _)| h)
 }
 
-/// The part of a host its owner registered: "example.co.uk" for
-/// "login.example.co.uk". Addresses and single-label hosts are their own.
 fn registrable(host: &str) -> &str {
     if host.parse::<std::net::IpAddr>().is_ok() || host.starts_with('[') {
         return host;
@@ -118,8 +98,6 @@ fn registrable(host: &str) -> &str {
 }
 
 impl Store {
-    /// Unlocks with `key`, or tells that it isn't the key the passwords
-    /// were sealed with. The first key ever given becomes the key.
     pub fn verify(&mut self, key: &Key) -> bool {
         if let Some(check) = &self.check {
             key.open(check).is_some_and(|c| c.as_bytes() == CHECK)
@@ -129,10 +107,6 @@ impl Store {
         }
     }
 
-    /// Logins of `profile` to offer on `url`: those saved on its very
-    /// origin, then those of other hosts of the same site (another
-    /// subdomain, or http for an https page), most recently used first.
-    /// Logins saved over https are never offered to an http page.
     pub fn matching(&self, profile: Id, url: &str) -> Vec<&Login> {
         let Some(origin) = origin_of(url) else { return Vec::new() };
         let secure = origin.starts_with("https://");
@@ -155,7 +129,6 @@ impl Store {
         found.into_iter().map(|(_, l)| l).collect()
     }
 
-    /// Whether to offer saving `password` sent with `username` on `url`.
     pub fn offer(&self, key: &Key, profile: Id, url: &str, username: &str, password: &str) -> Offer {
         let Some(origin) = origin_of(url) else { return Offer::Nothing };
         if password.is_empty() || self.never.iter().any(|(p, o)| *p == profile && *o == origin) {
@@ -163,7 +136,6 @@ impl Store {
         }
         let matching = self.matching(profile, url);
         let same_password = |l: &&Login| key.open(&l.password).is_some_and(|p| p == password);
-        // Filled from a login saved here or on another host of the site.
         if matching.iter().any(|l| (l.username == username || username.is_empty()) && same_password(l)) {
             return Offer::Nothing;
         }
@@ -173,8 +145,6 @@ impl Store {
         }
     }
 
-    /// Saves a login, replacing the password of the one with the same
-    /// origin and username.
     pub fn save(&mut self, key: &Key, profile: Id, url: &str, username: &str, password: &str, now: u64) -> Option<u64> {
         let origin = origin_of(url)?;
         let sealed = key.seal(password)?;
@@ -235,15 +205,11 @@ impl Store {
         self.logins.len() != before
     }
 
-    /// Forgets everything of profiles that no longer exist.
     pub fn keep_profiles(&mut self, profiles: &[Id]) {
         self.logins.retain(|l| profiles.contains(&l.profile));
         self.never.retain(|(p, _)| profiles.contains(p));
     }
 
-    /// Adds imported logins to `profile`. A login MBGA has with the same
-    /// origin and username takes the imported password only if that was
-    /// changed more recently.
     pub fn merge(&mut self, key: &Key, profile: Id, logins: &[ImportedLogin], never: &[String], now: u64) -> Merged {
         let mut merged = Merged::default();
         for login in logins {

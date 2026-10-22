@@ -23,7 +23,7 @@ TOOLS = os.path.join(ROOT, "build", "bench-tools")
 MEDIA = os.path.join(ROOT, "build", "bench-media")
 WORK = "/tmp/mbga-bench"
 PAGE_PORT = 8765
-DEVTOOLS_PORT = 9555  # never 9333: that is the user's own Chrome
+DEVTOOLS_PORT = 9555
 
 
 def machine():
@@ -73,7 +73,6 @@ def quit_app(pid, timeout=60):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            # Our own child lingers until reaped, so collect it first.
             if os.waitpid(pid, os.WNOHANG)[0] == pid:
                 return True
         except ChildProcessError:
@@ -110,9 +109,6 @@ def window_bounds(pid):
     return json.loads(out or "[]")
 
 
-# ----------------------------------------------------------------- sampling
-
-
 def sample(pid):
     """Footprint, CPU time, energy and wakeups of every process in the tree."""
     out = subprocess.run([os.path.join(TOOLS, "sample"), str(pid)], capture_output=True, text=True, check=True).stdout
@@ -124,7 +120,7 @@ def tree_pids(pid):
 
 
 def kind_of(proc):
-    return proc["type"].split(":")[0]  # browser, renderer, gpu-process, utility, ...
+    return proc["type"].split(":")[0]
 
 
 def summarize(s):
@@ -183,8 +179,6 @@ def measure_window(pid, seconds):
     process kind."""
     a, ga = sample(pid), gpu_times()
     top = EnergyImpact(seconds)
-    # Whether the browser stayed in front: another app's windows covering it
-    # would hide its pages and make the window meaningless.
     front = subprocess.Popen(
         [os.path.join(TOOLS, "frontwatch"), str(pid), str(seconds - 1)], stdout=subprocess.PIPE, text=True
     )
@@ -221,14 +215,10 @@ def measure_window(pid, seconds):
     }
 
 
-# --------------------------------------------------------------- test pages
-
-
 def ensure_media():
     """Test videos, generated once: a 1080p30 VP9 movie and a small ad."""
     os.makedirs(MEDIA, exist_ok=True)
     specs = {
-        # Film-like noise keeps the bitrate (and decoding work) realistic.
         "movie.webm": ("testsrc2=size=1920x1080:rate=30", "noise=alls=12:allf=t", "4M", 20),
         "ad.webm": ("testsrc2=size=640x360:rate=30", "noise=alls=12:allf=t", "800k", 10),
     }
@@ -296,9 +286,6 @@ def page_server():
 def page_url(name):
     page_server()
     return f"http://127.0.0.1:{PAGE_PORT}/{name}"
-
-
-# ----------------------------------------------------------------- DevTools
 
 
 def page_targets(port):

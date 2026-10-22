@@ -35,7 +35,6 @@ fn closing_today_tab_selects_tab_below_then_above() {
     let a = s.open_tab(sp, "https://a.com", false, 1).unwrap();
     let b = s.open_tab(sp, "https://b.com", false, 2).unwrap();
     let c = s.open_tab(sp, "https://c.com", false, 3).unwrap();
-    // today = [c, b, a]
     s.activate_tab(sp, b, 4);
     assert_eq!(s.close_tab(b, 5), (true, Some(a)));
     assert_eq!(s.close_tab(a, 6), (true, Some(c)));
@@ -82,7 +81,6 @@ fn moving_tab_to_other_profile_requires_reload() {
     let reload = s.move_item(t, Container::Today { space_id: sp2 }, 0).unwrap();
     assert_eq!(reload, vec![t]);
     assert!(!s.tabs[&t].live);
-    // It left the home space, so it is no longer selected there.
     assert!(s.spaces[0].active_tab.is_none());
 }
 
@@ -108,10 +106,8 @@ fn reorder_within_list_uses_pre_removal_index() {
     let a = s.open_tab(sp, "a", false, 1).unwrap();
     let b = s.open_tab(sp, "b", false, 2).unwrap();
     let c = s.open_tab(sp, "c", false, 3).unwrap();
-    // today = [c, b, a]; drag c to the end (index 3 before removal).
     s.move_item(c, Container::Today { space_id: sp }, 3).unwrap();
     assert_eq!(s.spaces[0].today, vec![b, a, c]);
-    // drag a to the front.
     s.move_item(a, Container::Today { space_id: sp }, 0).unwrap();
     assert_eq!(s.spaces[0].today, vec![a, b, c]);
 }
@@ -128,12 +124,9 @@ fn sleeps_idle_and_excess_tabs_but_never_visible_or_audible() {
         s.set_live(id, true, 0);
         ids.push(id);
     }
-    // ids[4] is visible. Make ids[0] audible.
     s.set_audible(ids[0], true);
     let sleepers = s.collect_sleepers(2_000, Pressure::Normal);
-    // 4 hidden live tabs, max 2, ids[0] protected: oldest unprotected go first.
     assert_eq!(sleepers, vec![ids[1], ids[2]]);
-    // After the timeout everything hidden and silent sleeps.
     let sleepers = s.collect_sleepers(1_000 + 61_000 + 10, Pressure::Normal);
     assert_eq!(sleepers, vec![ids[3]]);
     assert!(s.tabs[&ids[4]].live);
@@ -153,7 +146,6 @@ fn sleeping_can_be_turned_off_but_memory_pressure_still_sleeps() {
         ids.push(id);
     }
     assert!(s.collect_sleepers(u64::MAX / 2, Pressure::Normal).is_empty());
-    // Under pressure the default limit, halved, applies.
     assert_eq!(s.collect_sleepers(100, Pressure::Warning).len(), 39 - 12);
     assert_eq!(s.collect_sleepers(100, Pressure::Critical).len(), 12);
 }
@@ -264,13 +256,11 @@ fn freezes_only_idle_hidden_today_tabs() {
         s.set_live(id, true, 0);
     }
     s.set_audible(audible, true);
-    // Nothing has been hidden for a minute yet.
     assert!(s.collect_freezers(30_000).is_empty());
     assert_eq!(s.collect_freezers(70_000), vec![old]);
     assert!(s.collect_freezers(80_000).is_empty(), "already frozen");
     assert!(s.thaw(old));
     assert!(!s.thaw(old));
-    // A recreated web view starts unfrozen.
     s.collect_freezers(90_000);
     s.set_live(old, false, 0);
     s.set_live(old, true, 0);
@@ -298,7 +288,6 @@ fn states_with_the_first_sleep_defaults_get_the_current_ones() {
         (current.sleep_after_secs, current.max_live_tabs, current.freeze_after_secs)
     );
     assert_eq!(p.archive_after_hours, 12, "other choices are kept");
-    // Values someone chose stay.
     let mut chosen: model::Policy = serde_json::from_str(r#"{"sleep_after_secs": 900, "max_live_tabs": 8}"#).unwrap();
     chosen.upgrade_first_defaults();
     assert_eq!(chosen.sleep_after_secs, 900);
@@ -316,14 +305,11 @@ fn each_spaces_current_tab_and_freshly_loaded_tabs_stay_awake() {
     s.set_active_space(other, 0);
     let hour = 3_600_000;
     let later = 10 * hour;
-    // Home's current tab isn't visible but stays loaded.
     assert!(s.collect_sleepers(later, model::Pressure::Normal).is_empty());
-    // A tab loaded ahead of being shown counts as used when it was loaded.
     let warmed = s.open_tab(home, "https://warmed.com", false, 0).unwrap();
     s.set_live(warmed, true, later);
     assert!(s.collect_sleepers(later + hour, model::Pressure::Normal).is_empty());
     assert_eq!(s.collect_sleepers(later + 3 * hour, model::Pressure::Normal), vec![warmed]);
-    // Critical pressure frees everything but the visible tab.
     assert_eq!(s.collect_sleepers(later + 3 * hour, model::Pressure::Critical), vec![front]);
 }
 
@@ -344,7 +330,6 @@ fn engine_paths_are_resolved_through_symlinks() {
 #[test]
 fn only_new_state_needs_onboarding() {
     assert!(!State::new_default().onboarded);
-    // State files written before onboarding existed have no such field.
     let mut v = serde_json::to_value(State::new_default()).unwrap();
     v.as_object_mut().unwrap().remove("onboarded");
     let old: State = serde_json::from_value(v).unwrap();
@@ -481,7 +466,6 @@ fn closing_clearing_and_deleting_folders_can_be_undone() {
     let a = s.open_tab(sp, "https://a.com", false, 1).unwrap();
     let b = s.open_tab(sp, "https://b.com", false, 2).unwrap();
     let c = s.open_tab(sp, "https://c.com", false, 3).unwrap();
-    // today = [c, b, a]
     s.close_tab(b, 4);
     assert_eq!(s.reopen_last(), Some((sp, vec![b])));
     assert_eq!(s.spaces[0].today, vec![c, b, a]);
@@ -588,7 +572,6 @@ fn ad_settings_survive_a_restart() {
     assert!(core.persist());
     let reopened = BrowserCore::new(dir.clone());
     assert!(!reopened.snapshot().block_ads);
-    // Off means the engine is never loaded, even with lists on disk.
     fs::create_dir_all(reopened.filter_dir()).unwrap();
     fs::write(Path::new(&reopened.filter_dir()).join(blocker::LISTS[0].0), "||ads.example.net^\n").unwrap();
     assert!(!reopened.load_filters());
@@ -607,7 +590,6 @@ fn tabs_in_little_windows_stay_awake_and_the_main_window_moves_on() {
     let sp = home(&s);
     let a = s.open_tab(sp, "https://a.com", false, 1).unwrap();
     let b = s.open_tab(sp, "https://b.com", true, 2).unwrap();
-    // today = [b, a], b visible
     for id in [a, b] {
         s.set_live(id, true, 0);
     }
@@ -624,14 +606,12 @@ fn generic_hiding_rules_follow_the_names_a_page_reports() {
     let b = blocker::Blocker::from_rules("##.generic-ad\n###top-banner\n@@||quiet.example^$generichide\n");
     let page = "https://news.example.com/";
     assert!(b.page_script(page).contains("__mbga_cosmetic"), "the collector runs");
-    // A line break inside a JavaScript string would void the whole script.
     assert!(!b.page_script(page).contains("'\n'"));
     let reply = b.cosmetic_reply(page, r#"{"c":["generic-ad","story"],"i":["top-banner"]}"#);
     assert!(reply.contains(".generic-ad{display:none!important}"));
     assert!(reply.contains("#top-banner{display:none!important}"));
     assert!(b.cosmetic_reply(page, r#"{"c":["story"],"i":[]}"#).is_empty());
     assert!(b.cosmetic_reply(page, "not json").is_empty());
-    // $generichide: no collector, no generic rules.
     assert!(!b.page_script("https://quiet.example/").contains("__mbga_cosmetic"));
     assert!(b.cosmetic_reply("https://quiet.example/", r#"{"c":["generic-ad"]}"#).is_empty());
 }
@@ -668,7 +648,6 @@ fn a_space_with_tabs_but_none_selected_gets_its_most_recent_tab() {
     s.spaces[0].active_tab = None;
     assert_eq!(s.select_default_tab(sp, 10), Some(pinned), "most recently used");
     assert_eq!(s.select_default_tab(sp, 11), None, "already has one");
-    // Ties go to sidebar order: the newest Today tab first.
     let mut t = State::new_default();
     let sp = home(&t);
     let first = t.open_tab(sp, "https://a.com", false, 1).unwrap();
@@ -676,7 +655,6 @@ fn a_space_with_tabs_but_none_selected_gets_its_most_recent_tab() {
     let _ = first;
     t.spaces[0].active_tab = None;
     assert_eq!(t.select_default_tab(sp, 2), Some(second));
-    // An empty space stays empty, even with Favorites.
     let mut e = State::new_default();
     let sp = home(&e);
     let fav = e.open_tab(sp, "https://fav.com", false, 1).unwrap();
@@ -721,8 +699,6 @@ fn logins_are_offered_on_their_site_and_saving_is_asked_once() {
     assert_eq!(core.password_offer(profile, page(), "me".into(), "new".into()), PasswordOffer::Update { login_id: id });
     assert_eq!(core.password_offer(profile, page(), "you".into(), "pw2".into()), PasswordOffer::Save);
 
-    // Other hosts of the same site get it, after the page's own; other
-    // sites, insecure pages and other profiles don't.
     core.save_login(profile, "https://www.example.co.uk/".into(), "www".into(), "x".into());
     let names =
         |url: &str, p: u64| core.logins_for_page(p, url.into()).into_iter().map(|l| l.username).collect::<Vec<_>>();

@@ -1,18 +1,14 @@
-//! Firefox and its forks (Zen, `LibreWolf`, Waterfox): profiles from
-//! "profiles.ini" and bookmarks from each profile's "places.sqlite".
-
 use super::{ImportedProfile, ImportedSpace, Item};
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Profile paths (relative to `data_dir` when the profile is) and names.
 pub fn profiles(data_dir: &Path) -> Vec<(String, String)> {
     let Ok(ini) = fs::read_to_string(data_dir.join("profiles.ini")) else {
         return Vec::new();
     };
     let mut out = Vec::new();
-    let mut section: Option<(String, String)> = None; // (name, path)
+    let mut section: Option<(String, String)> = None;
     let flush = |section: &mut Option<(String, String)>, out: &mut Vec<(String, String)>| {
         if let Some((name, path)) = section.take() {
             if !path.is_empty() && profile_path(data_dir, &path).join("places.sqlite").exists() {
@@ -47,8 +43,6 @@ pub fn profile_path(data_dir: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Bookmarks of one profile as a space named `space_name`. Firefox keeps the
-/// database locked while it runs, so a copy is read instead.
 pub fn load(data_dir: &Path, path: &str, name: &str, space_name: &str) -> Result<ImportedProfile, String> {
     let dir = profile_path(data_dir, path);
     let result =
@@ -77,7 +71,6 @@ struct Row {
     url: Option<String>,
 }
 
-/// The toolbar, menu and "Other Bookmarks" roots as folders.
 fn read_bookmarks(db: &Connection) -> rusqlite::Result<Vec<Item>> {
     let mut stmt = db.prepare(
         "SELECT b.id, b.parent, b.type, COALESCE(b.title, ''), p.url
@@ -109,7 +102,6 @@ fn read_bookmarks(db: &Connection) -> rusqlite::Result<Vec<Item>> {
     Ok(out)
 }
 
-/// Type 1 is a bookmark, 2 a folder, 3 a separator.
 fn tree(rows: &[Row], parent: i64) -> Vec<Item> {
     rows.iter()
         .filter(|r| r.parent == parent)

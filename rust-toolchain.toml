@@ -1,4 +1,3 @@
-# One Rust for everyone, so rustfmt and clippy agree between machines and CI.
 [toolchain]
 channel = "1.94.0"
 components = ["clippy", "rustfmt"]

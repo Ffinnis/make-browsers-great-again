@@ -1,9 +1,5 @@
 import AppKit
 
-/// The full sidebar: toolbar, address field, favorites, the active space's
-/// list (swipeable between spaces), the mini player, an update waiting to be
-/// installed and the bottom bar.
-/// One instance moves between the window and the floating peek card.
 @MainActor
 final class SidebarView: FlippedView {
     private let store: BrowserStore
@@ -30,7 +26,6 @@ final class SidebarView: FlippedView {
         player.isHidden = store.mediaTab == nil
         updateCard.isHidden = Self.readyUpdate == nil
         if let version = Self.readyUpdate { updateCard.update(version: version) }
-        // Two-finger swipes anywhere in the sidebar switch spaces.
         store.pager.sidebar = self
         store.observe(self) { [weak self] change in self?.handle(change) }
     }
@@ -50,10 +45,6 @@ final class SidebarView: FlippedView {
             address.update()
             updatePlayer()
             needsLayout = true
-            // Another space may have more or fewer favorites: the list glides
-            // to its new place along with the pages rather than jumping.
-            // Rows the new space's list just made are settled first, so only
-            // the moving frames animate.
             if switched {
                 Motion.instantly {
                     pager.layoutSubtreeIfNeeded()
@@ -61,8 +52,6 @@ final class SidebarView: FlippedView {
                 }
                 Motion.animate(Motion.reflow) { layoutSubtreeIfNeeded() }
             } else if favoritesChanged {
-                // A favorite added or removed: the tiles and the list below
-                // move to their new places.
                 Motion.animate(Motion.reflow) { layoutSubtreeIfNeeded() }
             }
         case .nav:
@@ -78,12 +67,10 @@ final class SidebarView: FlippedView {
         case .update:
             refreshUpdateCard()
         case .cleanup:
-            // The tidy-up offer opens and closes rather than popping.
             pager.refreshDecorations(animation: Motion.settle)
         case .renaming:
             pager.refreshDecorations()
         case .drag:
-            // Empty favorites open a drop target while something is dragged.
             favorites.update()
             pager.refreshDecorations()
             pager.dragChanged()
@@ -99,7 +86,6 @@ final class SidebarView: FlippedView {
         player.update(media)
         let visible = media != nil
         guard visible == player.isHidden else { return }
-        // The player rises from the bottom bar.
         player.isHidden = false
         player.alphaValue = visible ? 0 : 1
         Motion.animate(Motion.settle) {
@@ -113,7 +99,6 @@ final class SidebarView: FlippedView {
         }
     }
 
-    /// The version to restart into, while its card is to show.
     private static var readyUpdate: String? {
         Updater.shared.cardHidden ? nil : Updater.shared.readyVersion
     }
@@ -123,7 +108,6 @@ final class SidebarView: FlippedView {
         if let version { updateCard.update(version: version) }
         let visible = version != nil
         guard visible == updateCard.isHidden else { return }
-        // Rises from the bottom bar, like the player.
         updateCard.isHidden = false
         updateCard.alphaValue = visible ? 0 : 1
         Motion.animate(Motion.settle) {
@@ -162,8 +146,6 @@ final class SidebarView: FlippedView {
         pager.frame = NSRect(x: 10, y: y, width: width, height: max(listBottom - y, 0))
     }
 }
-
-// MARK: - Toolbar
 
 private final class SidebarToolbarView: WindowDragView {
     private let store: BrowserStore
@@ -204,22 +186,16 @@ private final class SidebarToolbarView: WindowDragView {
 
     override func layout() {
         super.layout()
-        // Room for the window's traffic lights.
         toggle.frame = NSRect(x: 66, y: 3, width: 28, height: 24)
         reload.frame = NSRect(x: bounds.width - 28, y: 3, width: 28, height: 24)
         forward.frame = NSRect(x: bounds.width - 58, y: 3, width: 28, height: 24)
         back.frame = NSRect(x: bounds.width - 88, y: 3, width: 28, height: 24)
-        // Extensions between the sidebar button and the arrows.
         let left = toggle.frame.maxX + 4
         let width = min(extensions.preferredWidth, max(back.frame.minX - 2 - left, 0))
         extensions.frame = NSRect(x: back.frame.minX - 2 - width, y: 0, width: width, height: bounds.height)
     }
 }
 
-// MARK: - Address field
-
-/// The visible page's site; click to edit the address or search. Also shows
-/// loading and how many ads and trackers were blocked.
 private final class AddressPillView: HoverView {
     private var shownTab: UInt64?
     private let store: BrowserStore
@@ -267,7 +243,6 @@ private final class AddressPillView: HoverView {
         shield.setVisible(count > 0, animated: sameTab)
         blocked.setVisible(count > 0, animated: sameTab)
         if count != shownCount {
-            // The count rolls up as more is blocked.
             if count > shownCount, !Motion.reduced, let layer = blocked.layer {
                 let roll = CATransition()
                 roll.type = .push
@@ -320,11 +295,6 @@ private final class AddressPillView: HoverView {
     override func mouseDown(with event: NSEvent) {}
 }
 
-// MARK: - Favorites
-
-/// Favorites belong to the profile, so every space using it shows the same
-/// grid of tiles, reorderable by dragging. Up to four share a row, and fewer
-/// than four stretch to fill it, as in Arc.
 private final class FavoritesGridView: FlippedView {
     private let store: BrowserStore
     private var tiles: [FavoriteTileView] = []
@@ -365,8 +335,6 @@ private final class FavoritesGridView: FlippedView {
 
     private var shownTabs: [UInt64] = []
 
-    /// With `crossfade`, a space switch that brings other favorites fades
-    /// them in over the old ones. Returns whether the favorites changed.
     @discardableResult
     func update(crossfade: Bool = false) -> Bool {
         let favorites = space.favorites
@@ -375,10 +343,8 @@ private final class FavoritesGridView: FlippedView {
             let fade = CATransition()
             fade.type = .fade
             if ids.count < shownTabs.count {
-                // Gone before the list moves up into their place.
                 fade.duration = Motion.quick.duration * 0.7
             } else {
-                // Coming in as the list moves down out of their way.
                 fade.duration = Motion.reflow.duration
                 fade.timingFunction = CAMediaTimingFunction(name: .easeIn)
             }
@@ -393,7 +359,6 @@ private final class FavoritesGridView: FlippedView {
             tiles.append(tile)
             addSubview(tile)
             Motion.instantly { tile.frame = tileFrame(tiles.count - 1) }
-            // A new favorite appears in its place as the others make room.
             if fadeIn {
                 tile.isHidden = true
                 tile.setVisible(true, animated: true, curve: Motion.reflow)
@@ -417,8 +382,6 @@ private final class FavoritesGridView: FlippedView {
         hint.frame = bounds
         for (i, tile) in tiles.enumerated() { tile.frame = tileFrame(i) }
     }
-
-    // Dropping a tab here adds it as a favorite at the caret.
 
     private func insertionIndex(at point: NSPoint) -> Int {
         guard !tiles.isEmpty else { return 0 }
@@ -446,10 +409,8 @@ private final class FavoritesGridView: FlippedView {
         caret.backgroundColor = NSColor.controlAccentColor.cgColor
         let frame = NSRect(x: x - 1.5, y: anchor.minY + 6, width: 3, height: anchor.height - 12)
         if wasShown {
-            // Glides from slot to slot.
             caret.frame = frame
         } else {
-            // Appears where it is.
             CATransaction.begin()
             CATransaction.setDisableActions(true)
             caret.frame = frame
@@ -484,8 +445,6 @@ private final class FavoritesGridView: FlippedView {
     }
 }
 
-/// A favorite: its icon on a tile that, when selected, lights up in the
-/// site's own color, as in Dia.
 private final class FavoriteTileView: HoverView, NSDraggingSource {
     private let store: BrowserStore
     private let fill = FillLayer()
@@ -594,11 +553,6 @@ private final class FavoriteTileView: HoverView, NSDraggingSource {
     }
 }
 
-// MARK: - Space pager
-
-/// The spaces' lists side by side, offset by the pager's position, so a
-/// two-finger swipe slides them with the fingers. Only the pages near the
-/// current position (or along an animated move) exist.
 private final class SpacePagerView: FlippedView {
     private let store: BrowserStore
     private var pages: [UInt64: SpacePageView] = [:]
@@ -608,8 +562,6 @@ private final class SpacePagerView: FlippedView {
         self.store = store
         super.init(frame: .zero)
         wantsLayer = true
-        // Neighbouring spaces wait just past the edge; never show them over
-        // the page.
         layer?.masksToBounds = true
         store.pager.view = self
         store.pager.observe(self) { [weak self] in self?.positionChanged() }
@@ -639,9 +591,6 @@ private final class SpacePagerView: FlippedView {
         for page in pages.values { page.refreshDecorations(animation: animation) }
     }
 
-    /// Up to this many spaces every page is kept once made: making one
-    /// (a table and its rows) costs a few frames, too much mid-switch.
-    /// Beyond it, pages far from the current space are let go.
     private let keepAll = 16
 
     private func wanted(_ index: Int) -> Bool {
@@ -663,8 +612,6 @@ private final class SpacePagerView: FlippedView {
 
     private var preparing = false
 
-    /// Makes the pages not made yet one at a time while nothing else is
-    /// going on, so switching to a space never has to make its page.
     private func preparePages() {
         guard !preparing, window != nil, store.snapshot.spaces.count <= keepAll,
               store.snapshot.spaces.contains(where: { pages[$0.id] == nil })
@@ -673,7 +620,6 @@ private final class SpacePagerView: FlippedView {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
             preparing = false
-            // Not mid-move or under the fingers; try again shortly.
             guard store.pager.travel == nil, !store.pager.isTracking else { return preparePages() }
             guard let space = store.snapshot.spaces.first(where: { self.pages[$0.id] == nil }) else { return }
             makePage(space)
@@ -691,20 +637,15 @@ private final class SpacePagerView: FlippedView {
             if wanted(index) {
                 if pages[space.id] == nil { makePage(space) }
             } else if store.snapshot.spaces.count > keepAll, !store.isDragging, let page = pages.removeValue(forKey: space.id) {
-                // While dragging, the page the drag started from stays: a
-                // tab held over a space's icon switches spaces mid-drag.
                 page.removeFromSuperview()
             }
         }
     }
 
-    /// Drops pages kept for a drag once it ends.
     func dragChanged() {
         if !store.isDragging { ensurePages() }
     }
 
-    /// Never animated: the pager steps its moves itself, and an animation
-    /// here would hold the pages back from following it.
     private func layoutPages() {
         let position = store.pager.position
         Motion.instantly {
@@ -727,10 +668,6 @@ private final class SpacePagerView: FlippedView {
     }
 }
 
-// MARK: - Bottom bar
-
-/// Downloads, the space switcher (only once there is a second space) and
-/// the + menu.
 private final class SidebarBottomBar: FlippedView {
     private let store: BrowserStore
     private let downloads: SymbolButton
@@ -761,8 +698,6 @@ private final class SidebarBottomBar: FlippedView {
 
     func update() {
         let spaces = store.snapshot.spaces
-        // Most people use one space (5.5% of Arc's daily users used several),
-        // so the switcher only appears once there is a second.
         let shown = spaces.count > 1 ? spaces : []
         let changed = dots.count != shown.count
         let animated = changed && window != nil && !Motion.reduced
@@ -772,7 +707,6 @@ private final class SidebarBottomBar: FlippedView {
             dots.append(dot)
             addSubview(dot)
             if animated {
-                // Starts where it will end up, then fades in.
                 dot.isHidden = true
                 needsLayout = true
                 Motion.instantly { layoutSubtreeIfNeeded() }
@@ -781,7 +715,6 @@ private final class SidebarBottomBar: FlippedView {
         }
         for (dot, space) in zip(dots, shown) { dot.configure(space, active: space.id == store.snapshot.activeSpace) }
         needsLayout = true
-        // The others make room or close the gap.
         if animated { Motion.animate(Motion.reflow) { layoutSubtreeIfNeeded() } }
     }
 
@@ -790,10 +723,6 @@ private final class SidebarBottomBar: FlippedView {
         downloads.frame = NSRect(x: 0, y: 2, width: 28, height: 24)
         add.frame = NSRect(x: bounds.width - 28, y: 2, width: 28, height: 24)
         guard !dots.isEmpty else { return }
-        // A roomy, even pitch as in Arc. With many spaces the icons close
-        // up, then turn into dots, so the bar (and with it the sidebar) never
-        // gets wider. Each takes its whole pitch, so moving along the bar
-        // always hovers one.
         let available = bounds.width - 2 * 34
         let pitch = min(30, available / CGFloat(dots.count))
         var x = (bounds.width - pitch * CGFloat(dots.count)) / 2
@@ -805,10 +734,6 @@ private final class SidebarBottomBar: FlippedView {
     }
 }
 
-/// A space at the foot of the sidebar, as in Arc: its emoji in gray until
-/// hovered and in color while it's the active space, or a dot when there are
-/// too many to fit. Click to switch; drop a tab to move it there, or hold it
-/// over the icon to switch first and drop it anywhere in that space.
 private final class SpaceDotView: HoverView {
     private let store: BrowserStore
     private let fill = FillLayer()
@@ -857,8 +782,6 @@ private final class SpaceDotView: HoverView {
 
     override func hoverChanged() {
         super.hoverChanged()
-        // Resting on another space starts loading its page, so the click
-        // shows it loaded.
         if hovering, !active, warmTimer == nil, let id = space?.id {
             let timer = Timer(timeInterval: 0.12, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated { self?.store.warmSpace(id) }
@@ -945,8 +868,6 @@ private final class SpaceDotView: HoverView {
         springLoad?.invalidate()
         springLoad = nil
         guard value, !active, let id = space?.id else { return }
-        // A drag runs the run loop in its tracking mode, so the timer has to
-        // be in the common modes to fire.
         let timer = Timer(timeInterval: 0.6, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated { self?.store.activateSpace(id) }
         }
@@ -976,8 +897,6 @@ private final class SpaceDotView: HoverView {
     }
 }
 
-/// A space's icon drawn once in color and once in gray, at the screen's
-/// scale, cached.
 @MainActor
 private enum SpaceIconImages {
     private static var cache: [String: (color: CGImage, gray: CGImage)] = [:]
@@ -995,7 +914,6 @@ private enum SpaceIconImages {
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: bitmap, flipped: false)
         appearance.performAsCurrentDrawingAppearance {
-            // Letters and symbols take the text color; emoji keep their own.
             let string = NSAttributedString(string: text, attributes: [
                 .font: NSFont.systemFont(ofSize: 13 * scale), .foregroundColor: NSColor.labelColor,
             ])

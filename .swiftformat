@@ -1,5 +1,3 @@
-# SwiftFormat settings for shell/ and bench/. scripts/check.sh runs it with
-# --lint; scripts/check.sh --fix rewrites the files.
 --swiftversion 6.0
 --minversion 0.64.0
 --exclude build,third_party,core/target
@@ -18,14 +16,8 @@
 --stripunusedargs closure-only
 --header ignore
 
-# The code keeps short bodies on one line (`guard x else { return }`,
-# `var y: Int { 0 }`) and nested types next to the members they serve.
 --disable wrapIfStatementBodies,wrapFunctionBodies,wrapLoopBodies,wrapPropertyBodies,wrapIfExpressionBodies
 --disable blankLinesBetweenScopes,docComments,wrapMultilineStatementBraces
-# Line length is SwiftLint's job: rewrapping long lines mechanically reads
-# worse than wrapping them by hand.
 --disable wrap
-# `try await f(try g())` says where each call can throw; keep it.
 --disable hoistTry,hoistAwait
-# One guard per condition group reads better than one long line.
 --disable repeatedGuard

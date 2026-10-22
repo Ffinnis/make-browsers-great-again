@@ -1,5 +1,3 @@
-// Entry point for the engine's subprocesses (renderer, GPU, network, ...).
-
 #include "include/cef_app.h"
 #include "include/wrapper/cef_library_loader.h"
 
@@ -15,7 +13,6 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-  // The framework is loaded at runtime, as the macOS sandbox requires.
   CefScopedLibraryLoader library_loader;
   if (!library_loader.LoadInHelper()) {
     return 1;

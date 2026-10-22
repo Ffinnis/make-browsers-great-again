@@ -1,11 +1,7 @@
 import AppKit
 
-/// Three bars bouncing like Arc's "now playing" indicator. The animation is
-/// handed to Core Animation, which runs it in the render server, so the app
-/// itself doesn't wake up for every frame. Static with Reduce Motion.
 final class EqualizerView: NSView {
     private let bars = (0..<3).map { _ in CALayer() }
-    // Each bar bounces at its own pace so the three never move in step.
     private let durations: [CFTimeInterval] = [0.42, 0.31, 0.53]
     private let rest: [CGFloat] = [0.45, 0.8, 0.6]
 
@@ -59,7 +55,6 @@ final class EqualizerView: NSView {
 
     private func updateAnimations() {
         for (i, bar) in bars.enumerated() {
-            // Pausing settles the bars from wherever they are.
             let current = bar.presentation()?.transform
             bar.removeAllAnimations()
             bar.transform = CATransform3DMakeScale(1, rest[i], 1)
@@ -81,7 +76,6 @@ final class EqualizerView: NSView {
             bounce.autoreverses = true
             bounce.repeatCount = .infinity
             bounce.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-            // Survives the view leaving and rejoining a window.
             bounce.isRemovedOnCompletion = false
             bar.add(bounce, forKey: "bounce")
         }

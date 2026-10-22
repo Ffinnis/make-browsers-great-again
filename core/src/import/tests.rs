@@ -12,9 +12,6 @@ fn write(path: &Path, contents: impl AsRef<[u8]>) {
     fs::write(path, contents).unwrap();
 }
 
-/// A home folder with Arc, Chrome (two profiles), Helium, an unknown
-/// Chromium fork, Firefox and Safari, plus things that must not be
-/// detected: an Electron app and MBGA's own engine data.
 #[expect(clippy::too_many_lines, reason = "one fixture that lays out a whole home folder")]
 fn fixture_home(name: &str) -> PathBuf {
     let home = std::env::temp_dir().join(format!("mbga-import-{name}-{}", std::process::id()));
@@ -101,7 +98,6 @@ fn fixture_home(name: &str) -> PathBuf {
         .to_string(),
     );
 
-    // Helium has no profile list in its Local State: "Default" is found anyway.
     write(&support.join("net.imput.helium/Local State"), "{}");
     write(
         &support.join("net.imput.helium/Default/Bookmarks"),
@@ -181,8 +177,6 @@ fn exclude(home: &Path) -> PathBuf {
 
 #[test]
 fn session_file_replays_to_open_tabs() {
-    // Written by Chromium 154: example.com navigated to example.org, a
-    // Wikipedia tab opened, an IANA tab closed.
     let tabs = snss::parse(SESSION).unwrap();
     let urls: Vec<&str> = tabs.iter().map(|t| t.url.as_str()).collect();
     assert_eq!(urls, ["https://example.org/", "https://www.wikipedia.org/"]);
@@ -231,7 +225,6 @@ fn arc_sidebar_becomes_profiles_spaces_and_favorites() {
             tab("https://example.com/", "Renamed"),
         ]
     );
-    // arc:// pages are left behind.
     assert_eq!(space.today, [tab("https://news.ycombinator.com/", "HN")]);
 
     let work = &arc.profiles[1];
@@ -302,8 +295,6 @@ fn importing_into_a_fresh_state_replaces_the_empty_space() {
     let (counts, made) = apply(&mut state, &chosen, 1);
     assert_eq!(counts, Counts { spaces: 3, pinned: 6, favorites: 2, today: 1 });
 
-    // The unused "Personal" profile and "Home" space are gone; Arc's took
-    // over, in Arc's sidebar order.
     let names: Vec<&str> = state.profiles.iter().map(|p| p.name.as_str()).collect();
     assert_eq!(names, ["Personal", "Work"]);
     assert_eq!(made, state.profiles.iter().map(|p| p.id).collect::<Vec<_>>());
@@ -344,10 +335,8 @@ fn importing_into_a_used_state_adds_alongside() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// A cookie row: host, name, value, encrypted value, expiry and top-frame site.
 type CookieRow<'a> = (&'a str, &'a str, &'a str, &'a [u8], i64, &'a str);
 
-/// Chromium's cookie table as of version 24, with the columns read.
 fn chromium_cookies(path: &Path, version: u32, rows: &[CookieRow]) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let db = Connection::open(path).unwrap();
@@ -373,7 +362,7 @@ fn chromium_cookies_decrypt_with_the_keychain_password() {
     let home = fixture_home("cookies");
     let sources = detect(&home, &exclude(&home));
     let chrome = &sources[1];
-    let future = 13_500_000_000_000_000; // 2028, in microseconds since 1601
+    let future = 13_500_000_000_000_000;
     let encrypted = cookies::encrypt_for_test(b"peanuts", ".github.com", "secret-session");
     let foreign = cookies::encrypt_for_test(b"other", "x.com", "nope");
     chromium_cookies(
@@ -394,7 +383,6 @@ fn chromium_cookies_decrypt_with_the_keychain_password() {
         got,
         [(".github.com", "user_session", "secret-session", future), ("example.com", "plain", "visible", 0)]
     );
-    // SameSite=None without Secure would be refused, so it's left unspecified.
     assert!(read[0].secure && read[0].http_only && read[0].same_site == 0);
     assert_eq!(cookies::keychain_service(chrome).as_deref(), Some("Chrome Safe Storage"));
     assert_eq!(cookies::keychain_service(&sources[0]).as_deref(), Some("Arc Safe Storage"));
@@ -424,7 +412,6 @@ fn firefox_cookies_are_read_in_the_clear() {
     let read = cookies::read(firefox, &firefox.profiles[0].id, None, 1_790_000_000_000).unwrap();
     let names: Vec<&str> = read.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["sid", "ms"]);
-    // Seconds and milliseconds land on the same moment.
     assert_eq!(read[0].expires, read[1].expires);
     assert_eq!(read[0].expires, 11_644_473_600_000_000 + 1_900_000_000_000_000);
     assert_eq!((read[0].same_site, read[1].same_site), (1, -1));
@@ -484,7 +471,6 @@ fn chromium_passwords_decrypt_with_the_keychain_password() {
     );
     assert_eq!(read.never, ["https://ads.example/"]);
     assert_eq!(read.unreadable, 1);
-    // Microseconds since 1601 become milliseconds since 1970.
     assert_eq!(
         (read.logins[0].created_ms, read.logins[0].used_ms, read.logins[0].changed_ms),
         (1_655_526_400_000, 1_705_526_400_000, 1_695_526_400_000)
@@ -543,7 +529,6 @@ fn firefox_passwords_decrypt_with_key4() {
         }]
     );
 
-    // A Primary Password seals the check differently.
     let db = Connection::open(profile.join("key4.db")).unwrap();
     db.execute(
         "UPDATE metaData SET item2 = ?1",

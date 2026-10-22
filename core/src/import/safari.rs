@@ -1,6 +1,3 @@
-//! Safari bookmarks from "~/Library/Safari/Bookmarks.plist". macOS only lets
-//! an app read it with Full Disk Access.
-
 use super::{ImportedProfile, ImportedSpace, Item};
 use plist::Value;
 use std::path::Path;

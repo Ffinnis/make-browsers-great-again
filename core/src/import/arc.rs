@@ -1,14 +1,3 @@
-//! Arc's sidebar from "StorableSidebar.json": spaces with their profiles,
-//! icons and colors, pinned tabs and folders, Today tabs and favorites.
-//!
-//! The file is undocumented, so everything is read defensively. Its shape:
-//! `sidebar.containers[]` holds one container with `spaces` and `items`,
-//! both arrays where objects alternate with their ID strings. A space names
-//! its pinned and Today containers in `newContainerIDs` (`{"pinned": {}},
-//! "<id>", {"unpinned": {}}, "<id>"`); every item has `childrenIds`, and tabs
-//! carry `data.tab.savedURL`. Favorites are the children of the containers
-//! in `topAppsContainerIDs`, keyed by profile the same way.
-
 use super::{ImportedProfile, ImportedSpace, Item};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -17,8 +6,6 @@ use std::path::Path;
 
 pub const SIDEBAR_FILE: &str = "StorableSidebar.json";
 
-/// Arc's data directory ("~/Library/Application Support/Arc") to profiles,
-/// each with the spaces that use it.
 pub fn load(arc_dir: &Path) -> Result<Vec<ImportedProfile>, String> {
     let bytes = fs::read(arc_dir.join(SIDEBAR_FILE)).map_err(|e| format!("Can't read Arc's sidebar: {e}"))?;
     let root: Value = serde_json::from_slice(&bytes).map_err(|_| "Arc's sidebar file is not valid JSON".to_string())?;
@@ -62,7 +49,6 @@ pub fn load(arc_dir: &Path) -> Result<Vec<ImportedProfile>, String> {
         profiles[i].spaces.push(imported);
     }
 
-    // Favorites: [{"default": true}, "<container>", {"custom": ...}, "<container>"].
     if let Some(list) = container["topAppsContainerIDs"].as_array() {
         for pair in list.windows(2) {
             if let (Some(key), Some(id)) = (pair[0].as_object(), pair[1].as_str()) {
@@ -76,7 +62,6 @@ pub fn load(arc_dir: &Path) -> Result<Vec<ImportedProfile>, String> {
     Ok(profiles)
 }
 
-/// Objects of an array in which objects alternate with their ID strings.
 fn objects(list: &Value) -> impl Iterator<Item = &Value> {
     list.as_array().into_iter().flatten().filter(|v| v.is_object())
 }
@@ -86,7 +71,6 @@ fn container_id<'a>(ids: &'a Value, kind: &str) -> Option<&'a str> {
     list.windows(2).find(|pair| pair[0].get(kind).is_some()).and_then(|pair| pair[1].as_str())
 }
 
-/// `{"default": true}` or `{"custom": {"_0": {"directoryBasename": "Profile 1"}}}`.
 fn profile_dir(profile: &Value) -> String {
     profile["custom"]["_0"]["directoryBasename"].as_str().unwrap_or("Default").to_string()
 }
@@ -117,7 +101,6 @@ fn children(items: &HashMap<&str, &Value>, parent: &str) -> Vec<Item> {
                 out.push(Item::tab(url, title));
             }
         } else if item["data"].get("splitView").is_some() {
-            // A split view becomes its tabs, side by side in the list.
             out.extend(children(items, id));
         } else {
             let nested = children(items, id);
@@ -139,8 +122,6 @@ fn flatten_tabs(items: Vec<Item>) -> Vec<Item> {
         .collect()
 }
 
-/// `customInfo.iconType` is `{"emoji_v2": "🏠"}`, or `{"emoji": <code point>}`
-/// in older files.
 fn icon(info: &Value) -> Option<String> {
     let icon = &info["iconType"];
     icon["emoji_v2"]
@@ -152,8 +133,6 @@ fn icon(info: &Value) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The first `{red, green, blue}` color (0-1 components) in the space's
-/// theme, which is the first stop of its gradient.
 fn color(theme: &Value) -> Option<u32> {
     match theme {
         Value::Object(map) => {

@@ -1,14 +1,3 @@
-//! Other browsers' saved passwords.
-//!
-//! Chromium-based browsers (Arc too) keep them in each profile's "Login
-//! Data" database (and "Login Data For Account" for those saved to the
-//! person's account), encrypted like their cookies with the key in their
-//! keychain item. Firefox keeps them in "logins.json", encrypted with a key
-//! that "key4.db" holds, itself sealed with the Primary Password (empty for
-//! most people). Safari's live in the system's Passwords app, which only
-//! gives them out as an exported file; so do password managers, hence
-//! `read_csv`.
-
 use super::cookies::{columns, decrypt_value, derive_key};
 use super::{firefox, Kind, Source};
 use crate::crypto::{self, Cipher, Hash};
@@ -18,16 +7,13 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Microseconds from 1601 (Chromium's clock) to 1970.
 const UNIX_EPOCH_US: i64 = 11_644_473_600_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImportedLogin {
-    /// The page it was saved on; only its origin matters.
     pub url: String,
     pub username: String,
     pub password: String,
-    /// Milliseconds since 1970, 0 when unknown.
     pub created_ms: u64,
     pub used_ms: u64,
     pub changed_ms: u64,
@@ -36,13 +22,10 @@ pub struct ImportedLogin {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Read {
     pub logins: Vec<ImportedLogin>,
-    /// Sites the person told the browser never to save a password for.
     pub never: Vec<String>,
-    /// Saved passwords that couldn't be decrypted.
     pub unreadable: u32,
 }
 
-/// Where one profile of a Chromium-based `source` keeps its passwords.
 fn chromium_databases(source: &Source, profile_id: &str) -> Vec<PathBuf> {
     let data_dir = Path::new(&source.id);
     let profile =
@@ -50,8 +33,6 @@ fn chromium_databases(source: &Source, profile_id: &str) -> Vec<PathBuf> {
     ["Login Data", "Login Data For Account"].iter().map(|f| profile.join(f)).filter(|p| p.exists()).collect()
 }
 
-/// How many passwords one profile of `source` has saved, without
-/// decrypting them. Safari's can't be counted.
 pub fn count(source: &Source, profile_id: &str) -> u32 {
     match source.kind {
         Kind::Arc | Kind::Chromium => chromium_databases(source, profile_id)
@@ -74,8 +55,6 @@ pub fn count(source: &Source, profile_id: &str) -> u32 {
     }
 }
 
-/// One profile's passwords. Chromium-based browsers need their keychain
-/// `password`.
 pub fn read(source: &Source, profile_id: &str, password: Option<&[u8]>) -> Result<Read, String> {
     match source.kind {
         Kind::Arc | Kind::Chromium => {
@@ -129,8 +108,6 @@ fn read_chromium(db: &Connection, key: &[u8]) -> rusqlite::Result<Read> {
     })?;
     for (origin, realm, username, encrypted, never, [created, used, changed]) in rows.filter_map(Result::ok) {
         let url = if origin.is_empty() { realm } else { origin };
-        // Android apps ("android://…") and federated sign-ins have no web
-        // password to fill.
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             continue;
         }
@@ -165,10 +142,6 @@ fn chromium_ms(us: i64) -> u64 {
     }
 }
 
-// ------------------------------------------------------------------ Firefox
-
-/// The web logins in a Firefox profile's "logins.json"; logins for HTTP
-/// authentication dialogs are left out.
 fn firefox_logins(profile: &Path) -> Option<Vec<Value>> {
     let bytes = fs::read(profile.join("logins.json")).ok()?;
     let json: Value = serde_json::from_slice(&bytes).ok()?;
@@ -213,8 +186,6 @@ fn read_firefox(profile: &Path) -> Result<Read, String> {
     Ok(read)
 }
 
-/// The key that encrypts the profile's logins, from "key4.db", if no
-/// Primary Password seals it.
 fn firefox_key(profile: &Path) -> Result<Vec<u8>, String> {
     let db = profile.join("key4.db");
     if !db.exists() {
@@ -242,7 +213,6 @@ fn firefox_key(profile: &Path) -> Result<Vec<u8>, String> {
         .ok_or_else(|| "Can't decrypt its password key.".into())
 }
 
-/// NSS's fixed ID for the key that seals Firefox's logins.
 const KEY_ID: [u8; 16] = [0xf8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
 
 mod oid {
@@ -252,7 +222,6 @@ mod oid {
     pub const DES_EDE3_CBC: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x03, 0x07];
 }
 
-/// A DER element: its tag, its contents and what follows it.
 fn der(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let (&tag, rest) = input.split_first()?;
     let (&first, mut rest) = rest.split_first()?;
@@ -270,7 +239,6 @@ fn der(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
 }
 
-/// The elements inside a DER SEQUENCE.
 fn sequence(input: &[u8]) -> Option<Vec<(u8, &[u8])>> {
     let (tag, body, _) = der(input)?;
     if tag != 0x30 {
@@ -279,7 +247,6 @@ fn sequence(input: &[u8]) -> Option<Vec<(u8, &[u8])>> {
     inner(body)
 }
 
-/// The elements in the `contents` of a constructed element.
 fn inner(mut contents: &[u8]) -> Option<Vec<(u8, &[u8])>> {
     let mut out = Vec::new();
     while !contents.is_empty() {
@@ -305,8 +272,6 @@ fn integer(contents: &[u8]) -> u32 {
     contents.iter().fold(0u32, |n, &b| n << 8 | u32::from(b))
 }
 
-/// Decrypts a password-based encrypted blob of "key4.db" (the password
-/// check, or a key) with `global_salt` and the Primary Password.
 fn decrypt_pbe(blob: &[u8], global_salt: &[u8], primary: &[u8]) -> Option<Vec<u8>> {
     let outer = sequence(blob)?;
     let (_, algorithm) = outer.first()?;
@@ -316,7 +281,6 @@ fn decrypt_pbe(blob: &[u8], global_salt: &[u8], primary: &[u8]) -> Option<Vec<u8
     let (_, params) = algorithm.get(1)?;
     let password = crypto::digest(Hash::Sha1, &[global_salt, primary].concat());
     if *id == oid::PBES2 {
-        // PBKDF2-HMAC-SHA256 then AES-256-CBC.
         let params = inner(params)?;
         let kdf = inner(params.first()?.1)?;
         let kdf_params = inner(kdf.get(1)?.1)?;
@@ -327,12 +291,10 @@ fn decrypt_pbe(blob: &[u8], global_salt: &[u8], primary: &[u8]) -> Option<Vec<u8
             return None;
         }
         let iv = scheme.get(1)?.1;
-        // NSS stores 14 bytes of the IV and its DER header makes up the rest.
         let iv = if iv.len() == 14 { [&[0x04, 0x0e], iv].concat() } else { iv.to_vec() };
         let key = crypto::pbkdf2(Hash::Sha256, &password, salt, rounds, 32)?;
         crypto::cbc(false, Cipher::Aes, &key, &iv, ciphertext)
     } else if *id == oid::PBE_SHA1_3DES {
-        // NSS's own PKCS#12-like derivation, from before Firefox 72.
         let params = inner(params)?;
         let salt = params.first()?.1;
         let mut padded = salt.to_vec();
@@ -348,7 +310,6 @@ fn decrypt_pbe(blob: &[u8], global_salt: &[u8], primary: &[u8]) -> Option<Vec<u8
     }
 }
 
-/// Decrypts an encrypted username or password of "logins.json".
 fn decrypt_login_field(key: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     let parts = sequence(blob)?;
     let algorithm = inner(parts.get(1)?.1)?;
@@ -363,11 +324,6 @@ fn decrypt_login_field(key: &[u8], blob: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-// --------------------------------------------------------------------- CSV
-
-/// Passwords exported to a CSV file: by the Passwords app (Safari),
-/// Chrome, Firefox, 1Password, Bitwarden and most others. Columns are found
-/// by their names.
 pub fn read_csv(text: &str) -> Result<Read, String> {
     let mut rows = parse_csv(text.trim_start_matches('\u{feff}')).into_iter();
     let header: Vec<String> =
@@ -403,7 +359,6 @@ pub fn read_csv(text: &str) -> Result<Read, String> {
     Ok(read)
 }
 
-/// RFC 4180: commas, quoted fields with doubled quotes, any line ending.
 fn parse_csv(text: &str) -> Vec<Vec<String>> {
     let mut rows = Vec::new();
     let mut row = Vec::new();
@@ -450,7 +405,6 @@ fn parse_csv(text: &str) -> Vec<Vec<String>> {
 pub(super) mod test_support {
     use super::*;
 
-    /// Encrypts like NSS: PBES2 with PBKDF2-HMAC-SHA256 and AES-256-CBC.
     pub fn pbes2(plain: &[u8], global_salt: &[u8], salt: &[u8], iv14: &[u8]) -> Vec<u8> {
         let password = crypto::digest(Hash::Sha1, global_salt);
         let key = crypto::pbkdf2(Hash::Sha256, &password, salt, 1, 32).unwrap();
@@ -465,7 +419,6 @@ pub(super) mod test_support {
         seq(&[seq(&[tlv(0x06, oid::PBES2), seq(&[kdf, scheme])]), tlv(0x04, &ciphertext)])
     }
 
-    /// A "logins.json" field encrypted with 3DES under `key`.
     pub fn login_field(key: &[u8], plain: &str) -> String {
         let iv = [7u8; 8];
         let ciphertext = crypto::cbc(true, Cipher::TripleDes, &key[..24], &iv, plain.as_bytes()).unwrap();

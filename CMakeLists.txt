@@ -1,7 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
 
-# Configure with scripts/build.sh, which fetches CEF and Ninja first.
-
 set(MBGA_MIN_MACOS 15.0)
 set(CMAKE_OSX_ARCHITECTURES arm64)
 set(CMAKE_OSX_DEPLOYMENT_TARGET ${MBGA_MIN_MACOS})
@@ -16,13 +14,8 @@ set(MBGA_PRODUCT_NAME "MBGA")
 set(MBGA_BUNDLE_ID "dev.mbga.browser")
 set(MBGA_VERSION "0.0.8")
 option(MBGA_MOCK_KEYCHAIN "Use a mock keychain (avoids prompts on ad-hoc signed builds)" ON)
-# Releases (scripts/release.sh) update themselves from GitHub; builds from
-# source don't, so a new release never replaces the copy you're working on.
 option(MBGA_UPDATES "Update from MBGA's releases on GitHub" OFF)
 set(MBGA_UPDATE_PUBLIC_KEY "HQrQqNM/GyMsslsnQmag+Y9mTGB2YHt1WsyouwlPpjw=")
-# Builds are signed ad hoc. Releases are signed with a development identity
-# and the hardened runtime; Xcode then signs them with the Developer ID and
-# has Apple notarize them (scripts/release.sh).
 set(MBGA_SIGN_IDENTITY "-" CACHE STRING "Code signing identity (- signs ad hoc)")
 if(MBGA_SIGN_IDENTITY STREQUAL "-")
   set(MBGA_SIGN codesign --force --sign -)
@@ -41,8 +34,6 @@ endif()
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/out")
 
-# ----------------------------------------------------------------------- CEF
-
 set(CEF_ROOT "${CMAKE_SOURCE_DIR}/third_party/cef/dist")
 if(NOT EXISTS "${CEF_ROOT}/cmake/FindCEF.cmake")
   message(FATAL_ERROR "CEF not found in ${CEF_ROOT}. Run scripts/fetch-cef.sh.")
@@ -50,11 +41,8 @@ endif()
 list(APPEND CMAKE_MODULE_PATH "${CEF_ROOT}/cmake")
 find_package(CEF REQUIRED)
 add_subdirectory(${CEF_LIBCEF_DLL_WRAPPER_PATH} libcef_dll_wrapper)
-# FindCEF lowers the deployment target for its own code; ours needs macOS 15.
 set(CMAKE_OSX_DEPLOYMENT_TARGET ${MBGA_MIN_MACOS})
 set(CEF_FRAMEWORK "${CEF_BINARY_DIR_RELEASE}/Chromium Embedded Framework.framework")
-
-# ----------------------------------------------------------------- Rust core
 
 find_program(CARGO cargo HINTS "$ENV{HOME}/.cargo/bin" REQUIRED)
 set(CORE_DIR "${CMAKE_SOURCE_DIR}/core")
@@ -71,8 +59,6 @@ add_custom_command(
           "${CARGO}" build --release --lib
           --manifest-path "${CORE_DIR}/Cargo.toml"
           --target-dir "${CORE_TARGET_DIR}"
-  # The bindgen CLI lives behind a feature so it never ends up in the app;
-  # build it in its own target dir to keep the library's features lean.
   COMMAND ${CMAKE_COMMAND} -E env MACOSX_DEPLOYMENT_TARGET=${MBGA_MIN_MACOS}
           "${CARGO}" run --release --quiet --features bindgen
           --bin uniffi-bindgen
@@ -87,8 +73,6 @@ add_custom_command(
   VERBATIM)
 add_custom_target(mbga_core DEPENDS "${CORE_LIB}" "${CORE_SWIFT}")
 
-# ------------------------------------------------------------- engine bridge
-
 add_library(mbga_engine STATIC
   shell/engine/MBEngine.h
   shell/engine/MBEngine.mm)
@@ -99,10 +83,6 @@ if(MBGA_MOCK_KEYCHAIN)
 endif()
 add_dependencies(mbga_engine libcef_dll_wrapper)
 
-# ------------------------------------------------------------ helper bundles
-
-# The engine starts its subprocesses from these bundles. One per process
-# type, all from the same executable, as Chromium expects on macOS.
 set(MBGA_HELPER_TARGETS "")
 set(MBGA_HELPER_NAMES "")
 foreach(_suffixes ${CEF_HELPER_APP_SUFFIXES})
@@ -121,12 +101,10 @@ foreach(_suffixes ${CEF_HELPER_APP_SUFFIXES})
   SET_EXECUTABLE_TARGET_PROPERTIES(${_target})
   add_dependencies(${_target} libcef_dll_wrapper)
   target_link_libraries(${_target} libcef_dll_wrapper ${CEF_STANDARD_LIBS})
-  # A new Info.plist (another version) relinks it, so it's signed again.
   set_target_properties(${_target} PROPERTIES
     MACOSX_BUNDLE_INFO_PLIST "${_plist}"
     OUTPUT_NAME "${MBGA_HELPER_NAME}"
     LINK_DEPENDS "${_plist}")
-  # Signed here, when it relinks, so the copy in the app is never rewritten.
   add_custom_command(TARGET ${_target} POST_BUILD
     COMMAND ${MBGA_SIGN_HELPER} "$<TARGET_BUNDLE_DIR:${_target}>"
     VERBATIM)
@@ -134,8 +112,6 @@ foreach(_suffixes ${CEF_HELPER_APP_SUFFIXES})
   list(APPEND MBGA_HELPER_TARGETS ${_target})
   list(APPEND MBGA_HELPER_NAMES "${MBGA_HELPER_NAME}")
 endforeach()
-
-# ----------------------------------------------------------------------- app
 
 file(GLOB MBGA_SWIFT_SOURCES CONFIGURE_DEPENDS shell/app/*.swift)
 set_source_files_properties("${CORE_SWIFT}" PROPERTIES GENERATED TRUE)
@@ -153,15 +129,10 @@ target_compile_options(mbga PRIVATE
 target_link_libraries(mbga PRIVATE
   mbga_engine libcef_dll_wrapper "${CORE_LIB}" ${CEF_STANDARD_LIBS})
 
-# The `mbga` command agents use; it goes into Contents/Resources/bin.
 add_executable(mbga_cli shell/cli/main.swift)
 set_target_properties(mbga_cli PROPERTIES OUTPUT_NAME "mbga-cli")
 add_dependencies(mbga mbga_cli)
 
-# Assemble the bundle: helpers and the framework go into Contents/Frameworks.
-# The framework (~320 MB) is copied and signed only when CEF changes: macOS
-# scans rewritten code again before it runs, which held the first launch after
-# every build for seconds.
 set(_app "$<TARGET_BUNDLE_DIR:mbga>")
 set(_cef "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${MBGA_PRODUCT_NAME}.app/Contents/Frameworks/Chromium Embedded Framework.framework")
 add_custom_command(
@@ -189,13 +160,9 @@ endforeach()
 add_custom_command(TARGET mbga POST_BUILD
   COMMAND mkdir -p "${_app}/Contents/Resources/bin"
   COMMAND cp "$<TARGET_FILE:mbga_cli>" "${_app}/Contents/Resources/bin/mbga"
-  # The helper extension, which extension support loads in every profile.
   COMMAND rsync -a --delete "${CMAKE_SOURCE_DIR}/shell/resources/extension/"
           "${_app}/Contents/Resources/extension/"
   VERBATIM)
-# The app icon: actool compiles the Icon Composer document (its layer is made
-# from assets/icon.svg by scripts/make-icon.sh) into Assets.car for macOS 26
-# and AppIcon.icns for older systems.
 set(_icon "${CMAKE_SOURCE_DIR}/shell/resources/AppIcon.icon")
 set(_icon_out "${CMAKE_BINARY_DIR}/icon")
 add_custom_command(
@@ -211,9 +178,6 @@ add_dependencies(mbga mbga_icon)
 add_custom_command(TARGET mbga POST_BUILD
   COMMAND cp "${_icon_out}/Assets.car" "${_icon_out}/AppIcon.icns" "${_app}/Contents/Resources/"
   VERBATIM)
-# Not --deep: the framework and helpers are signed already, and re-signing
-# them would rewrite them. swiftc's dependency file (unused by Ninja) can't
-# sit in Contents/MacOS then.
 add_custom_command(TARGET mbga POST_BUILD
   COMMAND rm -f "$<TARGET_FILE:mbga>.d"
   COMMAND ${MBGA_SIGN} "${_app}/Contents/Resources/bin/mbga"

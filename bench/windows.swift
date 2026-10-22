@@ -1,5 +1,3 @@
-// Prints how many normal on-screen windows the given process owns.
-// Usage: windows <pid> [--bounds]   (--bounds: the windows' frames as JSON)
 import CoreGraphics
 import Foundation
 

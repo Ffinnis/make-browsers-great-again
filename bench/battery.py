@@ -76,8 +76,6 @@ def run_once(browser, scenario):
     background, front = pages(scenario)
     data = os.path.join(WORK, f"{browser.key}-{scenario}")
     is_mbga = browser.key == "mbga"
-    # DevTools is only used outside the measurement windows, to check the
-    # pages stayed on screen and did what the scenario needs.
     if is_mbga:
         tabs = (
             {"pinned": background, "today": [front]}
@@ -88,12 +86,10 @@ def run_once(browser, scenario):
         proc = MBGA.launch(data, devtools=True)
     else:
         browser.prepare(data)
-        # Chromium shows the first URL given on the command line.
         proc = browser.launch(data, [front, *background], devtools=True)
     result = {"first_window_s": wait_for_window(proc.pid)}
     time.sleep(2)
     if is_mbga and background:
-        # Visiting each tab loads it; the last one (the article) stays on screen.
         MBGA.select_every_tab([len(background) + 1])
     activate(proc.pid)
     t0 = time.time()

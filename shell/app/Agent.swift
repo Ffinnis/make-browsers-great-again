@@ -1,18 +1,11 @@
 import AppKit
 import JavaScriptCore
 
-// The commands agents run, built to keep their context small: a page is a
-// short outline of what can be read and used, each element with a ref
-// ("e12") to act on, instead of HTML or screenshots. Pages are read through
-// a JavaScript world of MBGA's own, which shares the page's DOM but not its
-// scripts, and acted on with real (trusted) input events.
-
 struct AgentError: Error {
     let message: String
     init(_ message: String) { self.message = message }
 }
 
-/// Lets only the first of a reply and a timeout through.
 @MainActor
 private final class Once {
     private var done = false
@@ -22,11 +15,9 @@ private final class Once {
     }
 }
 
-/// Parsed command line: words, and --flags with optional values.
 struct AgentArguments {
     var words: [String] = []
     var flags: [String: String] = [:]
-    /// Which agent is asking: each has its own current tab.
     var session = "default"
 
     init(_ argv: ArraySlice<String>) {
@@ -57,11 +48,8 @@ struct AgentArguments {
 @MainActor
 final class AgentCommands {
     private let store: BrowserStore
-    /// MBGA's JavaScript world in each frame, by execution context.
     private var worlds: [WorldKey: Int] = [:]
-    /// Each agent's current tab.
     private var sessionTabs: [String: UInt64] = [:]
-    /// The cross-site frames the last snapshot of each tab numbered.
     private var frameNumbers: [UInt64: [Int: FrameRef]] = [:]
 
     private struct WorldKey: Hashable {
@@ -69,8 +57,6 @@ final class AgentCommands {
         let frame: String?
     }
 
-    /// A frame of a page: its id, and the DevTools session reaching it if
-    /// it runs in a process of its own.
     struct FrameRef {
         let id: String
         let session: String?
@@ -127,10 +113,6 @@ final class AgentCommands {
         }
     }
 
-    // MARK: Tabs
-
-    /// The tab a command is for: --tab, else the one the agent last used,
-    /// else the one on screen.
     private func target(_ args: AgentArguments) throws -> UInt64 {
         if let name = args.flags["tab"] {
             guard let id = UInt64(name.hasPrefix("t") ? String(name.dropFirst()) : name), store.core.tab(id: id) != nil else {
@@ -143,15 +125,11 @@ final class AgentCommands {
         return id
     }
 
-    /// The tab's page, loading it if it was asleep. Sites the person keeps
-    /// agents off are refused.
     private func page(_ id: UInt64) async throws -> MBWebView {
         if let url = store.core.tab(id: id)?.url { try allow(url) }
         let loaded = store.isLoaded(id)
         guard let view = store.engineView(for: id) else { throw AgentError("Tab t\(id) has no page.") }
         if !loaded { try await waitForLoad(id, timeout: 15) }
-        // From now on its requests are logged and its cross-site frames
-        // can be read.
         view.recordsNetwork = true
         view.attachToFrames()
         store.agentActed(on: id)
@@ -172,7 +150,6 @@ final class AgentCommands {
         return text
     }
 
-    /// The agents' space and the one on screen (every space with --all).
     private func tabs(_ args: AgentArguments) -> String {
         var out: [String] = []
         let agents = store.agentPreferences.ownSpace ? store.agentPreferences.spaceID : nil
@@ -184,7 +161,6 @@ final class AgentCommands {
             if space.id == agents { title += " (agents' space)" }
             if space.id == store.activeSpace.id { title += " (on screen)" }
             out.append(title + ":")
-            // The agents' space shows the person's favourites too; they aren't the agents' tabs.
             let tabs = (space.id == agents ? [] : space.favorites) + space.pinned.compactMap(\.tab) + space.today
             if tabs.isEmpty { out.append("  (no tabs)") }
             for tab in tabs {
@@ -245,8 +221,6 @@ final class AgentCommands {
         return out.joined(separator: "\n")
     }
 
-    // MARK: Reading
-
     private func snapshot(_ args: AgentArguments) async throws -> String {
         let id = try target(args)
         let view = try await page(id)
@@ -275,7 +249,6 @@ final class AgentCommands {
         guard !args.words.isEmpty else { throw AgentError("Usage: mbga eval '<expression>' (runs in the page's own world)") }
         let id = try target(args)
         let view = try await page(id)
-        // In the page's world, so its own globals and frameworks are there.
         let result = try await cdp(view, "Runtime.evaluate", [
             "expression": args.words.joined(separator: " "), "returnByValue": true, "awaitPromise": true,
             "userGesture": true,
@@ -285,8 +258,6 @@ final class AgentCommands {
         return Self.json(value)
     }
 
-    /// `cdp <method> [json]`, in test copies only: a raw DevTools command,
-    /// for checking what the inspector sends.
     private func rawCommand(_ args: AgentArguments) async throws -> String {
         guard let method = args[0] else { throw AgentError("Usage: mbga cdp <method> [json]") }
         let view = try await page(try target(args))
@@ -296,8 +267,6 @@ final class AgentCommands {
         return Self.json(try await cdp(view, method, params, timeout: args.int("timeout").map(Double.init) ?? 5))
     }
 
-    /// `inspector <panel|at|eval|select|source|row> [arg]`, in test copies
-    /// only: drives the inspector sidebar on the visible tab.
     private func inspectorCommand(_ args: AgentArguments) async throws -> String {
         let action = args[0] ?? ""
         let rest = args.words.dropFirst().joined(separator: " ")
@@ -305,7 +274,6 @@ final class AgentCommands {
             store.showInspector(panel)
             return "showing \(panel.rawValue)"
         }
-        // As if "Inspect" were chosen at a point of the page, in CSS pixels.
         if action == "at" {
             let view = try await page(try target(args))
             let point = rest.split(separator: " ").compactMap { Double($0) }
@@ -353,8 +321,6 @@ final class AgentCommands {
         return out.joined(separator: "\n")
     }
 
-    /// Requests since the agent first used the tab: number, method,
-    /// status, type, path, size, time. --body N prints a response.
     private func network(_ args: AgentArguments) async throws -> String {
         let id = try target(args)
         let view = try await page(id)
@@ -393,8 +359,6 @@ final class AgentCommands {
         return out.joined(separator: "\n")
     }
 
-    // MARK: Acting
-
     private func click(_ args: AgentArguments) async throws -> String {
         let target = try await element(args, usage: "mbga click <ref> [--force]")
         let (id, view) = (target.id, target.view)
@@ -426,7 +390,6 @@ final class AgentCommands {
         let text = args.words.dropFirst().joined(separator: " ")
         let prefix = target.frameNumber.map { "f\($0):" } ?? ""
         let label = prefix + (try await call(id, view, "focus", ["ref": ref, "select": !append], in: frame) as? String ?? ref)
-        // Typing goes to the frame's own process when it has one.
         if text.isEmpty {
             try await key(view, "Backspace", session: frame?.session)
         } else {
@@ -437,7 +400,6 @@ final class AgentCommands {
             try await key(view, "Enter", session: frame?.session)
             return "filled \(label) and pressed Enter" + (try await settle(id, from: before))
         }
-        // As it is now, with the text in it.
         return "filled " + ((try? await call(id, view, "label", ref, in: frame) as? String).map { prefix + $0 } ?? label)
     }
 
@@ -544,8 +506,6 @@ final class AgentCommands {
         let width = size["width"] as? Double ?? 800, height = size["height"] as? Double ?? 600
         let full = args.has("full")
         var params: [String: Any] = ["format": "png"]
-        // At CSS pixels, not the display's: a quarter of the size for the same
-        // detail an agent can use.
         let scale = 1 / max(size["dpr"] as? Double ?? 1, 1)
         if full {
             let page = size["page"] as? Double ?? height
@@ -555,8 +515,6 @@ final class AgentCommands {
             let scrollY = size["scrollY"] as? Double ?? 0, scrollX = size["scrollX"] as? Double ?? 0
             params["clip"] = ["x": scrollX, "y": scrollY, "width": width, "height": height, "scale": scale]
         }
-        // A tab out of sight draws nothing to capture: it draws behind the
-        // page on screen meanwhile, where the person doesn't see it.
         let restore = store.renderBehind(id)
         defer { restore() }
         if id != store.visibleTabID { try await Task.sleep(for: .milliseconds(300)) }
@@ -570,11 +528,6 @@ final class AgentCommands {
         return "\(path) (\(Int(width)) × \(Int(full ? (size["page"] as? Double ?? height) : height)))"
     }
 
-    // MARK: Scripts
-
-    /// `mbga run`: a script with the commands as async functions, run here
-    /// so one call can open, act and extract across pages, and only what it
-    /// returns or logs comes back.
     private func runScript(_ args: AgentArguments) async throws -> String {
         guard let source = args.words.first, !source.isEmpty else {
             throw AgentError("Usage: mbga run <file.js | - | -e 'code'>")
@@ -583,10 +536,6 @@ final class AgentCommands {
         return try await script.run(source)
     }
 
-    // MARK: Helpers
-
-    /// The element a command names: a ref (in a cross-site frame for
-    /// "fN:eM"), css= or text=.
     private func element(_ args: AgentArguments, usage: String) async throws -> Target {
         guard var ref = args[0] else { throw AgentError("Usage: \(usage)") }
         let id = try target(args)
@@ -609,8 +558,6 @@ final class AgentCommands {
         let frameNumber: Int?
     }
 
-    /// Where on the page to click an element: in a frame, its point in the
-    /// frame plus the frame's place on the page.
     private func point(_ target: Target) async throws -> (x: Double, y: Double, label: String, covered: String) {
         var origin = (x: 0.0, y: 0.0)
         if let number = target.frameNumber {
@@ -623,8 +570,6 @@ final class AgentCommands {
                 point["covered"] as? String ?? "")
     }
 
-    /// After an action: waits for a navigation it started, and says where
-    /// the page went.
     private func settle(_ id: UInt64, from before: String?) async throws -> String {
         try await Task.sleep(for: .milliseconds(200))
         if store.navState(of: id).isLoading { try await waitForLoad(id, timeout: 15) }
@@ -689,8 +634,6 @@ final class AgentCommands {
         _ = try await cdp(view, "Input.dispatchKeyEvent", up, session: session)
     }
 
-    /// A DevTools command, given up on after `timeout` so no command hangs
-    /// (a page can stop answering, or wait for a frame that never comes).
     private func cdp(_ view: MBWebView, _ method: String, _ params: [String: Any]? = nil,
                      session: String? = nil, timeout: Double = 20) async throws -> [String: Any] {
         let json = try params.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
@@ -710,8 +653,6 @@ final class AgentCommands {
         return (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] ?? [:]
     }
 
-    /// Calls one of AgentScript's functions in MBGA's world in the tab's
-    /// page, making the world first (again after a navigation).
     private func call(_ id: UInt64, _ view: MBWebView, _ function: String, _ argument: Any?,
                       in frame: FrameRef? = nil) async throws -> Any? {
         let argumentJSON = argument.map { Self.json($0) } ?? "null"
@@ -728,7 +669,6 @@ final class AgentCommands {
             }
             if let exception = result["exceptionDetails"] as? [String: Any] {
                 let message = Self.describe(exception)
-                // The world went with the page it was made in.
                 if attempt == 0, message.contains("__mbga is not defined") { continue }
                 throw AgentError(message.replacingOccurrences(of: "Error: ", with: ""))
             }
@@ -737,8 +677,6 @@ final class AgentCommands {
         throw AgentError("The page changed while reading it; try again.")
     }
 
-    /// MBGA's world in a frame (the main frame if none), made on first use
-    /// and again after the frame navigates.
     private func world(_ id: UInt64, _ view: MBWebView, frame: FrameRef?, fresh: Bool) async throws -> Int {
         let key = WorldKey(tab: id, frame: frame?.id)
         if !fresh, let context = worlds[key] { return context }
@@ -757,16 +695,12 @@ final class AgentCommands {
         return context
     }
 
-    /// Reads the cross-site frames a snapshot left markers for (they run in
-    /// processes of their own) and puts their outlines in place, with refs
-    /// "fN:eM".
     private func expandFrames(_ id: UInt64, _ view: MBWebView, _ text: String, _ options: [String: Any]) async throws -> String {
         let tree = try await cdp(view, "Page.getFrameTree")
         let children = ((tree["frameTree"] as? [String: Any])?["childFrames"] as? [[String: Any]] ?? [])
             .compactMap { ($0["frame"] as? [String: Any])?["id"] as? String }
         let main = try await world(id, view, frame: nil, fresh: false)
         var numbers: [Int: FrameRef] = [:]
-        // Which iframe element each frame is, as the snapshot numbered them.
         for frameID in children {
             guard let owner = try? await cdp(view, "DOM.getFrameOwner", ["frameId": frameID]),
                   let node = owner["backendNodeId"] as? Int,
@@ -804,7 +738,6 @@ final class AgentCommands {
             out.append("\(indent)frame \(label):")
             for innerLine in inner.components(separatedBy: "\n") where !innerLine.isEmpty {
                 var line = innerLine.replacingOccurrences(of: "[e", with: "[f\(number):e")
-                // Frames inside it stay unread.
                 if let mark = line.range(of: "\u{1}F") {
                     let after = line[mark.upperBound...].split(separator: "\u{1}", maxSplits: 1)
                     line = String(line[..<mark.lowerBound]) + "[frame]" + (after.count > 1 ? after[1] : "") + " (not read)"
@@ -833,7 +766,6 @@ final class AgentCommands {
     }
 }
 
-/// The page side, defined once in MBGA's world of each page.
 enum AgentScript {
     static let source = #"""
     (() => {
@@ -1072,9 +1004,6 @@ enum AgentScript {
     """#
 }
 
-/// Runs `mbga run` scripts in JavaScriptCore, inside MBGA: each command is
-/// an async function resolving to its text, `evaluate` runs a function in
-/// the page and returns its value, `log` collects output.
 @MainActor
 final class AgentScriptRunner {
     private let commands: AgentCommands

@@ -1,7 +1,3 @@
-# SwiftLint rules for shell/ and bench/. scripts/check.sh runs them through
-# scripts/swiftlint-ratchet.py with --strict, so a warning fails the check
-# like an error does. Code that broke a size rule before it existed is
-# listed in .swiftlint-baseline.json and may shrink but not grow.
 included:
   - shell
   - bench
@@ -50,21 +46,15 @@ opt_in_rules:
   - yoda_condition
 
 disabled_rules:
-  # SwiftFormat owns layout.
   - opening_brace
   - trailing_comma
   - vertical_parameter_alignment
   - modifier_order
   - statement_position
-  # Short names like x, y, id and dx are the clearest in drawing code.
   - identifier_name
   - type_name
-  # String(decoding:as:) is how the shell reads page and network bytes on
-  # purpose: invalid UTF-8 shows as a replacement character, not as nothing.
   - optional_data_string_conversion
 
-# Size and complexity limits. Past the warning level a type, file or function
-# is doing more than one job and should be split.
 line_length:
   warning: 140
   error: 200

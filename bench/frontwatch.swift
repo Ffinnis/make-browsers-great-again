@@ -1,6 +1,3 @@
-// Prints the share of time (0-1) the given app was frontmost, sampled every
-// half second for the given number of seconds.
-// Usage: frontwatch <pid> <seconds>
 import AppKit
 
 guard CommandLine.arguments.count == 3, let pid = pid_t(CommandLine.arguments[1]),

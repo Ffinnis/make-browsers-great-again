@@ -1,7 +1,4 @@
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
-# CodeRabbit reviews every pull request. Work lands on dev (CONTRIBUTING.md),
-# and CodeRabbit only reviews pull requests into the default branch, main,
-# unless told otherwise, so dev is listed here.
 language: en-US
 reviews:
   profile: chill
@@ -17,8 +14,6 @@ reviews:
     - "!third_party/**"
     - "!core/Cargo.lock"
     - "!.swiftlint-baseline.json"
-  # scripts/check.sh already runs these with the repository's own settings in
-  # CI; CodeRabbit's copies would repeat its findings with other versions.
   tools:
     swiftlint:
       enabled: false

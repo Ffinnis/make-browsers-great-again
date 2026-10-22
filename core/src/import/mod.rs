@@ -1,16 +1,3 @@
-//! Importing from other browsers installed on this Mac.
-//!
-//! Detection scans the user's Application Support folder for browser data:
-//! known browsers by location, plus any other Chromium- or Firefox-based
-//! browser by the files they leave (so new forks are found too). Each source
-//! profile is read into plain `ImportedProfile` data, which `apply` turns
-//! into MBGA profiles, spaces, pinned trees, Today tabs and favorites.
-//!
-//! Tabs and bookmarks are copied into MBGA's state; cookies, read
-//! separately by `cookies`, go into the engine so imported profiles stay
-//! signed in, and passwords, read by `passwords`, into MBGA's password
-//! store. History stays in the other browser.
-
 mod arc;
 mod chromium;
 pub mod cookies;
@@ -43,7 +30,6 @@ impl Item {
 
 #[derive(Debug, Clone)]
 pub struct ImportedSpace {
-    /// Position in the browser's sidebar, across its profiles.
     pub position: usize,
     pub name: String,
     pub icon: Option<String>,
@@ -52,11 +38,8 @@ pub struct ImportedSpace {
     pub today: Vec<Item>,
 }
 
-/// One profile of another browser: its spaces (one for browsers without
-/// spaces) and favorites.
 #[derive(Debug, Clone)]
 pub struct ImportedProfile {
-    /// The profile's directory, unique within its browser.
     pub id: String,
     pub name: String,
     pub spaces: Vec<ImportedSpace>,
@@ -73,23 +56,19 @@ pub enum Kind {
 
 #[derive(Debug, Clone)]
 pub struct Source {
-    /// The browser's data directory, unique per source.
     pub id: String,
     pub name: String,
     pub kind: Kind,
     pub bundle_id: Option<String>,
     pub icon: &'static str,
     pub profiles: Vec<ImportedProfile>,
-    /// Why nothing could be read, e.g. missing Full Disk Access for Safari.
     pub error: Option<String>,
 }
 
-/// Sidebar items worth importing: web pages and local files.
 fn importable(url: &str) -> bool {
     url.starts_with("https://") || url.starts_with("http://") || url.starts_with("file://")
 }
 
-/// (data directory under Application Support, name, bundle ID, space icon).
 const CHROMIUM_BROWSERS: &[(&str, &str, &str, &str)] = &[
     ("Google/Chrome", "Chrome", "com.google.Chrome", "🌐"),
     ("Google/Chrome Beta", "Chrome Beta", "com.google.Chrome.beta", "🌐"),
@@ -116,8 +95,6 @@ const FIREFOX_BROWSERS: &[(&str, &str, &str, &str)] = &[
 
 const ARC_DIR: &str = "Arc";
 
-/// Every browser with importable data under `home`, Arc first. `exclude`
-/// is MBGA's own data directory, which also looks like a Chromium browser.
 pub fn detect(home: &Path, exclude: &Path) -> Vec<Source> {
     let support = home.join("Library/Application Support");
     let mut sources = Vec::new();
@@ -126,8 +103,6 @@ pub fn detect(home: &Path, exclude: &Path) -> Vec<Source> {
     detect_firefox(&support, &mut sources);
     detect_safari(home, &mut sources);
 
-    // A browser with nothing but sign-ins or passwords is still worth
-    // bringing.
     sources.retain(|s| {
         s.error.is_some()
             || s.profiles.iter().any(|p| {
@@ -156,14 +131,12 @@ fn detect_arc(support: &Path, sources: &mut Vec<Source>) {
     }
 }
 
-/// The known Chromium browsers, then any fork that looks like one.
 fn detect_chromium(support: &Path, exclude: &Path, sources: &mut Vec<Source>) {
     let arc = support.join(ARC_DIR);
     let mut chromium_dirs: Vec<(PathBuf, String, Option<String>, &'static str)> = CHROMIUM_BROWSERS
         .iter()
         .map(|(dir, name, bundle, icon)| (support.join(dir), name.to_string(), Some(bundle.to_string()), *icon))
         .collect();
-    // Unknown Chromium forks: any "Local State" one or two levels down.
     for dir in subdirs(support).into_iter().flat_map(|d| {
         let nested = subdirs(&d);
         std::iter::once(d).chain(nested)
@@ -201,7 +174,6 @@ fn detect_chromium(support: &Path, exclude: &Path, sources: &mut Vec<Source>) {
     }
 }
 
-/// The known Firefox browsers, then any fork that looks like one.
 fn detect_firefox(support: &Path, sources: &mut Vec<Source>) {
     let mut firefox_dirs: Vec<(PathBuf, String, Option<String>, &'static str)> = FIREFOX_BROWSERS
         .iter()
@@ -246,7 +218,6 @@ fn detect_safari(home: &Path, sources: &mut Vec<Source>) {
             Ok(p) => (vec![p], None),
             Err(e) => (Vec::new(), Some(e)),
         };
-        // A Mac whose Safari was never used has no bookmarks file at all.
         if !profiles.is_empty() || error.as_deref() == Some(safari::NEEDS_ACCESS) {
             sources.push(Source {
                 id: safari.to_string_lossy().into_owned(),
@@ -261,8 +232,6 @@ fn detect_safari(home: &Path, sources: &mut Vec<Source>) {
     }
 }
 
-/// Runs `read` on a copy of the `SQLite` database at `path`: browsers keep
-/// theirs locked while they run.
 fn read_copy<T>(path: &Path, read: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, String> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let tmp = std::env::temp_dir().join(format!(
@@ -274,7 +243,6 @@ fn read_copy<T>(path: &Path, read: impl FnOnce(&Connection) -> rusqlite::Result<
     let copy = tmp.join("db.sqlite");
     let result = (|| {
         fs::copy(path, &copy).map_err(|e| e.to_string())?;
-        // Recent changes may still be in the write-ahead log.
         let mut wal = path.as_os_str().to_owned();
         wal.push("-wal");
         let _ = fs::copy(wal, tmp.join("db.sqlite-wal"));
@@ -297,7 +265,6 @@ fn subdirs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// "net.example.browser" -> "Browser", "Foo/Foo Browser" -> "Foo Browser".
 fn display_name(support: &Path, dir: &Path) -> String {
     let rel = dir.strip_prefix(support).unwrap_or(dir);
     let last = rel.iter().rfind(|c| *c != "User Data").map(|c| c.to_string_lossy().into_owned());
@@ -340,11 +307,6 @@ pub fn count(p: &ImportedProfile) -> Counts {
     }
 }
 
-/// Adds the chosen profiles to `state`: an MBGA profile for each (so each
-/// keeps its own cookies and logins), their spaces, pinned trees, Today
-/// tabs and favorites. Every imported tab starts asleep. A state nobody has
-/// used yet (one empty space) is replaced rather than added to. Also returns
-/// the MBGA profile made for each of `sources`, in order.
 pub fn apply(state: &mut State, sources: &[(&Source, &ImportedProfile)], now: u64) -> (Counts, Vec<Id>) {
     let pristine = state.profiles.len() == 1 && state.spaces.len() == 1 && state.tabs.is_empty();
     let old_space = state.spaces[0].id;
@@ -353,11 +315,8 @@ pub fn apply(state: &mut State, sources: &[(&Source, &ImportedProfile)], now: u6
     let mut first_space = None;
     let mut made = Vec::new();
 
-    // Profiles first, then every space in its browser's sidebar order (Arc
-    // interleaves spaces of different profiles).
     let mut spaces: Vec<(usize, usize, Id, &Source, &ImportedSpace)> = Vec::new();
     for (source, profile) in sources {
-        // The unused default profile is about to go, so its name is free.
         let taken = |state: &State, name: &str| {
             state.profiles.iter().any(|p| p.name == name && !(pristine && p.id == old_profile))
         };

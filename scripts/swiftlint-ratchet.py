@@ -22,8 +22,6 @@ from collections import defaultdict
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BASELINE = os.path.join(ROOT, ".swiftlint-baseline.json")
-# "currently spans 671 lines", "currently it has 156 characters",
-# "currently complexity is 19", "it currently has 7".
 SIZE = re.compile(r"currently (?:spans |contains |it has |complexity is |has )?(\d+)")
 
 
@@ -33,7 +31,6 @@ def size(reason):
 
 
 def key(rule, file, text):
-    # A file's length is reported at its last line, whatever that holds.
     return (rule, file, "" if rule == "file_length" else text.strip())
 
 
@@ -65,7 +62,6 @@ def main():
         text = lines[v["line"] - 1] if v["line"] and v["line"] <= len(lines) else ""
         sizes = allowed[key(v["rule_id"], file, text)]
         now = size(v["reason"])
-        # Use up the closest grandfathered entry that's at least as bad.
         fits = [s for s in sizes if s is None or now is None or now <= s]
         if fits:
             sizes.remove(min(fits, key=lambda s: -1 if s is None else s))

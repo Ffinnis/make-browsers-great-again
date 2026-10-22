@@ -1,17 +1,8 @@
 import AppKit
 
-// Network: every request the page makes, with headers, bodies and timing.
-
-// MARK: - Model
-
-/// One request in the log. A redirect leaves its earlier hop behind as an
-/// entry of its own.
 @MainActor
 final class NetRequest {
-    /// Unique in the log: the protocol's id, with a suffix for hops that
-    /// redirected.
     fileprivate(set) var key: String
-    /// The protocol's id, for commands about it.
     let requestID: String
     let loaderID: String
     let url: String
@@ -22,8 +13,6 @@ final class NetRequest {
     var mime = ""
     var requestHeaders: [(name: String, value: String)] = []
     var responseHeaders: [(name: String, value: String)] = []
-    /// Headers as sent and received on the wire (cookies included), when
-    /// the engine reports them.
     var rawRequestHeaders: [(name: String, value: String)]?
     var rawResponseHeaders: [(name: String, value: String)]?
     var responseHeadersText: String?
@@ -32,26 +21,20 @@ final class NetRequest {
     var referrerPolicy: String?
     var initiator: JSON?
     var timing: JSON?
-    /// Bytes over the network, and decoded.
     var transferred: Double = 0
     var resourceSize: Double = 0
-    /// Monotonic seconds, as the protocol's timestamps.
     let start: Double
-    /// Seconds since 1970 when it started.
     let wallTime: Double
     var responseTime: Double?
     var end: Double?
     var failure: String?
     var canceled = false
     var blockedReason: String?
-    /// "memory cache", "disk cache", "prefetch cache" or "ServiceWorker".
     var cache: String?
     var remoteAddress: String?
     var protocolName: String?
-    /// WebSocket frames and EventSource messages.
     var frames: [NetFrame] = []
     var isRedirect = false
-    /// Bumped on every change, so the details pane knows to redraw.
     var version = 0
 
     init(requestID: String, loaderID: String, url: String, method: String, type: String, start: Double, wallTime: Double) {
@@ -68,7 +51,6 @@ final class NetRequest {
     var isFinished: Bool { end != nil }
     var isFailed: Bool { failure != nil || (status ?? 0) >= 400 }
 
-    /// The last part of the path and the query, as the Name column shows.
     lazy var displayName: String = {
         if url.hasPrefix("data:") { return String(url.prefix(40)) }
         guard let parts = URLComponents(string: url) else { return url }
@@ -80,7 +62,6 @@ final class NetRequest {
 
     lazy var host: String = URLComponents(string: url)?.host ?? ""
 
-    /// The type as the Type column shows it: images by their format.
     var typeLabel: String {
         switch type {
         case "Image":
@@ -112,7 +93,6 @@ final class NetRequest {
 
     var duration: Double? { end.map { $0 - start } }
 
-    /// The script line or document that made it, short.
     var initiatorLabel: String {
         guard let initiator else { return "" }
         if let frame = initiator.obj("stack")?.list("callFrames").first(where: { !($0.str("url") ?? "").isEmpty }) {
@@ -137,7 +117,6 @@ final class NetRequest {
         return name.isEmpty || name == "/" ? (parts.host ?? url) : name
     }
 
-    /// The headers a request went out with, the wire's if known.
     var sentHeaders: [(name: String, value: String)] { rawRequestHeaders ?? requestHeaders }
     var receivedHeaders: [(name: String, value: String)] { rawResponseHeaders ?? responseHeaders }
 
@@ -146,38 +125,30 @@ final class NetRequest {
     }
 }
 
-/// A WebSocket frame or EventSource message.
 struct NetFrame {
     let sent: Bool
     let time: Double
-    /// 1 text, 2 binary, 8 close…; -1 an error, 0 an EventSource message.
     let opcode: Int
     let data: String
 }
 
-/// The tab's requests since the inspector began following it (or since
-/// its page last loaded, without Preserve log).
 @MainActor
 final class NetworkModel: InspectorModel {
     private weak var session: InspectorSession?
     private(set) var requests: [NetRequest] = []
     private var byID: [String: NetRequest] = [:]
-    /// Wire headers reported before their request.
     private var pendingRequestHeaders: [String: [(name: String, value: String)]] = [:]
     private var pendingResponse: [String: JSON] = [:]
     private var bodies: [String: (text: String, base64: Bool)] = [:]
     private var redirects = 0
     let changed = Signal<Void>()
 
-    /// New requests are logged.
     var recording = true {
         didSet { changed.send() }
     }
-    /// The log survives the page loading again.
     var preservesLog = false {
         didSet { changed.send() }
     }
-    /// Shared with the developer toolbar, which keeps them per tab.
     var cacheDisabled: Bool {
         get { session?.developerState?().cacheDisabled ?? false }
         set {
@@ -192,15 +163,11 @@ final class NetworkModel: InspectorModel {
             changed.send()
         }
     }
-    /// URL patterns the page may not load.
     private(set) var blocked: [String] = []
 
-    /// When the page's main document was requested, and its events fired
-    /// (monotonic seconds).
     private(set) var navigationStart: Double?
     private(set) var domContentLoaded: Double?
     private(set) var loaded: Double?
-    /// The latest time any event reported, for requests still going.
     private(set) var latest: Double = 0
 
     static let limit = 3000
@@ -219,13 +186,11 @@ final class NetworkModel: InspectorModel {
             self?.loaded = params.num("timestamp")
             self?.changed.send()
         }
-        // Bodies are kept only within these buffers.
         session.call("Network.enable", ["maxTotalBufferSize": 200_000_000, "maxResourceBufferSize": 50_000_000,
                                         "maxPostDataSize": 1_000_000])
     }
 
     func stop() {
-        // The engine turns the domain off; what this panel changed goes back.
         if !blocked.isEmpty { session?.call("Network.setBlockedURLs", ["urls": [String]()]) }
     }
 
@@ -240,8 +205,6 @@ final class NetworkModel: InspectorModel {
         loaded = nil
         changed.send()
     }
-
-    // MARK: Commands
 
     func block(_ pattern: String) {
         guard !blocked.contains(pattern) else { return }
@@ -264,7 +227,6 @@ final class NetworkModel: InspectorModel {
         session?.call("Network.clearBrowserCache")
     }
 
-    /// The response body: text, or base64 for binary responses.
     func body(of request: NetRequest) async -> (text: String, base64: Bool)? {
         if let body = bodies[request.key] { return body }
         guard !request.isRedirect, request.type != "WebSocket", let session,
@@ -274,7 +236,6 @@ final class NetworkModel: InspectorModel {
         return body
     }
 
-    /// What the request sent, fetched if the event left it out.
     func postData(of request: NetRequest) async -> String? {
         if let data = request.postData { return data }
         guard request.hasPostData, let session,
@@ -283,13 +244,10 @@ final class NetworkModel: InspectorModel {
         return request.postData
     }
 
-    // MARK: Events
-
     static func headers(_ object: JSON?) -> [(name: String, value: String)] {
         guard let object else { return [] }
         var headers: [(name: String, value: String)] = []
         for (name, value) in object {
-            // Repeated headers arrive joined by newlines.
             for line in "\(value)".split(separator: "\n", omittingEmptySubsequences: false) {
                 headers.append((name, String(line)))
             }
@@ -439,7 +397,6 @@ final class NetworkModel: InspectorModel {
         loaded = nil
         navigationStart = requests.last { $0.loaderID == loader && $0.type == "Document" }?.start ?? latest
         if !preservesLog {
-            // The new page's own requests, its document first, stay.
             requests.removeAll { $0.loaderID != loader && $0.type != "WebSocket" || $0.type == "WebSocket" && $0.isFinished }
             byID = byID.filter { entry in requests.contains { $0 === entry.value } }
             let keys = Set(requests.map(\.key))
@@ -449,9 +406,6 @@ final class NetworkModel: InspectorModel {
     }
 }
 
-// MARK: - Panel
-
-/// The kinds the type chips pick, in their order.
 @MainActor
 private enum NetKind: Int, CaseIterable {
     case all, fetch, document, css, script, font, image, media, manifest, socket, wasm, other
@@ -608,8 +562,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
         empty.autoresizingMask = [.width, .height]
     }
 
-    // MARK: Binding
-
     override func sessionChanged() {
         model?.changed.stopObserving(self)
         model = session?.model(NetworkModel.self)
@@ -628,8 +580,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
     override func focusFilter() { window?.makeFirstResponder(filter) }
 
     override func cancelOperation(_ sender: Any?) { closeDetail() }
-
-    // MARK: Rows
 
     private func matches(_ request: NetRequest) -> Bool {
         if !kinds.contains(.all), !kinds.contains(NetKind.of(request)) { return false }
@@ -706,8 +656,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
         footer.text = parts.joined(separator: " · ")
     }
 
-    // MARK: Table
-
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -756,7 +704,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
         }
     }
 
-    /// The times the waterfall spans: the first request to the last event.
     private func span() -> (Double, Double) {
         guard let model, let first = model.requests.first?.start else { return (0, 1) }
         let start = min(model.navigationStart ?? first, first)
@@ -766,7 +713,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
 
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { InspectorRowView() }
 
-    /// The name takes what the other columns leave, so they all fit.
     private func fitNameColumn() {
         guard let name = table.tableColumn(withIdentifier: NSUserInterfaceItemIdentifier("name")) else { return }
         let spacing = table.intercellSpacing.width
@@ -816,8 +762,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
         }
         return false
     }
-
-    // MARK: Menus
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
@@ -904,8 +848,6 @@ final class NetworkPanel: InspectorPanelView, NSTableViewDataSource, NSTableView
     }
 }
 
-// MARK: - Copying
-
 @MainActor
 private enum NetCopy {
     static func headers(_ headers: [(name: String, value: String)]) -> String {
@@ -953,9 +895,6 @@ private enum NetCopy {
     }
 }
 
-// MARK: - Cells
-
-/// A request's bar across the page's span: waiting light, receiving solid.
 private final class WaterfallCell: NSView {
     var start: CGFloat = 0
     var response: CGFloat?
@@ -981,7 +920,6 @@ private final class WaterfallCell: NSView {
     }
 }
 
-/// The summary line along the panel's foot.
 private final class FooterBar: FlippedView {
     private let label = Label.make("", size: 11, color: .secondaryLabelColor)
     private let line = CALayer()
@@ -1018,14 +956,11 @@ private final class FooterBar: FlippedView {
     }
 }
 
-// MARK: - Details
-
 private enum DetailTab: String {
     case headers = "Headers", payload = "Payload", preview = "Preview", response = "Response"
     case initiator = "Initiator", timing = "Timing", messages = "Messages", cookies = "Cookies"
 }
 
-/// A stack frame or script location that opens in Sources when clicked.
 private final class LocationNode: ValueNode {
     let url: String
     let line: Int
@@ -1045,7 +980,6 @@ private final class LocationNode: ValueNode {
     override var copyText: String { "\(url):\(line + 1):\(column + 1)" }
 }
 
-/// The selected request in detail, a tab at a time.
 private final class RequestDetailView: FlippedView {
     weak var session: InspectorSession?
     weak var model: NetworkModel?
@@ -1069,7 +1003,6 @@ private final class RequestDetailView: FlippedView {
     private let timingScroll = NSScrollView()
     private let frames = FramesTable()
     private let message = InspectorEmptyView("")
-    /// The body of the request shown, once fetched.
     private var body: (text: String, base64: Bool)?
     private var bodyKey: String?
     private var prettyPrinted = true
@@ -1132,7 +1065,6 @@ private final class RequestDetailView: FlippedView {
         refresh()
     }
 
-    /// Redraws if the request changed since it was shown.
     func refresh() {
         guard let request else { return }
         guard request.version != shownVersion else { return }
@@ -1372,7 +1304,6 @@ private final class RequestDetailView: FlippedView {
     }
 }
 
-/// Where the time of one request went, phase by phase.
 private final class TimingView: FlippedView {
     private var phases: [(name: String, start: Double, end: Double, color: NSColor)] = []
     private var total: Double = 0
@@ -1437,7 +1368,6 @@ private final class TimingView: FlippedView {
     }
 }
 
-/// WebSocket frames and EventSource messages, oldest first.
 @MainActor
 private final class FramesTable: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     let table = InspectorTableView()

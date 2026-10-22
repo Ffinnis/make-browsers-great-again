@@ -1,6 +1,5 @@
-# shell/engine and shell/helper follow Chromium's style, like the CEF code
-# they call into, keeping short ifs and case labels on one line.
 BasedOnStyle: Chromium
 AllowShortIfStatementsOnASingleLine: WithoutElse
 AllowShortCaseLabelsOnASingleLine: true
 IncludeBlocks: Preserve
+FixNamespaceComments: false
