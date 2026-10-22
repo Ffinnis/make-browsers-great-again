@@ -1398,10 +1398,10 @@ extension BrowserStore {
         return store.views[id] != nil && store.navStates[id] != nil
     }
 
-    func renderBehind(_ id: UInt64) -> () -> Void {
+    func keepDrawing(_ id: UInt64) -> Bool {
         let store = keeper(of: id)
-        guard id != store.visibleTabID, let view = store.views[id] else { return {} }
-        return store.webContainer.renderBehind(view)
+        guard id != store.visibleTabID, let view = store.views[id] else { return false }
+        return store.webContainer.keepDrawing(view, for: 30)
     }
 
     func navState(of id: UInt64) -> NavState { keeper(of: id).navStates[id] ?? NavState() }

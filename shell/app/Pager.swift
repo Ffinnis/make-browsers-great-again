@@ -188,6 +188,8 @@ final class WebContainerView: NSView {
     private lazy var devToolsHeader = DevToolsHeaderView { [weak self] in self?.current?.closeDevTools() }
     private weak var dockedWindow: NSWindow?
     private lazy var devToolsHandle = DevToolsResizeHandle { [weak self] x in self?.resizeDevTools(to: x) }
+    private let outOfSight = NSHashTable<MBWebView>.weakObjects()
+    private let outOfSightTimers = NSMapTable<MBWebView, Timer>.weakToStrongObjects()
 
     override var isFlipped: Bool { true }
 
@@ -267,16 +269,38 @@ final class WebContainerView: NSView {
 }
 
 extension WebContainerView {
-    func renderBehind(_ view: MBWebView) -> () -> Void {
-        guard view.superview === self, view !== current else { return {} }
-        view.layer?.zPosition = -1
-        view.frame = pageArea == .zero ? bounds : pageArea
-        view.isHidden = false
-        return { [weak self, weak view] in
-            guard let view, view !== self?.current else { return }
-            view.isHidden = true
-            view.layer?.zPosition = 0
+    func keepDrawing(_ view: MBWebView, for seconds: TimeInterval) -> Bool {
+        guard view.superview === self, view !== current else { return false }
+        let started = view.isHidden
+        if started {
+            outOfSight.add(view)
+            placeOutOfSight(view)
+            view.isHidden = false
         }
+        outOfSightTimers.object(forKey: view)?.invalidate()
+        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self, weak view] _ in
+            MainActor.assumeIsolated {
+                guard let self, let view else { return }
+                self.putAway(view)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        outOfSightTimers.setObject(timer, forKey: view)
+        return started
+    }
+
+    private func putAway(_ view: MBWebView) {
+        outOfSight.remove(view)
+        outOfSightTimers.removeObject(forKey: view)
+        guard view !== current, view.superview === self else { return }
+        view.isHidden = true
+        view.frame = bounds
+    }
+
+    func placeOutOfSight(_ view: MBWebView) {
+        let area = pageArea == .zero ? bounds : pageArea
+        let frame = area.offsetBy(dx: bounds.width + 64, dy: 0)
+        if view.frame != frame { view.frame = frame }
     }
 
     func viewportChanged() {
@@ -291,6 +315,9 @@ extension WebContainerView {
         if area != pageArea {
             pageArea = area
             onPageAreaChange?()
+        }
+        for view in outOfSight.allObjects where view !== current && !view.isHidden {
+            placeOutOfSight(view)
         }
         guard let current else { return }
         guard let size = viewport?(current) else {

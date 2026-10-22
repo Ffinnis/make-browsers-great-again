@@ -44,6 +44,11 @@ enum AgentSettings {
             "",
             "`mbga` (~/.local/bin/mbga) drives the browser the person uses on this Mac. Your tabs open in its Agents space, off the person's screen, so they keep working while you do. Read pages with `snapshot` or `read`, not screenshots: far fewer tokens. When you know the page, write code: `mbga run` executes a whole script in one call, and `mbga eval` runs JavaScript in the page.",
             "",
+            "`open`, `goto`, `click` and `press` return once the page has loaded and its requests have quieted down, "
+                + "so don't `sleep` after them; for content that arrives later, use `mbga wait text <words>`. "
+                + "Refs change when the page does: after a navigation or reload, `snapshot` again before using them. "
+                + "If a click says a button is disabled or a checkbox didn't change, read why on the page rather than forcing it.",
+            "",
             "If a command says it can't reach MBGA, ask the person to open MBGA and turn on Settings > Agents.",
             "",
             "```",
@@ -58,6 +63,11 @@ enum AgentSettings {
         } catch {
             return error.localizedDescription
         }
+    }
+
+    static func refreshClaudeSkill() {
+        guard FileManager.default.fileExists(atPath: claudeSkill.path), !guide.isEmpty else { return }
+        _ = installClaudeSkill()
     }
 
     static let instructions = [
@@ -92,6 +102,7 @@ final class AgentServer {
         NotificationCenter.default.addObserver(self, selector: #selector(update),
                                                name: UserDefaults.didChangeNotification, object: nil)
         update()
+        DispatchQueue.global(qos: .utility).async { AgentSettings.refreshClaudeSkill() }
     }
 
     @objc private func update() {
