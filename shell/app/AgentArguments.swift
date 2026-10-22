@@ -12,7 +12,7 @@ struct AgentArguments {
                 let body = arg.dropFirst(2)
                 if let eq = body.firstIndex(of: "=") {
                     flags[String(body[..<eq])] = String(body[body.index(after: eq)...])
-                } else if ["tab", "max", "out", "timeout", "body", "filter"].contains(body), let value = rest.popFirst() {
+                } else if ["tab", "max", "out", "timeout", "body", "filter", "times"].contains(body), let value = rest.popFirst() {
                     flags[String(body)] = value
                 } else {
                     flags[String(body)] = ""

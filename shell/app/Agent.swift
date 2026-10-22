@@ -15,7 +15,18 @@ private final class Once {
 }
 
 @MainActor
+final class DrawingHolds {
+    var releases: [UInt64: () -> Void] = [:]
+
+    func releaseAll() {
+        releases.values.forEach { $0() }
+        releases = [:]
+    }
+}
+
+@MainActor
 final class AgentCommands {
+    @TaskLocal static var drawing: DrawingHolds?
     private let store: BrowserStore
     private var worlds: [WorldKey: Int] = [:]
     private var sessionTabs: [String: UInt64] = [:]
@@ -42,8 +53,10 @@ final class AgentCommands {
         let command = argv[0].lowercased()
         var args = AgentArguments(argv.dropFirst())
         args.session = session
+        let drawing = DrawingHolds()
+        defer { drawing.releaseAll() }
         do {
-            return .success(try await perform(command, args))
+            return try .success(await Self.$drawing.withValue(drawing) { try await perform(command, args) })
         } catch let error as AgentError {
             return .failure(error.message)
         } catch {
@@ -102,7 +115,11 @@ final class AgentCommands {
         view.recordsNetwork = true
         view.attachToFrames()
         store.agentActed(on: id)
-        if store.keepDrawing(id) { try await Task.sleep(for: .milliseconds(300)) }
+        if Self.drawing?.releases[id] == nil {
+            let hold = store.holdDrawing(id)
+            if let drawing = Self.drawing { drawing.releases[id] = hold.release } else { hold.release() }
+            if hold.started { try await Task.sleep(for: .milliseconds(300)) }
+        }
         return view
     }
 
@@ -823,7 +840,8 @@ enum AgentScript {
     const clean = (s, n) => { s = (s || '').replace(/\s+/g, ' ').trim(); return n && s.length > n ? s.slice(0, n - 1) + '…' : s; };
     const ref = el => { let r = S.refOf.get(el); if (!r) { r = 'e' + S.next++; S.refOf.set(el, r); } S.byRef.set(r, el); return r; };
     const shown = el => el.checkVisibility
-      ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) || getComputedStyle(el).display === 'contents'
+      ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+        || (getComputedStyle(el).display === 'contents' && !!el.parentElement && shown(el.parentElement))
       : el.getClientRects().length > 0;
     // A ref from a snapshot, or css=<selector> / text=<words> for code
     // that already knows the page.

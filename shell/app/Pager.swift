@@ -190,6 +190,7 @@ final class WebContainerView: NSView {
     private lazy var devToolsHandle = DevToolsResizeHandle { [weak self] x in self?.resizeDevTools(to: x) }
     private let outOfSight = NSHashTable<MBWebView>.weakObjects()
     private let outOfSightTimers = NSMapTable<MBWebView, Timer>.weakToStrongObjects()
+    private let drawingHolds = NSMapTable<MBWebView, NSNumber>.weakToStrongObjects()
 
     override var isFlipped: Bool { true }
 
@@ -269,8 +270,8 @@ final class WebContainerView: NSView {
 }
 
 extension WebContainerView {
-    func keepDrawing(_ view: MBWebView, for seconds: TimeInterval) -> Bool {
-        guard view.superview === self, view !== current else { return false }
+    func holdDrawing(_ view: MBWebView, grace: TimeInterval) -> (started: Bool, release: () -> Void) {
+        guard view.superview === self, view !== current else { return (false, {}) }
         let started = view.isHidden
         if started {
             outOfSight.add(view)
@@ -278,15 +279,35 @@ extension WebContainerView {
             view.isHidden = false
         }
         outOfSightTimers.object(forKey: view)?.invalidate()
-        let timer = Timer(timeInterval: seconds, repeats: false) { [weak self, weak view] _ in
-            MainActor.assumeIsolated {
-                guard let self, let view else { return }
-                self.putAway(view)
+        outOfSightTimers.removeObject(forKey: view)
+        drawingHolds.setObject(NSNumber(value: (drawingHolds.object(forKey: view)?.intValue ?? 0) + 1), forKey: view)
+        var released = false
+        return (started, { [weak self, weak view] in
+            guard !released, let self, let view else { return }
+            released = true
+            let holds = (drawingHolds.object(forKey: view)?.intValue ?? 1) - 1
+            guard holds <= 0 else {
+                drawingHolds.setObject(NSNumber(value: holds), forKey: view)
+                return
             }
-        }
-        RunLoop.main.add(timer, forMode: .common)
-        outOfSightTimers.setObject(timer, forKey: view)
-        return started
+            drawingHolds.removeObject(forKey: view)
+            let timer = Timer(timeInterval: grace, repeats: false) { [weak self, weak view] _ in
+                MainActor.assumeIsolated {
+                    guard let self, let view, self.drawingHolds.object(forKey: view) == nil else { return }
+                    self.putAway(view)
+                }
+            }
+            RunLoop.main.add(timer, forMode: .common)
+            outOfSightTimers.setObject(timer, forKey: view)
+        })
+    }
+
+    func stopDrawing(_ view: MBWebView) {
+        outOfSightTimers.object(forKey: view)?.invalidate()
+        outOfSightTimers.removeObject(forKey: view)
+        drawingHolds.removeObject(forKey: view)
+        outOfSight.remove(view)
+        view.isHidden = true
     }
 
     private func putAway(_ view: MBWebView) {

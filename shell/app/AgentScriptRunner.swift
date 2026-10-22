@@ -52,6 +52,7 @@ final class AgentScriptRunner {
         guard let context = JSContext() else { throw AgentError("Couldn't start a script.") }
         let call: @convention(block) (JSValue) -> JSValue = { [weak self] argv in
             let words = argv.toArray()?.compactMap { $0 as? String } ?? []
+            let context: JSContext = argv.context
             return JSValue(newPromiseIn: context) { resolve, reject in
                 Task { @MainActor in
                     guard let self else { return }
