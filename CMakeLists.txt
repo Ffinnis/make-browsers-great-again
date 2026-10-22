@@ -14,7 +14,7 @@ project(mbga LANGUAGES C CXX Swift)
 
 set(MBGA_PRODUCT_NAME "MBGA")
 set(MBGA_BUNDLE_ID "dev.mbga.browser")
-set(MBGA_VERSION "0.0.7")
+set(MBGA_VERSION "0.0.8")
 option(MBGA_MOCK_KEYCHAIN "Use a mock keychain (avoids prompts on ad-hoc signed builds)" ON)
 # Releases (scripts/release.sh) update themselves from GitHub; builds from
 # source don't, so a new release never replaces the copy you're working on.
