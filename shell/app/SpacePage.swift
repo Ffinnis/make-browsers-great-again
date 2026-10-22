@@ -1,10 +1,7 @@
 import AppKit
 
-/// macOS sidebar scale, as in Dia, rather than Arc's larger rows.
 let sidebarRowHeight: CGFloat = 30
 
-/// What a tab row shows. Equatable so a snapshot only redraws rows whose
-/// content actually changed.
 struct TabRowData: Equatable {
     let tab: TabInfo
     let active: Bool
@@ -14,19 +11,15 @@ struct TabRowData: Equatable {
     let mediaPaused: Bool
 }
 
-/// One row of a space's list: pinned tabs and folders, the Today divider,
-/// the tidy-up offer, New Tab, and Today tabs.
 enum SidebarRow: Equatable {
     case pinnedTab(TabRowData, PinnedRow)
     case folder(PinnedRow, renaming: Bool)
-    /// Where to drop when nothing is pinned yet.
     case pinZone(expanded: Bool)
     case divider(hasToday: Bool)
     case cleanup(Int)
     case newTab
     case todayTab(TabRowData, index: Int)
 
-    /// Stable identity, for animating insertions and removals.
     var id: String {
         switch self {
         case .pinnedTab(let data, _): "tab-\(data.tab.id)"
@@ -48,7 +41,6 @@ enum SidebarRow: Equatable {
         }
     }
 
-    /// Tabs, folders and New Tab sit on a pill when hovered or selected.
     var hasPill: Bool {
         switch self {
         case .pinnedTab, .folder, .newTab, .todayTab: true
@@ -64,9 +56,6 @@ enum SidebarRow: Equatable {
     }
 }
 
-/// One space's page in the sidebar: its header, then a list of everything
-/// in it. Built on a table view, so rows are reused and a snapshot redraws
-/// only the rows that changed.
 @MainActor
 final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     private let store: BrowserStore
@@ -75,7 +64,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
     private let scroll = NSScrollView()
     private let table = SidebarTableView()
     private var rows: [SidebarRow] = []
-    /// The last drop spot, for a haptic tick when it changes.
     private var lastDropSpot: (Int, NSTableView.DropOperation)?
 
     init(space: SpaceInfo, store: BrowserStore) {
@@ -103,7 +91,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         table.registerForDraggedTypes([.sidebarItem, .URL])
         table.setDraggingSourceOperationMask([.move, .copy], forLocal: true)
         table.setDraggingSourceOperationMask(.copy, forLocal: false)
-        // Rows part to make room where a dragged tab would land.
         table.draggingDestinationFeedbackStyle = .gap
         table.store = store
         let menu = NSMenu()
@@ -130,11 +117,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         table.tableColumns.first?.width = bounds.width
     }
 
-    // MARK: - Updating
-
-    /// Shows a new state of the space, animating insertions and removals
-    /// along `animation` (tidying up), otherwise changing only the rows that
-    /// changed.
     func update(_ space: SpaceInfo, animation: Motion.Curve?) {
         self.space = space
         header.update(space)
@@ -165,22 +147,14 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
             case .insert(let offset, _, _): inserted.insert(offset)
             }
         }
-        // A wholly different list (an import, say) is simply rebuilt; a few
-        // rows coming or going (the tidy-up offer as spaces switch) only
-        // touch those rows, which keeps a switch from rebuilding a long list.
         guard removed.count + inserted.count <= max(8, next.count / 2) else {
             rows = next
             table.reloadData()
             return
         }
-        // A few rows coming, going or moving (closing, pinning, opening or
-        // dragging a tab) slide into place; a tidy-up uses its own curve.
-        // Not while spaces slide past, where the list should just be there.
         let pagerMoving = store.pager.travel != nil || store.pager.isTracking
         let curve = animation ?? (removed.count + inserted.count <= 6 && !pagerMoving ? Motion.quick : nil)
         let animated = curve != nil && !Motion.reduced && window != nil
-        // One row moving (a drag within the list) slides to its new place
-        // rather than vanishing and reappearing.
         let moved: (from: Int, to: Int)? = {
             guard removed.count == 1, inserted.count == 1, let from = removed.first, let to = inserted.first,
                   oldIDs[from] == nextIDs[to] else { return nil }
@@ -199,7 +173,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
             rows = next
             table.endUpdates()
         }
-        // Then the kept rows whose content changed refresh.
         let before = Dictionary(old.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let changed = IndexSet(next.indices.filter {
             (moved != nil || !inserted.contains($0)) && before[next[$0].id] != next[$0]
@@ -208,8 +181,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         for i in changed { (table.rowView(atRow: i, makeIfNecessary: false) as? SidebarRowView)?.configure(rows[i]) }
     }
 
-    /// Redraws rows whose look depends on store state outside the snapshot
-    /// (media paused, little windows, dragging, folder renaming).
     func refreshDecorations(animation: Motion.Curve? = nil) {
         update(space, animation: animation)
     }
@@ -236,8 +207,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         }
         return out
     }
-
-    // MARK: - Table
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
@@ -320,14 +289,11 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         }
     }
 
-    // MARK: - Dragging out
-
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         let item = NSPasteboardItem()
         switch rows[row] {
         case .pinnedTab(let data, _), .todayTab(let data, _):
             item.setString(String(data.tab.id), forType: .sidebarItem)
-            // Dragging a tab out of the browser hands its URL to the other app.
             item.setString(data.tab.url, forType: .URL)
             item.setString(data.tab.url, forType: .string)
         case .folder(let folder, _):
@@ -357,8 +323,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         table.dragPreview = preview
         table.windowPreview = rows[row].tabData.map { DragImages.window(for: $0.tab) }
         session.animatesToStartingPositionsOnCancelOrFail = true
-        // Forgiving drag: the pill sits centered under the pointer, wherever
-        // the row was grabbed.
         table.centerDragImage(session, image: preview, at: screenPoint)
     }
 
@@ -366,8 +330,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
                    endedAt screenPoint: NSPoint, operation: NSDragOperation) {
         store.endDrag(at: screenPoint, accepted: !operation.isEmpty)
     }
-
-    // MARK: - Dropping in
 
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int,
                    proposedDropOperation operation: NSTableView.DropOperation) -> NSDragOperation {
@@ -381,13 +343,11 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         }
         guard let (target, _) = dropTarget(row: row, operation: operation) else { return [] }
         let dragged = draggedItemID(info)
-        // Folders only live among pinned tabs.
         if let dragged, store.core.tab(id: dragged) == nil {
             guard case .pinned = target else { return [] }
         }
         if lastDropSpot.map({ $0 != (row, operation) }) ?? true {
             lastDropSpot = (row, operation)
-            // A light tick on Force Touch trackpads as the drop spot moves.
             NSHapticFeedbackManager.defaultPerformer.perform(.alignment, performanceTime: .drawCompleted)
         }
         return dragged != nil ? .move : .copy
@@ -411,8 +371,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         info.draggingPasteboard.string(forType: .sidebarItem).flatMap(UInt64.init)
     }
 
-    /// Where an item dropped at `row` goes: into a folder for `.on`,
-    /// otherwise before the row now at `row`.
     private func dropTarget(row: Int, operation: NSTableView.DropOperation) -> (DropTarget, Int)? {
         if operation == .on, rows.indices.contains(row), case .folder(let folder, _) = rows[row] {
             return (.pinned(spaceId: space.id, folderId: folder.id), Int(UInt32.max))
@@ -424,7 +382,6 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
         case .pinZone:
             return (.pinned(spaceId: space.id, folderId: nil), 0)
         case .divider:
-            // Just below the pinned tabs: the end of the pinned list.
             return (.pinned(spaceId: space.id, folderId: nil), Int(UInt32.max))
         case .cleanup, .newTab:
             return (.today(spaceId: space.id), 0)
@@ -434,23 +391,14 @@ final class SpacePageView: FlippedView, NSTableViewDataSource, NSTableViewDelega
     }
 }
 
-/// The table that is the sidebar's list. As the drag source it follows the
-/// drag: over the page, the pill turns into a little-window preview.
 final class SidebarTableView: NSTableView {
     weak var store: BrowserStore?
     var dragPreview: NSImage?
     var windowPreview: NSImage?
     private var showingWindow = false
 
-    /// With responsive scrolling the scroll view takes a gesture's events
-    /// straight from the queue after the first one, so the app's monitor
-    /// never sees a horizontal swipe to switch spaces.
     override static var isCompatibleWithResponsiveScrolling: Bool { false }
 
-    /// The part its scroll view shows, ignoring the sidebar's clip. A page
-    /// sliding away already sits at its destination outside the sidebar
-    /// while it is drawn moving, and the table would drop the rows of what
-    /// it then thinks is off screen: the page would slide past empty.
     override var visibleRect: NSRect {
         guard let clip = enclosingScrollView?.contentView, window != nil else { return super.visibleRect }
         return clip.documentVisibleRect.intersection(bounds)
@@ -469,8 +417,6 @@ final class SidebarTableView: NSTableView {
     }
 
     override func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
-        // NSTableView doesn't implement this on every macOS; calling up to
-        // a missing method raises, and AppKit cancels the drag on the spot.
         if NSTableView.instancesRespond(to: #selector(NSDraggingSource.draggingSession(_:movedTo:))) {
             super.draggingSession(session, movedTo: screenPoint)
         }
@@ -483,13 +429,11 @@ final class SidebarTableView: NSTableView {
         showingWindow = overPage
     }
 
-    /// Clicks on rows select tabs; the table's own selection stays unused.
     override func validateProposedFirstResponder(_ responder: NSResponder, for event: NSEvent?) -> Bool {
         responder is NSButton || responder is NSTextField ? true : super.validateProposedFirstResponder(responder, for: event)
     }
 }
 
-/// Draws the pill behind selected and hovered rows.
 final class SidebarRowView: NSTableRowView {
     static let identifier = NSUserInterfaceItemIdentifier("SidebarRow")
     private let fill = FillLayer()
@@ -541,8 +485,6 @@ final class SidebarRowView: NSTableRowView {
         hovering = false
     }
 
-    /// A cell reused from another row would otherwise keep that row's hover
-    /// (and show its close button here).
     override func didAddSubview(_ subview: NSView) {
         super.didAddSubview(subview)
         (subview as? HoverAware)?.setHovering(hovering)
@@ -561,18 +503,14 @@ final class SidebarRowView: NSTableRowView {
                    shadow: active ? Theme.selectedShadow : nil, in: effectiveAppearance)
     }
 
-    // The table's own selection and drop highlight are not used.
     override func drawSelection(in dirtyRect: NSRect) {}
     override var isEmphasized: Bool { get { false } set {} }
 }
 
-/// Cells that change with their row's hover (close buttons).
 @MainActor
 protocol HoverAware: AnyObject {
     func setHovering(_ hovering: Bool)
 }
-
-// MARK: - Cells
 
 final class TabCellView: NSTableCellView, HoverAware {
     private let store: BrowserStore
@@ -621,7 +559,6 @@ final class TabCellView: NSTableCellView, HoverAware {
         title.stringValue = tab.displayTitle
         title.font = Theme.font(13, data.active ? .medium : .regular)
         title.alphaValue = data.active ? 1 : 0.85
-        // Sleeping tabs are dimmed: they hold no memory until selected.
         let dim: CGFloat = tab.live || data.active ? 1 : 0.55
         favicon.alphaValue = dim
         title.alphaValue *= dim
@@ -636,12 +573,8 @@ final class TabCellView: NSTableCellView, HoverAware {
 
     func setHovering(_ hovering: Bool) {
         self.hovering = hovering
-        // Only the hovered row has a tooltip: each one is a region AppKit
-        // recomputes on every frame a page slides.
         toolTip = hovering ? data?.tab.displayTitle : nil
         updateAccessory()
-        // Resting on a sleeping tab starts loading it, so the click shows it
-        // (mostly) loaded.
         warmTimer?.invalidate()
         warmTimer = nil
         guard hovering, let tab = data?.tab, !tab.live else { return }
@@ -652,8 +585,6 @@ final class TabCellView: NSTableCellView, HoverAware {
         warmTimer = timer
     }
 
-    /// The tab the accessories were last set for: a change for the same tab
-    /// fades, a cell reused for another tab just takes its state.
     private var accessoryTab: UInt64?
 
     private func updateAccessory() {
@@ -666,7 +597,6 @@ final class TabCellView: NSTableCellView, HoverAware {
         let audible = !showClose && !data.inLittleWindow && data.tab.audible
         equalizer.setVisible(audible, animated: animated)
         equalizer.playing = audible && !data.mediaPaused
-        // The title makes room for them.
         needsLayout = true
         effectiveAppearance.performAsCurrentDrawingAppearance {
             close.layer?.backgroundColor = Theme.faint(0.08).cgColor
@@ -692,7 +622,6 @@ final class TabCellView: NSTableCellView, HoverAware {
 
 final class FolderCellView: NSTableCellView, NSTextFieldDelegate {
     private let store: BrowserStore
-    /// A layer of our own, so its rotation isn't reset by AppKit.
     private let chevron = CALayer()
     private let icon = NSImageView()
     private let name = Label.make()
@@ -758,8 +687,6 @@ final class FolderCellView: NSTableCellView, NSTextFieldDelegate {
         effectiveAppearance.performAsCurrentDrawingAppearance {
             count.layer?.backgroundColor = Theme.faint(0.08).cgColor
         }
-        // The chevron turns as the folder opens; reused cells just take the
-        // right angle.
         let turn = row.expanded ? CATransform3DMakeRotation(-.pi / 2, 0, 0, 1) : CATransform3DIdentity
         CATransaction.begin()
         if expanded != row.expanded, !Motion.reduced, window != nil {
@@ -893,7 +820,6 @@ final class NewTabCellView: NSTableCellView {
     }
 }
 
-/// A dashed target that only shows while something is being dragged.
 final class DropHintCellView: NSTableCellView {
     private let label = Label.make(size: 11, weight: .medium)
     private let dash = CAShapeLayer()
@@ -942,8 +868,6 @@ final class DropHintCellView: NSTableCellView {
     }
 }
 
-/// The space's emoji and name above its list. Double-click to edit the
-/// space.
 final class SpaceHeaderView: FlippedView {
     private let store: BrowserStore
     private var space: SpaceInfo
@@ -964,7 +888,6 @@ final class SpaceHeaderView: FlippedView {
 
     func update(_ space: SpaceInfo) {
         self.space = space
-        // Only what changed: redrawing a page while it slides away blanks it.
         icon.setIfChanged(space.icon.isEmpty ? "•" : space.icon)
         name.setIfChanged(space.name)
         needsLayout = true
@@ -985,8 +908,6 @@ final class SpaceHeaderView: FlippedView {
     }
 }
 
-/// Images shown while dragging a tab: a compact pill, and a little window
-/// once the tab is over the page.
 @MainActor
 enum DragImages {
     static func pill(for tab: TabInfo) -> NSImage {

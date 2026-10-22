@@ -1,5 +1,3 @@
-/* Fixed-width layout so every browser renders the same pixels whatever its
-   window size. */
 body { margin: 0; font: 17px/1.6 -apple-system, "Helvetica Neue", sans-serif; color: #1d232b; background: #fafaf7; }
 .masthead { font: 700 22px/56px Georgia, serif; text-align: center; border-bottom: 1px solid #ddd; }
 .column { width: 960px; margin: 0 auto; padding: 24px 0 64px; }

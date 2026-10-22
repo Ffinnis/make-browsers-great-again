@@ -1,6 +1,3 @@
-// Sends one key press to MBGA (or the app --to names), refusing if another
-// app is frontmost.
-// Usage: key [--to <bundle id>] <keycode> [cmd] [ctrl] [shift] [opt]
 import AppKit
 
 var args = Array(CommandLine.arguments.dropFirst())

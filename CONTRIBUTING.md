@@ -93,6 +93,11 @@ Beyond style, the checks hold the architecture in place:
   `cyclomatic_complexity`, clippy's `too_many_lines` and
   `cognitive_complexity`, ruff's pylint rules). Past the limit, split the
   code by what it does.
+- The code has no comments: names and structure say what it does, and the
+  commit message says why. `scripts/comments.py` fails on any comment and
+  `--fix` removes them. It keeps only directives tools read: shebangs,
+  `swiftlint:`, `noqa`, `shellcheck`, `// SAFETY:` on `unsafe` blocks (clippy
+  requires them) and the like.
 
 Swift that was over a size limit before the limit existed is listed in
 `.swiftlint-baseline.json`. `scripts/swiftlint-ratchet.py` lets that code

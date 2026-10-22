@@ -1,9 +1,5 @@
 import AppKit
 
-/// Extensions' toolbar buttons, in the sidebar's toolbar row: as many as
-/// fit, right-aligned, then a puzzle piece listing them all. A button shows
-/// its badge; a click shows the extension's popup or tells it it was
-/// clicked, as Chrome's toolbar does.
 @MainActor
 final class ExtensionButtonsView: FlippedView {
     private let store: BrowserStore
@@ -48,13 +44,11 @@ final class ExtensionButtonsView: FlippedView {
         needsLayout = true
     }
 
-    /// The button of an extension, or the puzzle piece if it doesn't fit.
     func anchor(for extensionID: String) -> NSView {
         let index = items.firstIndex { $0.id == extensionID }
         return index.map { buttons[$0] }.flatMap { $0.isHidden ? nil : $0 } ?? more
     }
 
-    /// How wide the buttons would like to be.
     var preferredWidth: CGFloat {
         more.isHidden ? 0 : CGFloat(items.count + 1) * 26
     }
@@ -63,7 +57,6 @@ final class ExtensionButtonsView: FlippedView {
         super.layout()
         var x = bounds.width - 26
         more.frame = NSRect(x: x, y: 3, width: 26, height: 24)
-        // The buttons that fit, the rest only in the puzzle's menu.
         for button in buttons {
             x -= 26
             button.isHidden = x < 0
@@ -110,8 +103,6 @@ final class ExtensionButtonsView: FlippedView {
     }
 }
 
-/// One extension's button: its icon, dimmed when disabled on the tab, and
-/// its badge.
 private final class ExtensionButton: HoverView {
     var action: (() -> Void)?
     private let fill = FillLayer()
@@ -167,8 +158,6 @@ private final class ExtensionButton: HoverView {
     override func mouseDown(with event: NSEvent) {}
 }
 
-/// An extension's popup, in a popover beside its button, sized to its page
-/// as Chrome sizes popups (25×25 to 800×600 points).
 @MainActor
 final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
     private static var shown: ExtensionPopup?
@@ -190,8 +179,6 @@ final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
         view.delegate = self
         store.extensions.registerPopup(view)
         let controller = NSViewController()
-        // Small at first: the page lays out at its narrowest, then says how
-        // big it wants to be.
         view.frame = NSRect(x: 0, y: 0, width: 25, height: 25)
         controller.view = view
         popover.contentViewController = controller
@@ -210,8 +197,6 @@ final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
         if Self.shown === self { Self.shown = nil }
     }
 
-    /// Reports the page's size as Chrome sizes popups: as narrow as its
-    /// content allows (min-content), as tall as it then is.
     private static let sizeScript = """
     (() => {
       const measure = () => {
@@ -234,8 +219,6 @@ final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
     })()
     """
 
-    // MARK: MBWebViewDelegate
-
     nonisolated func webView(_ view: MBWebView, didFinishLoadWithStatus status: Int32, duration: TimeInterval) {
         MainActor.assumeIsolated {
             let params = try? JSONSerialization.data(withJSONObject: ["expression": Self.sizeScript])
@@ -254,7 +237,6 @@ final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
     }
 
     nonisolated func webViewDidClose(_ view: MBWebView) {
-        // The page closed itself (window.close()).
         MainActor.assumeIsolated { if popover.isShown { popover.close() } }
     }
 
@@ -287,7 +269,6 @@ final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
 }
 
 extension NSImage {
-    /// An image from a data: URL, as extensions set their icons.
     static func fromDataURL(_ url: String) -> NSImage? {
         guard let comma = url.firstIndex(of: ","), url.hasPrefix("data:"),
               let data = Data(base64Encoded: String(url[url.index(after: comma)...])) else { return nil }
@@ -296,7 +277,6 @@ extension NSImage {
 }
 
 extension NSColor {
-    /// From Chrome's [r, g, b, a] (0–255).
     convenience init(rgba: [Double]) {
         let c = rgba + [255, 255, 255, 255]
         self.init(red: c[0] / 255, green: c[1] / 255, blue: c[2] / 255, alpha: c[3] / 255)
@@ -305,11 +285,8 @@ extension NSColor {
 
 @MainActor
 extension InstalledExtension {
-    /// Icons read from disk, by file (each version of an extension has a
-    /// directory of its own).
     private static var icons: [URL: NSImage] = [:]
 
-    /// Its icon, or its initial on a tile when it has none, as Chrome shows.
     func icon(size: Int) -> NSImage? {
         if let file = iconFile(size: size) {
             if let known = Self.icons[file] { return known }

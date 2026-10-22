@@ -1,8 +1,5 @@
 import AppKit
 
-// Building blocks shared by the inspector's panels: its colours and type,
-// toolbars, tables, value trees and the code view.
-
 enum InspectorTheme {
     static func mono(_ size: CGFloat = 11, _ weight: NSFont.Weight = .regular) -> NSFont {
         .monospacedSystemFont(ofSize: size, weight: weight)
@@ -19,7 +16,6 @@ enum InspectorTheme {
         }
     }
 
-    // Syntax, after Xcode's default themes.
     static let tag = dynamic(0x9B2393, 0xFC5FA3)
     static let attribute = dynamic(0x815F03, 0xE8A86D)
     static let string = dynamic(0xC41A16, 0xFC6A5D)
@@ -39,39 +35,29 @@ enum InspectorTheme {
         $0.isDark ? NSColor(srgbRed: 0.33, green: 0.26, blue: 0.05, alpha: 0.45) : NSColor(srgbRed: 1, green: 0.98, blue: 0.88, alpha: 1)
     }
 
-    /// The window's tint (its gradient's stops), which the surface takes.
     static var tint: [RGB] = []
-    /// The surface changed with the tint.
     static let tintChanged = Notification.Name("MBGAInspectorTintChanged")
 
-    /// The panels' surface: the window's tint, deepened in the dark and
-    /// lightened in the light so code reads on it, as the sidebar sits on it.
     static let surface = NSColor(name: nil) { appearance in
         let dark = appearance.isDark
         guard tint.count == 2 else { return dark ? NSColor(white: 0.135, alpha: 1) : .white }
         let middle = tint[0].mixed(with: tint[1], 0.5)
         return (dark ? middle.mixed(with: RGB(0x141416), 0.3) : middle.mixed(with: .white, 0.5)).nsColor
     }
-    /// Bars across a panel (toolbars, headers): a shade over the surface.
     static let bar = NSColor(name: nil) {
         $0.isDark ? .white.withAlphaComponent(0.035) : .white.withAlphaComponent(0.4)
     }
     static let separator = NSColor(name: nil) {
         $0.isDark ? .white.withAlphaComponent(0.08) : .black.withAlphaComponent(0.07)
     }
-    /// Selected rows: the sidebar's selected tab, as a pill.
     static let selection = Theme.selectedFill
-    /// The line the debugger is paused on.
     static let pausedLine = NSColor(name: nil) {
         $0.isDark ? NSColor(srgbRed: 0.2, green: 0.4, blue: 0.2, alpha: 0.6) : NSColor(srgbRed: 0.85, green: 0.95, blue: 0.85, alpha: 1)
     }
     static let breakpoint = NSColor(srgbRed: 0.24, green: 0.5, blue: 0.95, alpha: 1)
 }
 
-// MARK: - Text
-
 extension NSMutableAttributedString {
-    /// Appends `text` in `color` and `font` (monospaced by default).
     @discardableResult
     func add(_ text: String, _ color: NSColor = .labelColor, font: NSFont = InspectorTheme.mono()) -> Self {
         append(NSAttributedString(string: text, attributes: [.foregroundColor: color, .font: font]))
@@ -80,12 +66,10 @@ extension NSMutableAttributedString {
 }
 
 extension String {
-    /// At most `limit` characters, with an ellipsis if cut.
     func clipped(_ limit: Int) -> String {
         count > limit ? String(prefix(limit)) + "…" : self
     }
 
-    /// One line: newlines and runs of spaces become single spaces.
     var oneLine: String {
         split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.joined(separator: " ")
     }
@@ -112,15 +96,9 @@ enum Format {
     }
 }
 
-// MARK: - Panels
-
-/// One of the inspector's panels. It shows the page of whichever session it
-/// is given, and keeps nothing of its own about a page.
 @MainActor
 class InspectorPanelView: FlippedView {
-    /// The visible tab's session, or nil with no tab.
     private(set) var session: InspectorSession?
-    /// The panel is the one shown.
     private(set) var isShown = false
 
     override init(frame: NSRect) {
@@ -143,18 +121,13 @@ class InspectorPanelView: FlippedView {
         if shown { panelDidAppear() } else { panelDidDisappear() }
     }
 
-    /// Show the new session's page (or nothing).
     func sessionChanged() {}
     func panelDidAppear() {}
     func panelDidDisappear() {}
-    /// ⌘F in the panel.
     func focusFilter() {}
-    /// Selects the panel's `row`th item, for testing.
     func selectRow(_ row: Int) {}
 }
 
-/// A bar of controls across the top of a panel, laid out left to right.
-/// Views added with `flexible` share what's left over (a search field).
 final class InspectorToolbar: FlippedView {
     static let height: CGFloat = 30
     private var items: [(view: NSView, width: CGFloat?, trailing: Bool)] = []
@@ -172,7 +145,6 @@ final class InspectorToolbar: FlippedView {
 
     override var wantsUpdateLayer: Bool { true }
 
-    /// Adds `view` at its width, or flexible with nil.
     func add(_ view: NSView, width: CGFloat?, trailing: Bool = false) {
         items.append((view, width, trailing))
         addSubview(view)
@@ -226,13 +198,11 @@ final class InspectorToolbar: FlippedView {
     }
 }
 
-/// A small symbol button for toolbars that can stay pressed in (a toggle).
 final class InspectorButton: HoverView {
     var action: (() -> Void)?
     var isOn = false {
         didSet { if isOn != oldValue { updateColors(); needsDisplay = true } }
     }
-    /// Colour of the symbol while on.
     var onColor: NSColor = .controlAccentColor {
         didSet { updateColors() }
     }
@@ -283,14 +253,11 @@ final class InspectorButton: HoverView {
     }
 }
 
-/// A row of small text toggles (All · Fetch · JS · CSS …); one or, with
-/// `multiple`, several on.
 final class InspectorChips: FlippedView {
     private(set) var titles: [String]
     var selected: Set<Int> = [0] {
         didSet { needsLayout = true; for (i, chip) in chips.enumerated() { chip.on = selected.contains(i) } }
     }
-    /// Clicking one with ⌘ adds it to the others.
     var multiple = false
     var onChange: ((Set<Int>) -> Void)?
     private var chips: [Chip] = []
@@ -370,7 +337,6 @@ final class InspectorChips: FlippedView {
     }
 }
 
-/// A search field sized for toolbars, filled like the sidebar's fields.
 final class InspectorFilterField: NSSearchField {
     var onChange: ((String) -> Void)?
     private let fill = FillLayer()
@@ -380,7 +346,6 @@ final class InspectorFilterField: NSSearchField {
         set {}
     }
 
-    /// Text centred in the field, which loses its bezel's insets.
     private final class Cell: NSSearchFieldCell {
         private func centred(_ rect: NSRect) -> NSRect {
             let height = ceil((font?.ascender ?? 10) - (font?.descender ?? -3) + 1)
@@ -432,7 +397,6 @@ final class InspectorFilterField: NSSearchField {
     @objc private func changed() { onChange?(stringValue) }
 }
 
-/// Quiet centred text for an empty panel or pane.
 final class InspectorEmptyView: FlippedView {
     private let label = Label.wrapping("", size: 12, color: .tertiaryLabelColor)
 
@@ -459,14 +423,12 @@ final class InspectorEmptyView: FlippedView {
     }
 }
 
-/// A split view whose divider is a hairline and remembers where it was.
 final class InspectorSplitView: NSSplitView, NSSplitViewDelegate {
     private let key: String
     private let defaultFraction: CGFloat
     private let minimum: CGFloat
     private var restored = false
 
-    /// Two panes side by side, or one above the other unless `vertical`.
     init(_ first: NSView, _ second: NSView, vertical: Bool, key: String, fraction: CGFloat = 0.5, minimum: CGFloat = 80) {
         self.key = "inspector.split." + key
         defaultFraction = fraction
@@ -487,7 +449,6 @@ final class InspectorSplitView: NSSplitView, NSSplitViewDelegate {
     override func layout() {
         super.layout()
         let length = isVertical ? bounds.width : bounds.height
-        // A collapsed pane gets its place back when it shows again.
         guard !restored, length > 0, arrangedSubviews.last?.isHidden == false else { return }
         restored = true
         let saved = UserDefaults.standard.double(forKey: key)
@@ -510,7 +471,6 @@ final class InspectorSplitView: NSSplitView, NSSplitViewDelegate {
         UserDefaults.standard.set(Double((isVertical ? first.frame.width : first.frame.height) / length), forKey: key)
     }
 
-    /// Hides or shows the second pane.
     func setSecondCollapsed(_ collapsed: Bool) {
         guard arrangedSubviews.count == 2 else { return }
         arrangedSubviews[1].isHidden = collapsed
@@ -522,9 +482,6 @@ final class InspectorSplitView: NSSplitView, NSSplitViewDelegate {
     }
 }
 
-// MARK: - Tables
-
-/// A plain, dense table in a scroll view, as DevTools lists things.
 @MainActor
 enum InspectorTable {
     static func make(_ table: NSTableView, columns: [(id: String, title: String, width: CGFloat)],
@@ -557,7 +514,6 @@ enum InspectorTable {
         return scroll
     }
 
-    /// A reusable one-line cell showing `text`.
     static func cell(_ table: NSTableView, _ id: String, _ text: NSAttributedString) -> NSTableCellView {
         let identifier = NSUserInterfaceItemIdentifier("cell." + id)
         let cell = table.makeView(withIdentifier: identifier, owner: nil) as? NSTableCellView ?? {
@@ -587,11 +543,8 @@ enum InspectorTable {
     }
 }
 
-/// A table row drawn with the inspector's selection colour rather than the
-/// accent colour, which is loud for dense lists.
 class InspectorRowView: NSTableRowView {
     var fill: NSColor?
-    /// Under the pointer, where a list shows it.
     var hovered = false {
         didSet { if hovered != oldValue { needsDisplay = true } }
     }
@@ -620,10 +573,8 @@ class InspectorRowView: NSTableRowView {
     override var interiorBackgroundStyle: NSView.BackgroundStyle { .normal }
 }
 
-/// A table that offers a context menu for the clicked row.
 class InspectorTableView: NSTableView {
     var menuForRow: ((Int) -> NSMenu?)?
-    /// Return or Space pressed on the selection.
     var onKey: ((NSEvent) -> Bool)?
 
     override func menu(for event: NSEvent) -> NSMenu? {
@@ -656,14 +607,9 @@ class InspectorOutlineView: NSOutlineView {
     }
 }
 
-// MARK: - Value trees
-
-/// A node of a tree of values: properties of a JavaScript object, keys of
-/// JSON, scopes of a paused call frame.
 @MainActor
 class ValueNode {
     let name: String
-    /// Dimmed names: non-enumerable and internal properties.
     var dimmed = false
     var children: [ValueNode]?
     var loading = false
@@ -671,19 +617,14 @@ class ValueNode {
     init(name: String) { self.name = name }
 
     var isExpandable: Bool { false }
-    /// The value as one coloured line.
     func valueText() -> NSAttributedString { NSAttributedString() }
-    /// Loads children, then calls `done`.
     func load(_ done: @escaping @MainActor () -> Void) { done() }
-    /// Text copied for this node.
     var copyText: String { valueText().string }
 }
 
-/// A Runtime.RemoteObject, its properties fetched on expanding.
 final class RemoteValueNode: ValueNode {
     let object: JSON
     weak var session: InspectorSession?
-    /// Properties of a getter call aren't fetched until asked.
     private let accessorOf: String?
 
     init(name: String, object: JSON, session: InspectorSession?, accessorOf: String? = nil) {
@@ -765,7 +706,6 @@ final class RemoteValueNode: ValueNode {
     }
 }
 
-/// A getter, called only when clicked, as DevTools shows `(…)`.
 final class GetterNode: ValueNode {
     private let owner: String
     weak var session: InspectorSession?
@@ -809,7 +749,6 @@ final class GetterNode: ValueNode {
     }
 }
 
-/// Parsed JSON, for response previews.
 final class JSONValueNode: ValueNode {
     let value: Any
 
@@ -860,7 +799,6 @@ final class JSONValueNode: ValueNode {
     }
 }
 
-/// Plain named rows (headers, scopes) that can hold children of any kind.
 final class GroupNode: ValueNode {
     private let text: NSAttributedString
     private let loader: ((@escaping @MainActor ([ValueNode]) -> Void) -> Void)?
@@ -885,11 +823,9 @@ final class GroupNode: ValueNode {
     }
 }
 
-/// An outline of value nodes: `name: value`, expanding on demand.
 final class ValueTreeView: NSScrollView, NSOutlineViewDataSource, NSOutlineViewDelegate {
     let outline = InspectorOutlineView()
     private(set) var roots: [ValueNode] = []
-    /// Names are shown (no for a lone value's properties).
     var showsNames = true
 
     override init(frame: NSRect) {
@@ -924,7 +860,6 @@ final class ValueTreeView: NSScrollView, NSOutlineViewDataSource, NSOutlineViewD
         outline.reloadData()
     }
 
-    /// Expands the top-level rows.
     func expandRoots() {
         for node in roots where node.isExpandable { expand(node) }
     }
@@ -957,8 +892,6 @@ final class ValueTreeView: NSScrollView, NSOutlineViewDataSource, NSOutlineViewD
         }
         return menu
     }
-
-    // MARK: Data source
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         guard let node = item as? ValueNode else { return roots.count }
@@ -1000,9 +933,6 @@ final class ValueTreeView: NSScrollView, NSOutlineViewDataSource, NSOutlineViewD
     }
 }
 
-// MARK: - Code
-
-/// Languages the code view colours.
 enum CodeLanguage {
     case javascript, css, html, json, plain
 
@@ -1018,10 +948,7 @@ enum CodeLanguage {
     }
 }
 
-/// Colours source text by a quick scan of its tokens: enough to read by,
-/// not a parser.
 enum SyntaxColorer {
-    /// Left-aligned lines that don't wrap unless the view does.
     static let codeParagraph: NSParagraphStyle = {
         let style = NSMutableParagraphStyle()
         style.alignment = .left
@@ -1029,8 +956,6 @@ enum SyntaxColorer {
         return style
     }()
 
-    /// Beyond this, text is shown uncoloured: colouring a megabyte of
-    /// minified script would stall the window.
     static let limit = 400_000
 
     static func color(_ text: String, as language: CodeLanguage, font: NSFont = InspectorTheme.mono()) -> NSAttributedString {
@@ -1078,9 +1003,6 @@ enum SyntaxColorer {
     }
 }
 
-/// Read-only (or editable) source text with line numbers, used for
-/// responses, scripts and stylesheets. Clicking a line number calls
-/// `onGutterClick`, for breakpoints.
 final class CodeView: NSScrollView {
     let textView: NSTextView
     private let ruler: LineNumberRuler
@@ -1088,16 +1010,13 @@ final class CodeView: NSScrollView {
         get { ruler.onClick }
         set { ruler.onClick = newValue }
     }
-    /// Zero-based lines marked in the gutter (breakpoints).
     var markedLines: Set<Int> {
         get { ruler.marked }
         set { ruler.marked = newValue; ruler.needsDisplay = true }
     }
-    /// The zero-based line highlighted across (the paused line), or nil.
     var highlightedLine: Int? {
         didSet { updateHighlight() }
     }
-    /// Lines numbered from this rather than 1 (inline scripts).
     var firstLineNumber: Int {
         get { ruler.first }
         set { ruler.first = newValue; ruler.needsDisplay = true }
@@ -1110,8 +1029,6 @@ final class CodeView: NSScrollView {
         let container = NSTextContainer(size: NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude))
         container.widthTracksTextView = false
         layout.addTextContainer(container)
-        // Laid out whole: estimated lines would make the view the
-        // container's full width, too wide to draw.
         layout.allowsNonContiguousLayout = false
         textView = NSTextView(frame: .zero, textContainer: container)
         ruler = LineNumberRuler(textView: textView)
@@ -1145,7 +1062,6 @@ final class CodeView: NSScrollView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// Wraps long lines to the view's width instead of scrolling sideways.
     var wraps = false {
         didSet {
             guard wraps != oldValue, let container = textView.textContainer else { return }
@@ -1163,7 +1079,6 @@ final class CodeView: NSScrollView {
 
     override func layout() {
         super.layout()
-        // The text view is at least as big as what shows it.
         textView.minSize = NSSize(width: wraps ? 0 : contentSize.width, height: contentSize.height)
         if textView.frame.width < contentSize.width || wraps { textView.frame.size.width = contentSize.width }
         if textView.frame.height < contentSize.height { textView.frame.size.height = contentSize.height }
@@ -1181,7 +1096,6 @@ final class CodeView: NSScrollView {
 
     var text: String { textView.string }
 
-    /// Scrolls zero-based `line` into the middle of the view.
     func reveal(line: Int, select: Bool = false) {
         guard let range = rangeOf(line: line) else { return }
         textView.layoutManager?.ensureLayout(forCharacterRange: range)
@@ -1216,13 +1130,11 @@ final class CodeView: NSScrollView {
     }
 }
 
-/// Line numbers beside a text view, with marks for breakpoints.
 private final class LineNumberRuler: NSRulerView {
     weak var textView: NSTextView?
     var onClick: ((Int) -> Void)?
     var marked: Set<Int> = []
     var first = 1
-    /// Character offsets where each line starts.
     private var starts: [Int] = [0]
 
     init(textView: NSTextView) {
@@ -1251,7 +1163,6 @@ private final class LineNumberRuler: NSRulerView {
         let thickness = CGFloat(digits) * 7 + 18
         if thickness != ruleThickness {
             ruleThickness = thickness
-            // The ruler floats over the text view; its text starts after it.
             textView?.textContainerInset = NSSize(width: thickness + 4, height: 4)
         }
         needsDisplay = true
@@ -1268,7 +1179,6 @@ private final class LineNumberRuler: NSRulerView {
 
     override func drawHashMarksAndLabels(in rect: NSRect) {
         guard let textView, let layout = textView.layoutManager, let container = textView.textContainer else { return }
-        // Solid, over the text scrolled beneath it.
         InspectorTheme.surface.setFill()
         bounds.fill()
         InspectorTheme.bar.setFill()
@@ -1283,7 +1193,6 @@ private final class LineNumberRuler: NSRulerView {
         while lineIndex < starts.count, starts[lineIndex] <= NSMaxRange(characters) {
             let length = textView.string.utf16.count
             let lineRect: NSRect = if starts[lineIndex] >= length {
-                // The empty line after a final newline.
                 length == 0 ? NSRect(x: 0, y: 0, width: 0, height: 14) : layout.extraLineFragmentRect
             } else {
                 layout.lineFragmentRect(forGlyphAt: layout.glyphIndexForCharacter(at: starts[lineIndex]), effectiveRange: nil)
@@ -1319,10 +1228,7 @@ private final class LineNumberRuler: NSRulerView {
     }
 }
 
-// MARK: - Menus
-
 extension NSView {
-    /// Pops `menu` up under the view, as from a toolbar button.
     func popUp(_ menu: NSMenu) {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: isFlipped ? bounds.height + 4 : -4), in: self)
     }

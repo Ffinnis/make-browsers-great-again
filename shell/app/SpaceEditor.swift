@@ -2,12 +2,9 @@ import AppKit
 
 struct SpaceEditorRequest {
     let id = UUID()
-    /// nil creates a new space.
     let spaceID: UInt64?
 }
 
-/// Shows the store's sheet requests on the window and clears a request when
-/// its sheet closes.
 @MainActor
 final class SheetPresenter {
     private var spaceEditor: SpaceEditorSheet?
@@ -46,8 +43,6 @@ final class SheetPresenter {
     }
 }
 
-/// Creates or edits a space: name, icon, color and the profile whose
-/// cookies, logins and favorites it uses.
 @MainActor
 final class SpaceEditorSheet: NSObject, NSTextFieldDelegate {
     let request: SpaceEditorRequest
@@ -206,7 +201,6 @@ final class SpaceEditorSheet: NSObject, NSTextFieldDelegate {
         profiles.selectedItem?.representedObject as? UInt64 ?? store.activeSpace.profileId
     }
 
-    /// Profiles no space uses can be deleted from here.
     private func reloadUnused() {
         for view in unused.arrangedSubviews { view.removeFromSuperview() }
         guard store.snapshot.profiles.count > 1 else { return }
@@ -253,14 +247,12 @@ final class SpaceEditorSheet: NSObject, NSTextFieldDelegate {
     func controlTextDidChange(_ notification: Notification) {
         guard let field = notification.object as? NSTextField else { return }
         if field === iconField, field.stringValue.count > 1 {
-            // An icon is a single character (usually an emoji).
             field.stringValue = String(field.stringValue.suffix(1))
         }
         updateSave()
     }
 }
 
-/// A color to pick for a space, ringed when chosen.
 private final class SwatchView: NSView {
     let color: UInt32
     var onPick: ((UInt32) -> Void)?

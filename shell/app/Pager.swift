@@ -1,23 +1,10 @@
 import AppKit
 
-/// Horizontal paging between spaces, driven directly by trackpad scroll
-/// events so a two-finger swipe anywhere in the sidebar moves the spaces
-/// with the fingers and springs to the nearest one on release.
-///
-/// Animated moves are stepped on every display frame rather than handed to
-/// Core Animation: a view animated that way already sits at its destination,
-/// and AppKit doesn't keep drawing a page it thinks is off screen, so a
-/// space sliding away would go blank. Stepping also keeps the pages and the
-/// window's color in step with each other, as under the fingers.
 @MainActor
 final class PagerModel {
-    /// Fractional index of the space on screen.
     private(set) var position: CGFloat = 0
-    /// Where an animated move is heading, while it runs.
     private(set) var destination: CGFloat?
-    /// What an animated move covers, so the pages along the way are ready.
     private(set) var travel: ClosedRange<CGFloat>?
-    /// The view whose display drives animated moves.
     weak var view: NSView?
 
     private struct Observer {
@@ -26,7 +13,6 @@ final class PagerModel {
     }
     private var observers: [Observer] = []
 
-    /// Calls `handle` whenever the position on screen changes.
     func observe(_ owner: AnyObject, _ handle: @escaping @MainActor () -> Void) {
         observers.append(Observer(owner: owner, handle: handle))
     }
@@ -48,12 +34,7 @@ final class PagerModel {
         for observer in observers { observer.handle() }
     }
 
-    // MARK: Animated moves
-
     private lazy var ticker = FrameTicker("space switch") { [weak self] time in self?.step(at: time) }
-    /// When the move's first frame was shown. Its clock starts there, so
-    /// work done as the move begins (switching the page) delays its start
-    /// by a moment instead of making it skip mid-way.
     private var moveStart: CFTimeInterval?
     private var moveFrom: CGFloat = 0
 
@@ -83,13 +64,8 @@ final class PagerModel {
 
     var pageCount = 1
     var pageWidth: CGFloat = 260
-    /// The sidebar, where swipes switch spaces. Looked up on each swipe: it
-    /// slides in and out and moves onto the peek card without resizing, so
-    /// a frame noted at layout goes stale.
     weak var sidebar: NSView?
-    /// Called with the space index a swipe settled on.
     var onSettle: ((Int) -> Void)?
-    /// Called with the space a swipe heads for as it starts.
     var onSwipeTowards: ((Int) -> Void)?
 
     private enum Tracking {
@@ -97,7 +73,6 @@ final class PagerModel {
         case undecided(dx: CGFloat, dy: CGFloat)
         case horizontal(start: CGFloat, dx: CGFloat, velocity: CGFloat)
         case vertical
-        /// Swallows the momentum events that follow a horizontal swipe.
         case momentum
     }
 
@@ -110,7 +85,6 @@ final class PagerModel {
         }
     }
 
-    /// Moves to `index` unless the user is swiping.
     func show(_ index: Int, animated: Bool) {
         guard !isTracking, (destination ?? position) != CGFloat(index) else { return }
         setPosition(CGFloat(index), animated: animated)
@@ -123,7 +97,6 @@ final class PagerModel {
         return sidebar.bounds.contains(sidebar.convert(event.locationInWindow, from: nil))
     }
 
-    /// Returns true if the event was consumed.
     func handle(_ event: NSEvent) -> Bool {
         guard event.hasPreciseScrollingDeltas else { return handleWheel(event) }
 
@@ -141,7 +114,6 @@ final class PagerModel {
             dx += event.scrollingDeltaX
             dy += event.scrollingDeltaY
             if abs(dx) > 6, abs(dx) > abs(dy) * 1.2 {
-                // The fingers take over from a move still running.
                 stopMoving()
                 onSwipeTowards?(Int(position.rounded()) + (dx < 0 ? 1 : -1))
                 tracking = .horizontal(start: position, dx: dx, velocity: event.scrollingDeltaX)
@@ -154,7 +126,6 @@ final class PagerModel {
         case .horizontal(let start, var dx, let velocity):
             dx += event.scrollingDeltaX
             if ended {
-                // The ended event carries no movement; use the last real delta.
                 settle(from: start - dx / pageWidth, velocity: velocity)
                 tracking = .momentum
             } else {
@@ -175,14 +146,10 @@ final class PagerModel {
         }
     }
 
-    /// A mouse's horizontal wheel (or Shift-scroll) over the sidebar steps
-    /// one space at a time.
     private func handleWheel(_ event: NSEvent) -> Bool {
         var dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
-        // The system usually turns Shift-scroll horizontal; not always.
         if event.modifierFlags.contains(.shift), dx == 0 { (dx, dy) = (dy, 0) }
         guard pageCount > 1, abs(dx) >= 1, abs(dx) > abs(dy), inSidebar(event) else { return false }
-        // One step per flick of the wheel, however many notches it reports.
         guard event.timestamp - lastWheelStep > 0.35 else { return true }
         lastWheelStep = event.timestamp
         let current = Int((destination ?? position).rounded())
@@ -202,7 +169,6 @@ final class PagerModel {
 
     private func settle(from raw: CGFloat, velocity: CGFloat) {
         var target = raw.rounded()
-        // A flick moves one space even if the fingers travelled less than half.
         if abs(velocity) > 6 {
             target = velocity > 0 ? raw.rounded(.down) : raw.rounded(.up)
         }
@@ -212,26 +178,14 @@ final class PagerModel {
     }
 }
 
-/// Holds the engine views of loaded tabs and shows the visible one. Hidden
-/// views are throttled by the engine automatically.
 final class WebContainerView: NSView {
     private weak var current: MBWebView?
-    /// The size a tab's page shows at instead of filling the container (a
-    /// device preview in Developer Mode), or nil.
     var viewport: ((MBWebView) -> NSSize?)?
-    /// Called when the page's share of the container changes (docked
-    /// DevTools opened, closed or resized), for what floats over the page.
     var onPageAreaChange: (() -> Void)?
-    /// The part the page fills; DevTools takes the rest, on the right.
     private(set) var pageArea = NSRect.zero
     private let devToolsEdge = NSView()
-    /// DevTools' own background under its window, so the window's rounded
-    /// corners and edge don't show the white page container.
     private let devToolsBacking = NSView()
-    /// The docked panel's own header: a title and a close button, as the
-    /// DevTools window has no title bar here.
     private lazy var devToolsHeader = DevToolsHeaderView { [weak self] in self?.current?.closeDevTools() }
-    /// The visible tab's DevTools window, docked over the panel.
     private weak var dockedWindow: NSWindow?
     private lazy var devToolsHandle = DevToolsResizeHandle { [weak self] x in self?.resizeDevTools(to: x) }
 
@@ -265,7 +219,6 @@ final class WebContainerView: NSView {
         placeCurrent()
     }
 
-    /// A one-pixel edge drawn above the page, or none.
     func setBorder(_ color: NSColor?) {
         layer?.borderWidth = color == nil ? 0 : 1 / (window?.backingScaleFactor ?? 2)
         layer?.borderColor = color?.cgColor
@@ -278,15 +231,11 @@ final class WebContainerView: NSView {
         addSubview(view)
     }
 
-    /// Shows `view`, hiding the one shown before. With `crossfade` (a space
-    /// switch) the old page fades out over the new one instead.
     func show(_ view: MBWebView?, crossfade: Bool = false) {
         guard view !== current else { return }
-        // A view moved to a little window is no longer this container's.
         let previous = current?.superview === self ? current : nil
         let view = view?.superview === self ? view : nil
         if let view {
-            // It may still be fading out from an earlier switch.
             view.layer?.removeAnimation(forKey: "opacity")
             view.alphaValue = 1
             view.layer?.zPosition = 0
@@ -295,14 +244,12 @@ final class WebContainerView: NSView {
         current = view
         placeCurrent()
         guard let previous else {
-            // From an empty space: the page fades in over the empty field.
             if crossfade, let view, !Motion.reduced {
                 view.alphaValue = 0
                 Motion.animate(Motion.fade) { view.animator().alphaValue = 1 }
             }
             return
         }
-        // To an empty space too: the page fades out over the empty field.
         guard crossfade, !Motion.reduced else {
             previous.isHidden = true
             return
@@ -320,8 +267,6 @@ final class WebContainerView: NSView {
 }
 
 extension WebContainerView {
-    /// Shows `view` under the visible page, so the engine draws it for a
-    /// capture, until the returned closure puts it away.
     func renderBehind(_ view: MBWebView) -> () -> Void {
         guard view.superview === self, view !== current else { return {} }
         view.layer?.zPosition = -1
@@ -334,8 +279,6 @@ extension WebContainerView {
         }
     }
 
-    /// A device preview turned on or off: the page takes its new size and
-    /// fades in at it, rather than squeezing there.
     func viewportChanged() {
         placeCurrent()
         guard let current, !Motion.reduced, window != nil else { return }
@@ -343,8 +286,6 @@ extension WebContainerView {
         Motion.animate(Motion.settle) { current.animator().alphaValue = 1 }
     }
 
-    /// Fills the container with the visible page, or centres it at its
-    /// device size below the developer toolbar, on a quiet surround.
     func placeCurrent() {
         let area = placeDevTools()
         if area != pageArea {
@@ -366,9 +307,6 @@ extension WebContainerView {
         setPreview(current, radius: min(size.width, size.height) < 500 ? 24 : 12)
     }
 
-    /// Docks the visible tab's DevTools on the right: CEF only makes DevTools
-    /// windows, so its window, without a title bar, rides on this one as a
-    /// child, laid over the panel. Returns what's left for the page.
     private func placeDevTools() -> NSRect {
         guard DeveloperSettings.docksDevTools, let window, let devTools = current?.devToolsWindow else {
             undock()
@@ -393,7 +331,6 @@ extension WebContainerView {
             view.layer?.zPosition = 2
             view.isHidden = false
         }
-        // DevTools follows the system appearance, as the window does.
         let dark = effectiveAppearance.isDark
         devToolsBacking.frame = NSRect(x: edge, y: 0, width: bounds.width - edge, height: bounds.height)
         devToolsBacking.layer?.backgroundColor = (dark ? NSColor(srgbRed: 0.157, green: 0.157, blue: 0.157, alpha: 1) : .white).cgColor
@@ -415,9 +352,6 @@ extension WebContainerView {
     }
 
     private func dock(_ devTools: NSWindow, in window: NSWindow) {
-        // Borderless, so macOS doesn't round its corners: square against the
-        // page, and rounded only where it meets the card's own corners.
-        // (Chrome's window class still takes the keyboard when borderless.)
         devTools.styleMask = [.borderless, .resizable]
         devTools.isOpaque = false
         devTools.backgroundColor = .clear
@@ -426,7 +360,6 @@ extension WebContainerView {
         if let content = devTools.contentView {
             content.wantsLayer = true
             content.layer?.cornerCurve = .continuous
-            // The header takes the card's top corner.
             content.layer?.maskedCorners = [.layerMaxXMinYCorner]
             content.layer?.masksToBounds = true
         }
@@ -439,8 +372,6 @@ extension WebContainerView {
         dockedWindow = devTools
     }
 
-    /// Puts the docked window away: hidden behind another tab, or back to a
-    /// window of its own when DevTools stops docking.
     private func undock() {
         guard let devTools = dockedWindow else { return }
         dockedWindow = nil
@@ -482,7 +413,6 @@ extension WebContainerView {
     }
 }
 
-/// The docked DevTools panel's header: what it is, and how to close it.
 final class DevToolsHeaderView: FlippedView {
     static let height: CGFloat = 30
     var dark = true {
@@ -518,14 +448,12 @@ final class DevToolsHeaderView: FlippedView {
     }
 
     override func updateLayer() {
-        // DevTools' own colours, whatever the window's appearance.
         appearance = NSAppearance(named: dark ? .darkAqua : .aqua)
         layer?.backgroundColor = (dark ? NSColor(srgbRed: 0.157, green: 0.157, blue: 0.157, alpha: 1) : .white).cgColor
         line.backgroundColor = (dark ? NSColor.white.withAlphaComponent(0.08) : NSColor.black.withAlphaComponent(0.08)).cgColor
     }
 }
 
-/// The docked DevTools panel's edge, dragged to resize it.
 final class DevToolsResizeHandle: NSView {
     private let onDrag: (CGFloat) -> Void
 
@@ -550,8 +478,6 @@ final class DevToolsResizeHandle: NSView {
     }
 }
 
-/// The page as a card: a soft shadow and a hairline around the shared
-/// WebContainerView, with corners that follow the window's.
 final class PageCardView: NSView {
     let container: WebContainerView
     private let shadowLayer = CALayer()
@@ -577,8 +503,6 @@ final class PageCardView: NSView {
 
     override var wantsUpdateLayer: Bool { true }
 
-    /// Card corners and edge, or none for full screen. Set on every layout
-    /// pass, so only a real change redraws.
     var isCard = true {
         didSet { if isCard != oldValue { needsDisplay = true; needsLayout = true } }
     }
@@ -592,8 +516,6 @@ final class PageCardView: NSView {
         CATransaction.setDisableActions(true)
         shadowLayer.frame = bounds
         shadowLayer.cornerRadius = isCard ? cornerRadius : 0
-        // A shadow without a path is worked out from the layer's pixels
-        // again whenever the card changes size: every frame of ⌘S.
         shadowLayer.shadowPath = CGPath(roundedRect: bounds, cornerWidth: shadowLayer.cornerRadius,
                                         cornerHeight: shadowLayer.cornerRadius, transform: nil)
         shadowLayer.isHidden = !isCard

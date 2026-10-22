@@ -1,4 +1,3 @@
-# scripts/check.sh fails on any finding.
 enable=avoid-nullary-conditions
 enable=check-unassigned-uppercase
 enable=deprecate-which

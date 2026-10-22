@@ -1,10 +1,5 @@
-//! Pages visited, for command bar suggestions. Ranked by frecency: how often
-//! and how recently a page was visited. Kept in its own file so the state
-//! file stays small, and capped so it never grows without bound.
-
 use serde::{Deserialize, Serialize};
 
-/// Most pages remembered; the lowest-ranked are forgotten first.
 const MAX_ENTRIES: usize = 2000;
 const DAY_MS: f64 = 86_400_000.0;
 
@@ -21,8 +16,6 @@ pub struct History {
     pub visits: Vec<Visit>,
 }
 
-/// A suggestion: the page, and whether the query is the start of its site
-/// so the bar can offer it as the top "Go to" result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Match {
     pub url: String,
@@ -31,7 +24,6 @@ pub struct Match {
 }
 
 impl History {
-    /// Records a visit to `url`. Only web pages are remembered.
     pub fn record(&mut self, url: &str, now: u64) {
         if !(url.starts_with("https://") || url.starts_with("http://")) {
             return;
@@ -61,8 +53,6 @@ impl History {
         }
     }
 
-    /// Pages whose address or title contains every word of `query`, best
-    /// first. Pages whose site starts with the query rank highest.
     pub fn suggest(&self, query: &str, limit: usize, now: u64) -> Vec<Match> {
         let query = query.trim().to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();
@@ -88,16 +78,12 @@ impl History {
     }
 }
 
-/// Frecency: the visit count matters logarithmically and fades over the
-/// weeks since the last visit, so a page visited daily last month still
-/// beats one seen once today.
 #[expect(clippy::cast_precision_loss, reason = "an age in milliseconds is far below 2^52")]
 fn score(v: &Visit, now: u64) -> f64 {
     let days = now.saturating_sub(v.last_ms) as f64 / DAY_MS;
     (1.0 + f64::from(v.count)).ln() * 10.0 / (1.0 + days / 14.0)
 }
 
-/// "<https://www.example.com/a>" -> "example.com/a"
 fn strip_scheme(url: &str) -> &str {
     let rest = url.split_once("://").map_or(url, |(_, r)| r);
     rest.strip_prefix("www.").unwrap_or(rest)

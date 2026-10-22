@@ -1,7 +1,5 @@
 import AppKit
 
-/// The window's content: the space-tinted backdrop, the sidebar (full,
-/// compact rail or hidden), the page card, and what floats above them.
 @MainActor
 final class RootView: NSView {
     private let store: BrowserStore
@@ -51,8 +49,6 @@ final class RootView: NSView {
         elsewhereHint.autoresizingMask = [.width, .height]
         dropPreview.autoresizingMask = [.width, .height]
         dropPreview.isHidden = true
-        // The peek card sits right under the sidebar, which never leaves this
-        // view: moving it into the peek redrew it all as it slid in.
         addSubview(smear)
         addSubview(peek)
         peek.isHidden = true
@@ -65,7 +61,6 @@ final class RootView: NSView {
         store.webContainer.onPageAreaChange = { [weak self] in self?.needsLayout = true }
 
         store.observe(self) { [weak self] change in self?.handle(change) }
-        // The color follows the pages frame by frame.
         store.pager.observe(self) { [weak self] in self?.updateBackdrop(nil) }
         NotificationCenter.default.addObserver(self, selector: #selector(defaultsChanged),
                                                name: UserDefaults.didChangeNotification, object: nil)
@@ -77,14 +72,9 @@ final class RootView: NSView {
 
     override var isFlipped: Bool { true }
 
-    // MARK: - Changes
-
     private func handle(_ change: StoreChange) {
         switch change {
         case .snapshot:
-            // A space's colour edited, or the page colour of another tab
-            // (with Match Page Colour) washes in; on a space switch the
-            // pager moves the colour with the pages.
             let sameSpace = store.snapshot.activeSpace == backdropSpace
             backdropSpace = store.snapshot.activeSpace
             updateBackdrop(store.snapshotAnimation ?? (sameSpace ? Motion.quick : nil))
@@ -110,8 +100,6 @@ final class RootView: NSView {
         case .inspector:
             transitionInspector()
         case .chrome:
-            // Into and out of page full screen (a video), the card grows to
-            // the window's edges and back.
             Motion.animate(Motion.settle) {
                 needsLayout = true
                 layoutSubtreeIfNeeded()
@@ -126,7 +114,6 @@ final class RootView: NSView {
     }
 
     @objc private func defaultsChanged() {
-        // The tint style or page matching may have changed.
         updateBackdrop(Motion.quick)
     }
 
@@ -141,7 +128,6 @@ final class RootView: NSView {
     }
 
     @objc private func windowStateChanged() {
-        // Inactive windows wash their color out, as system materials do.
         updateBackdrop(Motion.quick)
     }
 
@@ -153,7 +139,6 @@ final class RootView: NSView {
     private func updateBackdrop(_ curve: Motion.Curve?) {
         let dark = effectiveAppearance.isDark
         let colors = store.tintColors(matchPage: UserDefaults.standard.bool(forKey: TintStyle.matchPageKey), dark: dark)
-        // Docked DevTools taking the keyboard doesn't make the window inactive.
         let active = window.map { $0.isKeyWindow || $0.isMainWindow || NSApp.keyWindow?.parent === $0 } ?? true
         let tint = Theme.gradient(for: Theme.blend(colors, at: store.pager.position), dark: dark, active: active,
                                   style: TintStyle.saved)
@@ -173,12 +158,8 @@ final class RootView: NSView {
         elsewhereHint.setVisible(store.visibleTabElsewhere && store.commandBar == nil, animated: true, curve: Motion.fade)
     }
 
-    // MARK: - Layout
-
     private var chrome: Bool { !store.contentFullscreen }
     private var sidebarWidth: CGFloat { handle.width }
-    /// Space between the page and the window edge. Focus mode keeps only a
-    /// thin frame to drag the window by.
     private var inset: CGFloat { store.layout == .focus ? 5 : 8 }
 
     private func cardFrame(for layout: SidebarLayout) -> NSRect {
@@ -198,29 +179,18 @@ final class RootView: NSView {
         backdrop.frame = bounds
         card.frame = currentCardFrame
         card.isCard = chrome
-        // The corners follow the frame's inset as the layout changes.
         let panels = min(sidebarSpring.value + railSpring.value, 1)
         card.cornerRadius = max(store.windowRadius - (5 + 3 * panels), 6)
         emptyHint.frame = card.bounds
         elsewhereHint.frame = card.bounds
         dropPreview.frame = card.bounds
-        // The card isn't flipped: the strip runs along its top.
-        // Over the page only, not docked DevTools beside it.
         let page = store.webContainer.pageArea
         agentGlow.frame = card.bounds
         agentGlow.cornerRadius = card.isCard ? card.cornerRadius : 0
         devToolbar.frame = NSRect(x: 0, y: card.bounds.height - DevToolbarView.height,
                                   width: page.width > 0 ? page.width : card.bounds.width, height: DevToolbarView.height)
         layoutInspector()
-        // Out of sight, the sidebar and rail stay attached but hidden:
-        // attaching the sidebar again costs a couple of frames as it slides in.
-        // The sidebar is either part of the layout, sliding in and out with
-        // it, or floating on the peek card; hidden, it waits at the peek's
-        // size so the peek doesn't make it lay out again.
         let shown = sidebarShown, peeking = peekSpring.value
-        // Out of sight it waits just past the left edge rather than hidden:
-        // a hidden list makes no rows, and making them all as it slides in
-        // cost several frames.
         if shownLayout == .full || shown > 0.001 {
             sidebar.frame = NSRect(x: -sidebarWidth * (1 - shown), y: 0, width: sidebarWidth, height: bounds.height)
             sidebar.alphaValue = shown
@@ -231,9 +201,6 @@ final class RootView: NSView {
         sidebar.isHidden = !chrome
         peek.isHidden = !chrome || peeking == 0 || shownLayout == .full
         if !peek.isHidden { peek.frame = peekFrame(at: peeking) }
-        // The traffic lights ride on the peek card, in line with its toolbar.
-        // They never leave the window's corner to come in with it: in Compact
-        // they stay visible, and sliding out and back would be a jump.
         store.offsetTrafficLights(peek.isHidden ? .zero
             : CGSize(width: max(peek.frame.minX, 0), height: peek.frame.minY * min(max(peeking, 0), 1)))
         if rail.superview === self {
@@ -254,25 +221,16 @@ final class RootView: NSView {
         commandBar?.frame = bounds
     }
 
-    // MARK: - Layout transitions
-
-    /// How far the sidebar and the rail are in (1) or out (0), as springs:
-    /// stepped frame by frame from wherever they are, so a quick second ⌘S
-    /// turns a change around smoothly, and a layout pass mid-way (a window
-    /// resize) can't snap anything into place early.
     private lazy var sidebarSpring = Spring(store.layout == .full ? 1 : 0)
     private lazy var railSpring = Spring(store.layout == .compact ? 1 : 0)
     private lazy var layoutTicker = FrameTicker("layout") { [weak self] time in self?.stepLayout(at: time) }
     private var lastLayoutStep: CFTimeInterval?
 
-    /// How far the floating sidebar is in while it peeks over the page.
     private lazy var peekSpring = Spring(0, response: Motion.peekResponse)
-    /// How far the inspector is in on the right.
     private lazy var inspectorSpring = Spring(store.inspectorOpen ? 1 : 0)
     private var sidebarShown: CGFloat { sidebarSpring.value }
     private var railShown: CGFloat { railSpring.value }
 
-    /// The card between the layouts, from how far the panels are in.
     private var currentCardFrame: NSRect {
         guard chrome else { return bounds }
         let sidebar = sidebarSpring.value, rail = railSpring.value
@@ -284,11 +242,6 @@ final class RootView: NSView {
                       height: max(bounds.height - inset * 2, 0))
     }
 
-    /// Switches layouts: the sidebar or rail slides while the page's card
-    /// follows its edge, the page reflowing with it frame by frame as in Arc.
-    /// (Laying it out only once left a visible jump to the new layout as the
-    /// slide ended; the engine lays a page out as fast as it can keep up, so
-    /// the slide itself stays smooth.)
     private func transitionLayout() {
         let new = store.layout
         guard new != shownLayout else { return }
@@ -296,8 +249,6 @@ final class RootView: NSView {
         if new == .compact, rail.superview !== self { addSubview(rail, positioned: .above, relativeTo: card) }
         sidebarSpring.target = new == .full ? 1 : 0
         railSpring.target = new == .compact ? 1 : 0
-        // Pinned while it peeks (⌘S with the sidebar out): it carries on
-        // from where the peek has it instead of sliding in from the edge.
         if new == .full, peekSpring.value > sidebarSpring.value {
             sidebarSpring.value = peekSpring.value
             sidebarSpring.velocity = peekSpring.velocity
@@ -335,14 +286,10 @@ final class RootView: NSView {
         layoutSubtreeIfNeeded()
     }
 
-    // MARK: - Inspector
-
-    /// The inspector's width, leaving the page at least a phone's.
     private var inspectorWidth: CGFloat {
         min(InspectorSettings.width, max(bounds.width - 420, InspectorSettings.minWidth))
     }
 
-    /// The inspector rides in from the right edge as the page makes room.
     private func layoutInspector() {
         let shown = inspectorSpring.value
         let width = inspectorWidth
@@ -377,17 +324,12 @@ final class RootView: NSView {
         needsLayout = true
     }
 
-    // MARK: - Peek
-
-    /// The floating sidebar `p` of the way in (0: just past the left edge).
     private func peekFrame(at p: CGFloat) -> NSRect {
         let width = sidebarWidth
         let hidden = -width - 12, shown: CGFloat = 6
         return NSRect(x: hidden + (shown - hidden) * p, y: 6, width: width, height: max(bounds.height - 12, 0))
     }
 
-    /// With the sidebar hidden, it slides in over the page as a floating
-    /// card, by a spring: a quick move away turns it around smoothly.
     private func updatePeek() {
         peek.cornerRadius = max(store.windowRadius - 6, 8)
         peekSpring.target = store.sidebarPeek ? 1 : 0
@@ -400,8 +342,6 @@ final class RootView: NSView {
         layoutTicker.start(on: self)
         needsLayout = true
     }
-
-    // MARK: - Overlays
 
     private func updateCommandBar() {
         if let mode = store.commandBar {
@@ -417,7 +357,6 @@ final class RootView: NSView {
         }
     }
 
-    /// Centered under the page, near the bottom of the window.
     private func layoutToast() {
         let width = toast.preferredWidth
         let pageMid = chrome ? card.frame.midX : bounds.midX
@@ -427,7 +366,6 @@ final class RootView: NSView {
     private func updateToast() {
         if let current = store.toast {
             toast.configure(current)
-            // Above everything but the command bar.
             if let commandBar {
                 addSubview(toast, positioned: .below, relativeTo: commandBar)
             } else {
@@ -441,7 +379,6 @@ final class RootView: NSView {
                 toast.alphaValue = 0
                 toast.isHidden = false
             } else {
-                // Replacing a toast: it resizes to the new message.
                 toast.frame = shown
             }
             Motion.animate(Motion.settle) {
@@ -465,7 +402,6 @@ final class RootView: NSView {
             dropPreview.configure(tab)
             dropPreview.layer?.anchorPoint = CGPoint(x: 0.5, y: 0.5)
             dropPreview.fade(visible: true, curve: Motion.settle)
-            // The little-window preview grows into place as it appears.
             if appearing, !Motion.reduced, let layer = dropPreview.layer {
                 let grow = CABasicAnimation(keyPath: "transform.scale")
                 grow.fromValue = 0.96
@@ -479,7 +415,6 @@ final class RootView: NSView {
         }
     }
 
-    // The frame around the page (and empty sidebar space) drags the window.
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
             window?.performZoom(nil)
@@ -489,7 +424,6 @@ final class RootView: NSView {
     }
 }
 
-/// The window's background: a vertical wash of the space's color.
 final class BackdropView: NSView {
     private let gradient = CAGradientLayer()
 
@@ -514,7 +448,6 @@ final class BackdropView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    /// Changes color, along `curve` or at once (while the fingers swipe).
     func setColors(_ colors: [CGColor], curve: Motion.Curve?) {
         CATransaction.begin()
         if let curve, !Motion.reduced {
@@ -528,8 +461,6 @@ final class BackdropView: NSView {
     }
 }
 
-/// An edge of light around the page while an agent acts on it, so it's
-/// always clear when something other than the person is driving.
 final class AgentGlowView: NSView {
     private let ring = CALayer()
     var cornerRadius: CGFloat = 8 {
@@ -575,7 +506,6 @@ final class AgentGlowView: NSView {
         fade.duration = Motion.reduced ? 0 : (active ? Motion.quick.duration : Motion.fade.duration * 2)
         ring.opacity = active ? 1 : 0
         ring.add(fade, forKey: "fade")
-        // It breathes while the agent works.
         if active, !Motion.reduced, ring.animation(forKey: "breathe") == nil {
             let breathe = CABasicAnimation(keyPath: "shadowRadius")
             breathe.fromValue = 6
@@ -594,7 +524,6 @@ final class AgentGlowView: NSView {
     }
 }
 
-/// The floating card the hidden sidebar slides out in.
 final class PeekContainerView: FlippedView {
     let backdrop = BackdropView()
 
@@ -621,8 +550,6 @@ final class PeekContainerView: FlippedView {
     override func layout() {
         super.layout()
         backdrop.frame = bounds
-        // From a path: worked out from the sidebar's pixels, the shadow cost
-        // a full redraw on every frame of the slide.
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer?.shadowPath = CGPath(roundedRect: bounds, cornerWidth: cornerRadius, cornerHeight: cornerRadius, transform: nil)
@@ -640,16 +567,10 @@ final class PeekContainerView: FlippedView {
     }
 }
 
-/// A soft smear off the right edge of the sidebar as it peeks in or out,
-/// as long as the sidebar is fast and gone as it settles: it reads as
-/// motion blur on the edge sweeping over the page. Plain gradients, so it
-/// costs nothing per frame (blurring the sidebar itself with a filter cost
-/// about one frame in thirty).
 final class MotionSmearView: NSView {
     private let fill = CAGradientLayer()
     private let fade = CAGradientLayer()
 
-    /// The sidebar's colors, top to bottom.
     var colors: [CGColor] = [] {
         didSet {
             CATransaction.begin()
@@ -665,7 +586,6 @@ final class MotionSmearView: NSView {
         isHidden = true
         fill.startPoint = CGPoint(x: 0.5, y: 1)
         fill.endPoint = CGPoint(x: 0.5, y: 0)
-        // Solid at the edge, gone at the far end, easing out.
         fade.startPoint = CGPoint(x: 0, y: 0.5)
         fade.endPoint = CGPoint(x: 1, y: 0.5)
         fade.colors = [1, 0.55, 0.2, 0].map { NSColor.black.withAlphaComponent($0).cgColor }
@@ -679,17 +599,13 @@ final class MotionSmearView: NSView {
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
-    /// `edge` is the sidebar's frame, `speed` in points per second.
     func update(edge: NSRect, cornerRadius: CGFloat, speed: CGFloat) {
-        // A slowed-down capture shows it as at full speed.
         let length = min(abs(speed) * CGFloat(Motion.slow) / 55, 72)
         guard length >= 2, !Motion.reduced else {
             isHidden = true
             return
         }
         isHidden = false
-        // Tucked a little under the edge so there is no seam, and clear of
-        // the rounded corners.
         frame = NSRect(x: edge.maxX - 2, y: edge.minY + cornerRadius,
                        width: length + 2, height: max(edge.height - cornerRadius * 2, 0))
         alphaValue = min(length / 24, 1) * 0.9
@@ -701,8 +617,6 @@ final class MotionSmearView: NSView {
     }
 }
 
-/// Drag to resize the sidebar. Past its limits it stretches a little, then
-/// springs back.
 final class SidebarResizeHandle: NSView {
     static let range: ClosedRange<CGFloat> = 200...420
     var onResize: (() -> Void)?

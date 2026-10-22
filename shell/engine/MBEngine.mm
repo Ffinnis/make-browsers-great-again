@@ -1,8 +1,3 @@
-// CEF integration: application class, engine lifecycle, per-profile storage
-// and one CefClient per tab. Every CEF callback used here runs on the browser
-// UI thread, which on macOS is the main thread, except the request filter
-// (OnBeforeResourceLoad), which runs on the network thread.
-
 #import "MBEngine.h"
 
 #include <fcntl.h>
@@ -29,9 +24,6 @@
 #include "include/cef_resource_handler.h"
 #include "include/wrapper/cef_library_loader.h"
 
-// A permission question that is answered exactly once: by the user, or with
-// Block if its tab closes first. Unanswered requests keep the engine from
-// ever finishing closing the tab.
 @interface MBPermissionPrompt : NSObject
 - (instancetype)initWithMessage:(NSString*)message
                            done:(void (^)(BOOL allowed))done;
@@ -68,47 +60,30 @@ namespace {
 
 CefScopedLibraryLoader* g_library_loader = nullptr;
 std::map<std::string, CefRefPtr<CefRequestContext>> g_contexts;
-// Tabs stay retained here until the engine reports them closed.
 NSMutableSet<MBWebView*>* g_views = nil;
-// Popup windows and DevTools, which CEF hosts in its own windows.
 std::vector<CefRefPtr<CefBrowser>> g_auxiliary;
-// The browser-wide DevTools connection: Chromium reads commands from fd 3
-// and writes replies and events to fd 4 (--remote-debugging-pipe); these
-// are our ends. -1 until claimed.
 int g_pipe_write = -1;
 int g_pipe_read = -1;
-// Whether to load MBGA's helper extension (see shell/resources/extension).
 bool g_extension_helper = false;
 void (^g_pipe_handler)(NSString* message) = nil;
 int g_browser_count = 0;
 bool g_quitting = false;
 bool g_strict_site_isolation = true;
 std::string g_isolated_origins;
-// Ad blocking, set once before the first browser is created. The request
-// filter is called on the network thread.
 MBRequestFilter g_request_filter = nil;
 MBPageScript g_page_script = nil;
 MBEarlyScript g_early_script = nil;
 MBPageReply g_page_reply = nil;
-// Run in every web page as it starts loading; see +setFormScript:.
 std::string g_form_script;
-// Extension support (see MBEngine.h): answers to extension code's fetches
-// of kBridgeOrigin, and the script extension pages get before their own.
 MBExtensionBridge g_extension_bridge = nil;
 MBPageScript g_extension_script = nil;
 const char kBridgeOrigin[] = "https://mbga-extension.invalid/";
-// While a tab is dragged out of the sidebar, pages refuse drops so the drag
-// can end over a page (and pop the tab out) instead of navigating it.
 bool g_reject_drops = false;
 
-// Page scripts report the class and id names they see with this prefix.
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
-// The form script's reports: this prefix, the page's token and a colon.
 constexpr char kFormPrefix[] = "__mbga_form:";
 constexpr char kFormTokenPlaceholder[] = "__MBGA_TOKEN__";
 
-// The request type names filter lists use, or nullptr for top-level pages,
-// which are never blocked.
 const char* RequestKind(cef_resource_type_t type) {
   switch (type) {
     case RT_MAIN_FRAME:
@@ -134,9 +109,6 @@ const char* RequestKind(cef_resource_type_t type) {
 }
 
 constexpr char kMediaProbePrefix[] = "__mbga_media:";
-// Reports the page's theme-color (the first <meta name="theme-color"> whose
-// media query matches), normalized by a canvas to "#rrggbb" or "rgba(...)",
-// or nothing.
 constexpr char kThemePrefix[] = "__mbga_theme:";
 constexpr char kThemeColorScript[] =
     "(function(){try{var c='';var ms=document.querySelectorAll("
@@ -151,8 +123,6 @@ constexpr char kMediaProbeScript[] =
     "if(!m.paused&&!m.muted&&m.volume>0&&m.readyState>2)p=true;});"
     "console.debug('__mbga_media:'+(p?1:0));}catch(e){}})();";
 
-// Pauses the page's playing media, marking what it paused so that resuming
-// starts only those again.
 constexpr char kPauseMediaScript[] =
     "(function(){document.querySelectorAll('video,audio').forEach(function(m){"
     "if(!m.paused){m.dataset.mbgaPaused='1';m.pause();}});})();";
@@ -164,7 +134,6 @@ enum MenuCommand {
   kOpenLinkInNewTab = MENU_ID_USER_FIRST,
   kCopyLink,
   kInspect,
-  // Extensions' items count up from here.
   kFirstExtensionItem,
 };
 
@@ -172,7 +141,6 @@ NSString* ToNS(const CefString& s) {
   return [NSString stringWithUTF8String:s.ToString().c_str()] ?: @"";
 }
 
-// What a page menu was opened on, in the terms of Chrome's contextMenus API.
 NSDictionary* MenuContext(CefRefPtr<CefContextMenuParams> params) {
   int flags = params->GetTypeFlags();
   NSMutableArray* contexts = [NSMutableArray arrayWithObject:@"all"];
@@ -187,7 +155,6 @@ NSDictionary* MenuContext(CefRefPtr<CefContextMenuParams> params) {
   if (flags & CM_TYPEFLAG_SELECTION) [contexts addObject:@"selection"];
   if (flags & CM_TYPEFLAG_EDITABLE) [contexts addObject:@"editable"];
   if (media.length) [contexts addObject:media];
-  // "page" is what's left; CEF flags the top frame as a frame too.
   if (contexts.count == 1) [contexts addObject:@"page"];
   if ((flags & CM_TYPEFLAG_FRAME) &&
       params->GetFrameUrl() != params->GetPageUrl()) {
@@ -220,8 +187,6 @@ void BrowserGone() {
   }
 }
 
-// One fetch of kBridgeOrigin by extension code, answered by the shell on
-// the main thread. Never reaches the network.
 class BridgeResourceHandler : public CefResourceHandler {
  public:
   BridgeResourceHandler(std::string profile_path,
@@ -309,7 +274,6 @@ class BridgeRequestHandler : public CefResourceRequestHandler {
       CefRefPtr<CefBrowser> browser,
       CefRefPtr<CefFrame> frame,
       CefRefPtr<CefRequest> request) override {
-    // Service workers' requests have no browser.
     return new BridgeResourceHandler(profile_path_, extension_,
                                      browser ? browser->GetIdentifier() : 0);
   }
@@ -320,8 +284,6 @@ class BridgeRequestHandler : public CefResourceRequestHandler {
   IMPLEMENT_REFCOUNTING(BridgeRequestHandler);
 };
 
-// The handler for a fetch of kBridgeOrigin made by an extension (its
-// origin is |initiator|), or null for any other request.
 CefRefPtr<CefResourceRequestHandler> BridgeHandlerFor(
     const std::string& profile_path,
     CefRefPtr<CefRequest> request,
@@ -336,7 +298,6 @@ CefRefPtr<CefResourceRequestHandler> BridgeHandlerFor(
                                   origin.substr(kExtensionScheme.size()));
 }
 
-// Requests no browser makes, such as extensions' service workers'.
 class ContextHandler : public CefRequestContextHandler {
  public:
   explicit ContextHandler(std::string path) : path_(std::move(path)) {}
@@ -357,8 +318,6 @@ class ContextHandler : public CefRequestContextHandler {
   IMPLEMENT_REFCOUNTING(ContextHandler);
 };
 
-// The script a document at |url| gets before its own: ad blocking's for web
-// pages, extension support's for extension pages. Nil for none.
 NSString* DocumentScriptFor(const std::string& url) {
   if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
     return g_page_script ? g_page_script(@(url.c_str())) : nil;
@@ -413,8 +372,6 @@ void AskPermission(CefRefPtr<CefBrowser> browser,
                  done:done];
   NSView* browser_view =
       (__bridge NSView*)browser->GetHost()->GetWindowHandle();
-  // Tabs ask only while on screen, like other browsers; popups and DevTools
-  // windows ask right away.
   if ([browser_view.superview isKindOfClass:[MBWebView class]]) {
     [(MBWebView*)browser_view.superview engineAddPrompt:prompt];
   } else {
@@ -455,8 +412,6 @@ NSString* DescribePrompt(uint32_t permissions) {
   return @"use additional permissions";
 }
 
-// Pages only the extensions window can show: Chrome's extension settings
-// and the Chrome Web Store, whose install button needs Chrome's own UI.
 bool IsExtensionsPage(const std::string& url) {
   for (const char* prefix :
        {"chrome://extensions", "https://chromewebstore.google.com/",
@@ -468,7 +423,6 @@ bool IsExtensionsPage(const std::string& url) {
   return false;
 }
 
-// Shortcuts the browser keeps even when a page would like to handle them.
 bool IsReservedShortcut(NSEvent* event) {
   NSEventModifierFlags flags =
       event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask &
@@ -480,8 +434,6 @@ bool IsReservedShortcut(NSEvent* event) {
   }
   unichar c = [key characterAtIndex:0];
   if (c > 0x7F && c < 0xF700) {
-    // Non-Latin layouts (e.g. Cyrillic): match by physical key instead, as
-    // the menu does.
     static const std::map<unsigned short, unichar> kAnsiKeys = {
         {17, 't'}, {13, 'w'}, {37, 'l'}, {12, 'q'}, {18, '1'},
         {19, '2'}, {20, '3'}, {21, '4'}, {23, '5'}, {22, '6'},
@@ -506,8 +458,6 @@ bool IsReservedShortcut(NSEvent* event) {
   return false;
 }
 
-// MBGA_ENGINE_OMIT="js-flags Prerender2" drops built-in
-// defaults by switch or feature name, for measuring what each one costs.
 bool Omitted(const std::string& name) {
   static const std::set<std::string> omitted = [] {
     std::set<std::string> names;
@@ -523,14 +473,11 @@ bool Omitted(const std::string& name) {
   return omitted.count(name) > 0;
 }
 
-// Appends to a comma-separated switch such as --enable-features instead of
-// replacing what is already there.
 void AppendToListSwitch(CefRefPtr<CefCommandLine> command_line,
                         const std::string& name,
                         const std::string& items) {
   std::string value = command_line->GetSwitchValue(name);
   for (NSString* item in [@(items.c_str()) componentsSeparatedByString:@","]) {
-    // Feature parameters follow the name: "Feature:param/value".
     NSString* feature = [item componentsSeparatedByString:@":"].firstObject;
     if (!Omitted(feature.UTF8String)) {
       value += (value.empty() ? "" : ",") + std::string(item.UTF8String);
@@ -554,8 +501,6 @@ void AppendDefaultSwitch(CefRefPtr<CefCommandLine> command_line,
   }
 }
 
-// MBGA_ENGINE_SWITCHES="--foo --bar=baz" adds engine switches, for
-// measuring memory and performance options without rebuilding.
 void AppendSwitchesFromEnvironment(CefRefPtr<CefCommandLine> command_line) {
   const char* env = getenv("MBGA_ENGINE_SWITCHES");
   if (!env) {
@@ -577,7 +522,6 @@ void AppendSwitchesFromEnvironment(CefRefPtr<CefCommandLine> command_line) {
         name == "load-extension") {
       AppendToListSwitch(command_line, name, value);
     } else if (name == "js-flags" && command_line->HasSwitch("js-flags")) {
-      // Repeated --js-flags accumulate; V8 takes them space-separated.
       command_line->AppendSwitchWithValue(
           name, command_line->GetSwitchValue(name).ToString() + " " + value);
     } else {
@@ -594,15 +538,9 @@ class BrowserApp : public CefApp {
     if (!process_type.empty()) {
       return;
     }
-    // Each switch below was measured with bench/trials.py on a 3-profile,
-    // 50-tab workload; see bench/README.md for the numbers.
 
-    // Process model. Tabs of the same site share one renderer.
     AppendDefaultSwitch(command_line, "process-per-site");
     if (!g_strict_site_isolation) {
-      // Chrome on Android's model: sites share four renderers, while
-      // sign-in origins and sites that send COOP headers stay isolated.
-      // Strict isolation used ~30% more memory with 50 tabs.
       AppendToListSwitch(command_line, "disable-features", "SitePerProcess");
       AppendDefaultSwitch(command_line, "renderer-process-limit", "4");
       if (!g_isolated_origins.empty()) {
@@ -611,44 +549,24 @@ class BrowserApp : public CefApp {
       }
     }
 
-    // Renderers whose pages are all hidden release caches, collect garbage
-    // and return free memory 30-60 s later. Freezing a tab (see the core's
-    // freeze policy) does the same for its renderer even when that renderer
-    // also hosts the visible tab.
     AppendToListSwitch(command_line, "enable-features",
                        "MemoryPurgeInBackground:"
                        "memory_purge_background_min_delay/30s/"
                        "memory_purge_background_max_delay/60s");
     AppendToListSwitch(command_line, "enable-features", "MemoryPurgeOnFreeze");
-    // Cached scripts, stylesheets and fonts are dropped once no page uses
-    // them instead of being pinned (they were ~190 MB across renderers), and
-    // prerendered tiles outside the viewport are released when idle.
     AppendToListSwitch(command_line, "disable-features",
                        "MemoryCacheStrongReference");
     AppendToListSwitch(command_line, "enable-features",
                        "ReclaimPrepaintTilesWhenIdle,ReclaimOldPrepaintTiles");
-    // The network service runs inside the browser process instead of its own
-    // (its caches were ~140 MB in a separate process); same for audio. HTTP/3
-    // (QUIC) is off: its per-connection buffers cost ~80 MB with 50 tabs, and
-    // HTTP/2 over TCP is as fast on wired and Wi-Fi networks.
     AppendToListSwitch(command_line, "enable-features",
                        "NetworkServiceInProcess2");
     AppendDefaultSwitch(command_line, "disable-quic");
-    // No idle renderer kept warm for the next navigation, no speculative
-    // prerendering, and no background fetching of optimization hints.
     AppendToListSwitch(command_line, "disable-features",
                        "SpareRendererForSitePerProcess,OptimizationHints,"
                        "AudioServiceOutOfProcess,Prerender2");
-    // V8 favours smaller code and heaps over peak speed. Low-end device mode
-    // is not used: it makes every process believe the Mac has 512 MB of RAM,
-    // which caps a renderer's JavaScript heap at ~270 MB. All tabs sharing a
-    // renderer share that heap, so heavy sites stalled in garbage collection
-    // and then crashed with "out of memory", freezing every tab beside them.
     AppendDefaultSwitch(command_line, "js-flags", "--optimize-for-size");
 
     if (g_pipe_write >= 0) {
-      // Extension support (see shell/app/Extensions.swift): the browser
-      // DevTools connection, and MBGA's helper extension in every profile.
       command_line->AppendSwitch("remote-debugging-pipe");
       AppendToListSwitch(command_line, "disable-features",
                          "DisableLoadExtensionCommandLineSwitch");
@@ -661,8 +579,6 @@ class BrowserApp : public CefApp {
     AppendSwitchesFromEnvironment(command_line);
 
 #if defined(MBGA_MOCK_KEYCHAIN)
-    // Development builds are re-signed on every build, which would make the
-    // real keychain prompt for the cookie encryption key at each launch.
     command_line->AppendSwitch("use-mock-keychain");
 #endif
   }
@@ -671,7 +587,6 @@ class BrowserApp : public CefApp {
   IMPLEMENT_REFCOUNTING(BrowserApp);
 };
 
-// Behaviour shared by tabs, popups and DevTools.
 class BaseClient : public CefClient,
                    public CefDownloadHandler,
                    public CefPermissionHandler,
@@ -697,7 +612,6 @@ class BaseClient : public CefClient,
                          CefRefPtr<CefDownloadItem> download_item,
                          CefRefPtr<CefDownloadItemCallback> callback) override {
     if (download_item->IsComplete()) {
-      // Makes the Downloads stack in the Dock bounce, like other browsers.
       [NSDistributedNotificationCenter.defaultCenter
           postNotificationName:@"com.apple.DownloadFileFinished"
                         object:ToNS(download_item->GetFullPath())];
@@ -740,9 +654,6 @@ class BaseClient : public CefClient,
       return false;
     }
     NSEvent* ns_event = (__bridge NSEvent*)os_event;
-    // Pressing a modifier alone (Cmd, Shift...) also arrives as a raw key
-    // down, with a flags-changed event that has no characters: asking it for
-    // them throws.
     if (ns_event.type != NSEventTypeKeyDown) {
       return false;
     }
@@ -751,8 +662,6 @@ class BaseClient : public CefClient,
   }
 };
 
-// Popups (window.open with features, e.g. sign-in flows) and DevTools. They
-// keep their opener, so they get real windows owned by CEF.
 class AuxiliaryClient : public BaseClient, public CefLifeSpanHandler {
  public:
   static CefRefPtr<AuxiliaryClient> Get() {
@@ -795,10 +704,6 @@ class AuxiliaryClient : public BaseClient, public CefLifeSpanHandler {
   IMPLEMENT_REFCOUNTING(AuxiliaryClient);
 };
 
-// Chrome's own window for managing a profile's extensions. Tabs are
-// Alloy style (the only style CEF embeds in a view of ours), which can't
-// show chrome:// pages or install from the Chrome Web Store; a Chrome-style
-// window can, and what it installs runs in every tab of the profile.
 class ExtensionsClient : public BaseClient, public CefLifeSpanHandler {
  public:
   static CefRefPtr<ExtensionsClient> Get() {
@@ -806,10 +711,7 @@ class ExtensionsClient : public BaseClient, public CefLifeSpanHandler {
     return instance;
   }
 
-  // Shows |url| in the profile's window, opening one if it has none.
   static void Show(const std::string& path, const std::string& url) {
-    // The window's tabs (the Web Store, an extension's options) are
-    // browsers of their own; any of them will do.
     for (const CefRefPtr<CefBrowser>& browser : g_auxiliary) {
       if (Path(browser) != path ||
           browser->GetHost()->GetRuntimeStyle() != CEF_RUNTIME_STYLE_CHROME) {
@@ -830,7 +732,6 @@ class ExtensionsClient : public BaseClient, public CefLifeSpanHandler {
                                   settings, nullptr, ContextForPath(path));
   }
 
-  // No shortcuts for the main window: ⌘W and ⌘T are this window's own.
   CefRefPtr<CefKeyboardHandler> GetKeyboardHandler() override {
     return nullptr;
   }
@@ -856,7 +757,6 @@ class ExtensionsClient : public BaseClient, public CefLifeSpanHandler {
   IMPLEMENT_REFCOUNTING(ExtensionsClient);
 };
 
-// A number from DevTools JSON, which writes whole numbers as integers.
 double Number(CefRefPtr<CefValue> value) {
   if (!value) {
     return 0;
@@ -871,8 +771,6 @@ void ShowDevTools(CefRefPtr<CefBrowser> browser, const CefPoint& at) {
   browser->GetHost()->ShowDevTools(info, AuxiliaryClient::Get(), settings, at);
 }
 
-// DevTools for one tab, reporting its window to the tab so the shell can
-// dock it.
 class DevToolsClient : public BaseClient, public CefLifeSpanHandler {
  public:
   explicit DevToolsClient(MBWebView* view) : view_(view) {}
@@ -885,7 +783,6 @@ class DevToolsClient : public BaseClient, public CefLifeSpanHandler {
     ReportWindow(browser, 40);
   }
 
-  // The window comes a little after the browser; ask until it's there.
   void ReportWindow(CefRefPtr<CefBrowser> browser, int tries) {
     CefRefPtr<DevToolsClient> client(this);
     dispatch_after(
@@ -918,7 +815,6 @@ class DevToolsClient : public BaseClient, public CefLifeSpanHandler {
   IMPLEMENT_REFCOUNTING(DevToolsClient);
 };
 
-// Downloads the page's icons in order of preference until one decodes.
 class FaviconCallback : public CefDownloadImageCallback {
  public:
   FaviconCallback(MBWebView* view,
@@ -929,8 +825,6 @@ class FaviconCallback : public CefDownloadImageCallback {
   static void Start(MBWebView* view,
                     CefRefPtr<CefBrowser> browser,
                     const std::vector<CefString>& icon_urls) {
-    // Bitmaps first: SVG icons often depend on media queries or fail to
-    // decode, and pages usually list a bitmap as well.
     std::vector<CefString> urls(icon_urls);
     std::stable_partition(urls.begin(), urls.end(), [](const CefString& url) {
       return url.ToString().find(".svg") == std::string::npos;
@@ -962,7 +856,6 @@ class FaviconCallback : public CefDownloadImageCallback {
   }
 
  private:
-  // |urls_| is stored reversed so the next candidate is at the back.
   void Next() {
     if (urls_.empty()) {
       return;
@@ -993,9 +886,6 @@ class WebClient : public BaseClient,
   explicit WebClient(MBWebView* view)
       : view_(view), created_(CFAbsoluteTimeGetCurrent()) {}
 
-  // A new tab's first page waits until its page script is registered, so
-  // scriptlets run before the page's own scripts even on a fast load. The
-  // browser starts on about:blank meanwhile.
   void DeferFirstLoad(const std::string& url) { deferred_url_ = url; }
   void CancelDeferredLoad() { deferred_url_.clear(); }
 
@@ -1008,15 +898,11 @@ class WebClient : public BaseClient,
   }
   CefRefPtr<CefDragHandler> GetDragHandler() override { return this; }
 
-  // CefDragHandler
-
   bool OnDragEnter(CefRefPtr<CefBrowser> browser,
                    CefRefPtr<CefDragData> dragData,
                    DragOperationsMask mask) override {
     return g_reject_drops;
   }
-
-  // CefLifeSpanHandler
 
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
                      CefRefPtr<CefFrame> frame,
@@ -1053,7 +939,6 @@ class WebClient : public BaseClient,
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     devtools_ = browser->GetHost()->AddDevToolsMessageObserver(this);
     if (g_page_script || g_extension_script) {
-      // Scripts for new documents only run with the Page domain enabled.
       browser->GetHost()->ExecuteDevToolsMethod(0, "Page.enable", nullptr);
     }
     [view_ engineDidCreateBrowser:browser];
@@ -1064,7 +949,6 @@ class WebClient : public BaseClient,
       LoadDeferred(browser);
       return;
     }
-    // Don't wait forever if DevTools never answers.
     CefRefPtr<WebClient> client(this);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC),
                    dispatch_get_main_queue(), ^{
@@ -1078,12 +962,10 @@ class WebClient : public BaseClient,
     }
     prepared_url_ = deferred_url_;
     deferred_url_.clear();
-    // Chrome refuses extension pages a web page navigates to.
     if (prepared_url_.rfind("chrome-extension://", 0) == 0) {
       browser->GetMainFrame()->LoadURL(prepared_url_);
       return;
     }
-    // Replacing the blank page keeps it out of the tab's history.
     NSData* json =
         [NSJSONSerialization dataWithJSONObject:@[ @(prepared_url_.c_str()) ]
                                         options:0
@@ -1096,8 +978,6 @@ class WebClient : public BaseClient,
   }
 
   bool DoClose(CefRefPtr<CefBrowser> browser) override {
-    // Returning false would make CEF close the whole window hosting the
-    // browser. Tear down only this browser's view instead.
     [view_ engineWillCloseBrowser];
     return true;
   }
@@ -1107,12 +987,9 @@ class WebClient : public BaseClient,
     BrowserGone();
   }
 
-  // CefDisplayHandler
-
   void OnAddressChange(CefRefPtr<CefBrowser> browser,
                        CefRefPtr<CefFrame> frame,
                        const CefString& url) override {
-    // The about:blank a new tab waits on is nobody's business.
     if (frame->IsMain() && deferred_url_.empty()) {
       MBWebView* view = view_;
       [view.delegate webView:view didChangeURL:ToNS(url)];
@@ -1130,8 +1007,6 @@ class WebClient : public BaseClient,
 
   void OnFaviconURLChange(CefRefPtr<CefBrowser> browser,
                           const std::vector<CefString>& icon_urls) override {
-    // The same icons again (enabling DevTools domains announces them anew):
-    // the tab keeps the one it has.
     std::vector<std::string> urls;
     for (const auto& url : icon_urls) {
       urls.push_back(url.ToString());
@@ -1171,7 +1046,6 @@ class WebClient : public BaseClient,
       return true;
     }
     if (text.rfind(kFormPrefix, 0) == 0) {
-      // Frames of other sites can log too, but don't know the token.
       std::string signed_prefix = kFormPrefix + form_token_ + ":";
       if (!form_token_.empty() && text.rfind(signed_prefix, 0) == 0) {
         MBWebView* view = view_;
@@ -1199,8 +1073,6 @@ class WebClient : public BaseClient,
     return true;
   }
 
-  // Counted for the developer toolbar; a page logging in a loop reports at
-  // most once per run-loop turn.
   void CountConsoleMessage(cef_log_severity_t level) {
     if (level == LOGSEVERITY_ERROR || level == LOGSEVERITY_FATAL) {
       console_errors_++;
@@ -1230,8 +1102,6 @@ class WebClient : public BaseClient,
                            bool has_audio_access) override {
     [view_ engineSetCapturing:has_video_access || has_audio_access];
   }
-
-  // CefLoadHandler
 
   void OnLoadStart(CefRefPtr<CefBrowser> browser,
                    CefRefPtr<CefFrame> frame,
@@ -1271,7 +1141,6 @@ class WebClient : public BaseClient,
                  int httpStatusCode) override {
     if (frame->IsMain()) {
       frame->ExecuteJavaScript(kThemeColorScript, "", 0);
-      // A failed load ends with the error page, which has no status.
       [view_
           engineDidFinishLoad:load_error_ != 0 ? load_error_ : httpStatusCode
                      duration:CFAbsoluteTimeGetCurrent() - navigation_started_];
@@ -1288,7 +1157,6 @@ class WebClient : public BaseClient,
                    ErrorCode errorCode,
                    const CefString& errorText,
                    const CefString& failedUrl) override {
-    // Aborted loads were replaced by another navigation.
     if (frame->IsMain() && errorCode != ERR_ABORTED) {
       load_error_ = errorCode;
       [view_
@@ -1308,8 +1176,6 @@ class WebClient : public BaseClient,
               canGoForward:canGoForward];
   }
 
-  // CefRequestHandler
-
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
                       CefRefPtr<CefFrame> frame,
                       CefRefPtr<CefRequest> request,
@@ -1319,8 +1185,6 @@ class WebClient : public BaseClient,
       return true;
     }
     if (frame->IsMain() && IsExtensionsPage(request->GetURL().ToString())) {
-      // Only for the person (a click, or where it redirected), and not over
-      // and over: a page can't keep bringing Chrome's window up.
       static CFAbsoluteTime last_shown = 0;
       CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
       std::string current = frame->GetURL().ToString();
@@ -1340,7 +1204,6 @@ class WebClient : public BaseClient,
       navigation_started_ = CFAbsoluteTimeGetCurrent();
       load_error_ = 0;
       std::string url = request->GetURL().ToString();
-      // The first load after a deferral already has its script.
       if (url == prepared_url_) {
         prepared_url_.clear();
       } else if (deferred_url_.empty()) {
@@ -1350,9 +1213,6 @@ class WebClient : public BaseClient,
     return false;
   }
 
-  // Links into other apps (zoomus:, mailto:, slack:...) go to the app that
-  // claims the scheme, once the person allows it, like other browsers.
-  // Returns true if the navigation belongs to another app.
   bool OpenExternally(CefRefPtr<CefBrowser> browser, const CefString& url) {
     NSURL* target = [NSURL URLWithString:ToNS(url)];
     NSString* scheme = target.scheme.lowercaseString;
@@ -1381,11 +1241,6 @@ class WebClient : public BaseClient,
     return true;
   }
 
-  // Registers the page script for the document the main frame is about to
-  // load, so it runs before the page's own scripts (scriptlets must). The
-  // previous page's script is unregistered; the load-start injection stays
-  // as a fallback, and the script runs once per document either way.
-  // Returns true if a script was sent for registration.
   bool PrepareNewDocument(CefRefPtr<CefBrowser> browser, const CefString& url) {
     CefURLParts parts;
     if (!CefParseURL(url, parts)) {
@@ -1406,8 +1261,6 @@ class WebClient : public BaseClient,
     if (script.length == 0) {
       return false;
     }
-    // Only in the top frame of the page it was made for: a script left over
-    // from a quick second navigation must not run elsewhere.
     NSData* host_json = [NSJSONSerialization
         dataWithJSONObject:@[ ToNS(CefString(&parts.host)) ]
                    options:0
@@ -1439,8 +1292,6 @@ class WebClient : public BaseClient,
     host->ExecuteDevToolsMethod(0, "Page.removeScriptToEvaluateOnNewDocument",
                                 params);
   }
-
-  // CefDevToolsMessageObserver
 
   void OnDevToolsMethodResult(CefRefPtr<CefBrowser> browser,
                               int message_id,
@@ -1494,9 +1345,6 @@ class WebClient : public BaseClient,
     }
   }
 
-  // Messages for cross-site frames' sessions, which the parsed callbacks
-  // below can't tell from the page's own. Looked at only once frames are
-  // followed or such a command is waiting.
   bool OnDevToolsMessage(CefRefPtr<CefBrowser> browser,
                          const void* message,
                          size_t message_size) override {
@@ -1549,7 +1397,6 @@ class WebClient : public BaseClient,
         return;
       }
       [view_ engineFrameAttached:info[@"targetId"] session:session];
-      // Frames inside it too, and it mustn't wait for a debugger.
       CallInSession(browser, "Target.setAutoAttach",
                     "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,"
                     "\"flatten\":true}",
@@ -1578,7 +1425,6 @@ class WebClient : public BaseClient,
             [](bool, const std::string&) {});
   }
 
-  // Sends a command to a frame's session as a raw message.
   void CallInSession(CefRefPtr<CefBrowser> browser,
                      const std::string& method,
                      const std::string& params,
@@ -1659,7 +1505,6 @@ class WebClient : public BaseClient,
         [view_ engineDidPickNode:args->GetInt("backendNodeId")];
         return;
       }
-      // DevTools inspects whatever is at a point, so ask where the node is.
       __weak MBWebView* weak_view = view_;
       Call(browser, "DOM.getBoxModel", args,
            [browser, weak_view](CefRefPtr<CefDictionaryValue> result) {
@@ -1669,7 +1514,6 @@ class WebClient : public BaseClient,
                      ? result->GetDictionary("model")->GetList("border")
                      : nullptr;
              if (quad && quad->GetSize() == 8) {
-               // Page zoom scales CSS pixels; the point is in view points.
                double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
                auto corner = [&](size_t i) {
                  return Number(quad->GetValue(i));
@@ -1684,11 +1528,8 @@ class WebClient : public BaseClient,
     }
   }
 
-  // DevTools protocol calls made on behalf of the developer toolbar.
-
   using Reply = std::function<void(CefRefPtr<CefDictionaryValue>)>;
 
-  // Sends |method|; |done| gets the result, or null if it failed.
   void Call(CefRefPtr<CefBrowser> browser,
             const std::string& method,
             CefRefPtr<CefDictionaryValue> params,
@@ -1703,7 +1544,6 @@ class WebClient : public BaseClient,
     }
   }
 
-  // Sends a command given as JSON; |done| gets the result or error JSON.
   void CallRaw(CefRefPtr<CefBrowser> browser,
                const std::string& method,
                const std::string& params,
@@ -1737,7 +1577,6 @@ class WebClient : public BaseClient,
     CefRefPtr<CefDictionaryValue> args = CefDictionaryValue::Create();
     args->SetString("mode", picking ? "searchForNode" : "none");
     if (picking) {
-      // Chrome's own highlight colours.
       auto rgba = [](int r, int g, int b, double a) {
         CefRefPtr<CefDictionaryValue> c = CefDictionaryValue::Create();
         c->SetInt("r", r);
@@ -1758,7 +1597,6 @@ class WebClient : public BaseClient,
     }
     Call(browser, "Overlay.setInspectMode", args);
     if (!picking) {
-      // The inspector keeps using them.
       if (!forwarding_) {
         Call(browser, "Overlay.disable", nullptr);
         Call(browser, "DOM.disable", nullptr);
@@ -1767,8 +1605,6 @@ class WebClient : public BaseClient,
     }
   }
 
-  // The Network domain reports every request once enabled, so it's on only
-  // while something needs it.
   void SetNetworkOverrides(CefRefPtr<CefBrowser> browser,
                            bool cache_disabled,
                            double latency,
@@ -1809,7 +1645,6 @@ class WebClient : public BaseClient,
            clip->SetDouble("x", 0);
            clip->SetDouble("y", 0);
            clip->SetDouble("width", Number(size->GetValue("width")));
-           // Beyond this a PNG gets too big to be useful.
            clip->SetDouble("height",
                            std::min(Number(size->GetValue("height")), 16384.0));
            clip->SetDouble("scale", 1);
@@ -1851,8 +1686,6 @@ class WebClient : public BaseClient,
     return g_request_filter && !is_download ? this : nullptr;
   }
 
-  // CefResourceRequestHandler (network thread)
-
   ReturnValue OnBeforeResourceLoad(CefRefPtr<CefBrowser> browser,
                                    CefRefPtr<CefFrame> frame,
                                    CefRefPtr<CefRequest> request,
@@ -1861,12 +1694,10 @@ class WebClient : public BaseClient,
     if (!kind || !browser) {
       return RV_CONTINUE;
     }
-    // Filter rules are about the site the person is on: the top-level page.
     NSString* page = ToNS(browser->GetMainFrame()->GetURL());
     if (!g_request_filter(ToNS(request->GetURL()), page, @(kind))) {
       return RV_CONTINUE;
     }
-    // Report the count to the main thread at most once per run-loop turn.
     blocked_++;
     if (!report_pending_.exchange(true)) {
       __weak MBWebView* view = view_;
@@ -1886,8 +1717,6 @@ class WebClient : public BaseClient,
     MBWebView* view = view_;
     [view.delegate webViewRendererDidTerminate:view];
   }
-
-  // CefContextMenuHandler
 
   void OnBeforeContextMenu(CefRefPtr<CefBrowser> browser,
                            CefRefPtr<CefFrame> frame,
@@ -1945,7 +1774,6 @@ class WebClient : public BaseClient,
         model->AddCheckItem(command, title);
         model->SetChecked(command, [item[@"checked"] boolValue]);
       } else if ([type isEqualToString:@"radio"]) {
-        // Radio items next to each other form a group.
         if (![last_type isEqualToString:@"radio"]) {
           group++;
         }
@@ -1980,7 +1808,6 @@ class WebClient : public BaseClient,
         return true;
       case kInspect:
         if (inspector_picks_) {
-          // The shell's inspector finds the element; it wants CSS pixels.
           double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
           [view engineInspectAt:NSMakePoint(params->GetXCoord() / zoom,
                                             params->GetYCoord() / zoom)];
@@ -2005,42 +1832,29 @@ class WebClient : public BaseClient,
 
  private:
   __weak MBWebView* view_;
-  // Extensions' items in the open page menu, by command, and what it was
-  // opened on.
   std::vector<std::string> extension_items_;
   NSDictionary* menu_context_ = nil;
-  // Keeps the DevTools observer registered.
   CefRefPtr<CefRegistration> devtools_;
-  // The page script registered for new documents, and requests in flight.
   std::string document_script_;
   std::string deferred_url_;
-  // The page's icons last announced.
   std::vector<std::string> favicon_urls_;
-  // When the tab's engine view was made, for load timings in debug logs.
   CFAbsoluteTime created_;
   std::string prepared_url_;
   int pending_add_ = 0;
   std::set<int> stale_adds_;
-  // Requests blocked since the page started loading.
   std::atomic<NSUInteger> blocked_{0};
   std::atomic<bool> report_pending_{false};
-  // For the developer toolbar: console messages since the page started
-  // loading, and how the last navigation went.
   NSUInteger console_errors_ = 0;
   NSUInteger console_warnings_ = 0;
   bool console_report_pending_ = false;
-  // The secret the current page's form script signs its reports with.
   std::string form_token_;
   CFAbsoluteTime navigation_started_ = 0;
   int load_error_ = 0;
   std::map<int, Reply> replies_;
   std::map<int, RawReply> raw_replies_;
   bool picking_ = false;
-  // Agents: cross-site frames followed, network recorded, and commands
-  // sent to frames' sessions (ids far above ExecuteDevToolsMethod's).
   bool following_frames_ = false;
   bool recording_network_ = false;
-  // Every event goes to the shell's inspector, which also picks elements.
   bool forwarding_ = false;
   bool inspector_picks_ = false;
   std::map<int, RawReply> session_replies_;
@@ -2050,9 +1864,7 @@ class WebClient : public BaseClient,
   IMPLEMENT_REFCOUNTING(WebClient);
 };
 
-}  // namespace
-
-// ---------------------------------------------------------- MBPermissionPrompt
+}
 
 @implementation MBPermissionPrompt {
   NSString* _message;
@@ -2099,7 +1911,6 @@ class WebClient : public BaseClient,
   }
   _answered = YES;
   if (_alert && _window.attachedSheet == _alert.window) {
-    // Re-enters -answer: through the completion handler, which is ignored.
     [_window endSheet:_alert.window returnCode:NSAlertSecondButtonReturn];
   }
   void (^done)(BOOL) = _done;
@@ -2110,9 +1921,6 @@ class WebClient : public BaseClient,
 }
 
 @end
-
-// ----------------------------------------------------------------
-// MBApplication
 
 @interface MBApplication () <CefAppProtocol>
 @end
@@ -2136,12 +1944,10 @@ class WebClient : public BaseClient,
           (unsigned long)event.modifierFlags, event.window.title,
           NSStringFromClass([event.window.firstResponder class]));
   }
-  // Permission prompts are sheets, and a sheet with keyboard focus swallows
-  // Cmd+Q. Quit anyway; quitting answers open prompts with Block.
   NSEventModifierFlags modifiers =
       event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
   NSWindow* sheet_parent = NSApp.keyWindow.sheetParent;
-  if (event.type == NSEventTypeKeyDown && event.keyCode == 12 /* Q */ &&
+  if (event.type == NSEventTypeKeyDown && event.keyCode == 12 &&
       (modifiers & (NSEventModifierFlagCommand | NSEventModifierFlagControl |
                     NSEventModifierFlagOption)) == NSEventModifierFlagCommand &&
       sheet_parent) {
@@ -2160,8 +1966,6 @@ class WebClient : public BaseClient,
 }
 
 @end
-
-// ------------------------------------------------------------- cookie import
 
 namespace {
 
@@ -2193,9 +1997,6 @@ class SetCookieCallback : public CefSetCookieCallback {
   IMPLEMENT_REFCOUNTING(SetCookieCallback);
 };
 
-// Collects the keys of every cookie in a store. CEF lets the visitor go
-// once it has seen them all (at once when there are none), so that's when
-// |done| runs.
 class CookieKeys : public CefCookieVisitor {
  public:
   explicit CookieKeys(std::function<void(std::set<std::string>)> done)
@@ -2218,13 +2019,10 @@ class CookieKeys : public CefCookieVisitor {
   IMPLEMENT_REFCOUNTING(CookieKeys);
 };
 
-}  // namespace
+}
 
 @implementation MBCookie
 @end
-
-// ---------------------------------------------------------------------
-// MBEngine
 
 @implementation MBEngine
 
@@ -2268,7 +2066,6 @@ class CookieKeys : public CefCookieVisitor {
         browser->GetHost()->GetRuntimeStyle() != CEF_RUNTIME_STYLE_CHROME) {
       continue;
     }
-    // Chrome's menu items send commandDispatch: with the command as tag.
     SEL dispatch = NSSelectorFromString(@"commandDispatch:");
     if (![key respondsToSelector:dispatch]) {
       return NO;
@@ -2290,8 +2087,6 @@ class CookieKeys : public CefCookieVisitor {
            completion:(void (^)(NSInteger added,
                                 NSInteger kept,
                                 NSInteger refused))completion {
-  // Each cookie with the URL it's set for: https for secure ones, the
-  // domain without its leading dot. A host-only cookie names no domain.
   auto list =
       std::make_shared<std::vector<std::pair<std::string, CefCookie>>>();
   for (MBCookie* c in cookies) {
@@ -2346,7 +2141,6 @@ class CookieKeys : public CefCookieVisitor {
           for (const auto& item : *list) {
             CefCookie keyed = item.second;
             if (!CefString(&keyed.domain).length()) {
-              // Stored host-only cookies carry their host as the domain.
               std::string url = item.first;
               size_t start = url.find("://") + 3;
               CefString(&keyed.domain) =
@@ -2412,8 +2206,6 @@ class CookieKeys : public CefCookieVisitor {
 }
 
 + (BOOL)claimDevToolsPipe {
-  // Both descriptors must be free: claimed before anything else opens a
-  // file, they're ours for the life of the process.
   if (fcntl(3, F_GETFD) != -1 || fcntl(4, F_GETFD) != -1) {
     return NO;
   }
@@ -2426,8 +2218,6 @@ class CookieKeys : public CefCookieVisitor {
     close(to_browser[1]);
     return NO;
   }
-  // Our ends move out of the way first: pipe() itself may have handed out
-  // 3 and 4.
   g_pipe_write = fcntl(to_browser[1], F_DUPFD_CLOEXEC, 10);
   g_pipe_read = fcntl(from_browser[0], F_DUPFD_CLOEXEC, 10);
   int browser_read = fcntl(to_browser[0], F_DUPFD, 10);
@@ -2449,7 +2239,6 @@ class CookieKeys : public CefCookieVisitor {
     g_pipe_write = g_pipe_read = -1;
     return NO;
   }
-  // Messages end with a NUL byte.
   int fd = g_pipe_read;
   [NSThread detachNewThreadWithBlock:^{
     std::string buffer;
@@ -2549,7 +2338,6 @@ class CookieKeys : public CefCookieVisitor {
     return;
   }
   g_quitting = true;
-  // An open permission prompt would hold up shutdown; answer it with Block.
   for (NSWindow* window in NSApp.windows) {
     if (window.attachedSheet) {
       [window endSheet:window.attachedSheet
@@ -2584,9 +2372,6 @@ class CookieKeys : public CefCookieVisitor {
 
 @end
 
-// --------------------------------------------------------------------
-// MBWebView
-
 @implementation MBWebView {
   CefRefPtr<WebClient> _client;
   CefRefPtr<CefBrowser> _browser;
@@ -2595,13 +2380,11 @@ class CookieKeys : public CefCookieVisitor {
   BOOL _capturing;
   BOOL _frozen;
   NSMutableArray<MBPermissionPrompt*>* _prompts;
-  // Developer toolbar emulations.
   NSMutableDictionary<NSString*, NSString*>* _mediaFeatures;
   NSMutableDictionary<NSString*, NSString*>* _frameSessions;
   BOOL _followsFrames;
   BOOL _forwardsDevToolsEvents;
   BOOL _picksForInspector;
-  // DevTools commands sent before the browser existed, sent once it does.
   NSMutableArray<dispatch_block_t>* _pendingCommands;
   NSString* _mobileUserAgent;
   BOOL _scriptsDisabled;
@@ -2630,12 +2413,7 @@ class CookieKeys : public CefCookieVisitor {
   [g_views addObject:self];
   g_browser_count++;
   std::string start = url.UTF8String;
-  // Waiting for the page script costs the time it takes a renderer to start
-  // (the request can't go out meanwhile), so only pages with scriptlets do;
-  // hiding rules arrive as the page starts loading.
   bool web = [url hasPrefix:@"https://"] || [url hasPrefix:@"http://"];
-  // Extension pages always wait: their script answers the extension APIs
-  // they call first thing.
   bool extension = [url hasPrefix:@"chrome-extension://"];
   if ((g_page_script && web && (!g_early_script || g_early_script(url))) ||
       (g_extension_script && extension)) {
@@ -2751,7 +2529,6 @@ class CookieKeys : public CefCookieVisitor {
   if (!_browser) {
     return;
   }
-  // Open already, it comes forward and inspects the point.
   if (_browser->GetHost()->HasDevTools()) {
     ShowDevTools(_browser, at);
     [_devToolsWindow makeKeyAndOrderFront:nil];
@@ -2799,7 +2576,6 @@ class CookieKeys : public CefCookieVisitor {
   if (!_browser) {
     return;
   }
-  // Each call replaces every emulated feature.
   CefRefPtr<CefListValue> features = CefListValue::Create();
   for (NSString* feature in _mediaFeatures) {
     CefRefPtr<CefDictionaryValue> entry = CefDictionaryValue::Create();
@@ -2819,7 +2595,6 @@ class CookieKeys : public CefCookieVisitor {
   }
   BOOL mobile = userAgent != nil;
   if (mobile) {
-    // Zero sizes keep the view's own; only the mobile viewport changes.
     CefRefPtr<CefDictionaryValue> metrics = CefDictionaryValue::Create();
     metrics->SetInt("width", 0);
     metrics->SetInt("height", 0);
@@ -2834,7 +2609,6 @@ class CookieKeys : public CefCookieVisitor {
   touch->SetInt("maxTouchPoints", 5);
   _client->Call(_browser, "Emulation.setTouchEmulationEnabled", touch);
   CefRefPtr<CefDictionaryValue> agent = CefDictionaryValue::Create();
-  // An empty user agent goes back to the real one.
   agent->SetString("userAgent", mobile ? userAgent.UTF8String : "");
   _client->Call(_browser, "Emulation.setUserAgentOverride", agent);
 }
@@ -2876,7 +2650,6 @@ class CookieKeys : public CefCookieVisitor {
     return;
   }
   std::string origin = CefString(&parts.origin).ToString();
-  // The origin comes with a trailing slash the protocol doesn't accept.
   if (!origin.empty() && origin.back() == '/') {
     origin.pop_back();
   }
@@ -2970,7 +2743,6 @@ class CookieKeys : public CefCookieVisitor {
       });
 }
 
-// Runs |then| once the browser exists (YES), or at once if it never will.
 - (void)waitForBrowser:(void (^)(BOOL ready))then {
   if (_closing) {
     then(NO);
@@ -3109,8 +2881,6 @@ class CookieKeys : public CefCookieVisitor {
   }
   _prompts = nil;
   if (_frozen) {
-    // A frozen page never acknowledges the close, which would leave the
-    // browser half-closed (and quitting waiting for it) forever.
     [self setFrozen:NO];
   }
   _closing = YES;
@@ -3118,12 +2888,8 @@ class CookieKeys : public CefCookieVisitor {
     _browser->GetHost()->CloseBrowser(true);
     [self scheduleCloseFallback];
   }
-  // Otherwise the browser is closed as soon as it has been created.
 }
 
-// A page that does not answer the close request (frozen, hung) would never
-// finish closing. Tearing down the engine's view destroys the browser
-// regardless, the same way the normal close path does.
 - (void)scheduleCloseFallback {
   __weak MBWebView* weakSelf = self;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
@@ -3139,19 +2905,12 @@ class CookieKeys : public CefCookieVisitor {
                  });
 }
 
-// Engine callbacks.
-
 - (int)browserIdentifier {
   return _browser ? _browser->GetIdentifier() : 0;
 }
 
 - (void)engineDidCreateBrowser:(CefRefPtr<CefBrowser>)browser {
   _browser = browser;
-  // Chromium takes a page made in a hidden view for a visible one, and only
-  // looks again when its view is hidden, shown or moved. A tab loaded off
-  // screen (another space's, readied at launch) kept painting every frame
-  // and running its timers at full speed until first shown. Moving the
-  // engine's view out and back in makes Chromium look.
   if (self.isHiddenOrHasHiddenAncestor) {
     NSView* host = (__bridge NSView*)browser->GetHost()->GetWindowHandle();
     [host removeFromSuperview];
@@ -3173,7 +2932,6 @@ class CookieKeys : public CefCookieVisitor {
   }
 }
 
-// Emulations (and agents' recording) asked for before the browser existed.
 - (void)applyEmulations {
   if (_followsFrames) {
     _client->FollowFrames(_browser);
@@ -3207,13 +2965,11 @@ class CookieKeys : public CefCookieVisitor {
     NSLog(@"tab %llu: DoClose / teardown", _tabID);
   }
   _closing = YES;
-  // Commands waiting for a browser that won't come fail now.
   NSArray<dispatch_block_t>* pending = _pendingCommands;
   _pendingCommands = nil;
   for (dispatch_block_t command in pending) {
     command();
   }
-  // Removing the engine's view destroys the browser (see DoClose).
   dispatch_async(dispatch_get_main_queue(), ^{
     for (NSView* subview in [self.subviews copy]) {
       [subview removeFromSuperview];

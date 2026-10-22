@@ -1,10 +1,3 @@
-//! Open tabs from a Chromium session file ("SNSS"): a log of commands that
-//! replays into the browser's windows and tabs.
-//!
-//! Layout: "SNSS", an i32 version, then records of a u16 size followed by a
-//! one-byte command id and `size - 1` bytes of payload. Fixed-size payloads
-//! are little-endian structs; tab navigations are `base::Pickle` objects.
-
 use std::collections::{BTreeMap, HashMap};
 
 const SET_TAB_WINDOW: u8 = 0;
@@ -18,7 +11,6 @@ const SET_PINNED_STATE: u8 = 12;
 const TAB_CLOSED: u8 = 16;
 const WINDOW_CLOSED: u8 = 17;
 
-/// Window types other than this (popups, apps, `DevTools`) are skipped.
 const WINDOW_TYPE_NORMAL: i32 = 0;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,9 +33,6 @@ fn i32_at(b: &[u8], at: usize) -> Option<i32> {
     Some(i32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
 }
 
-/// Reads a `base::Pickle` navigation: payload size, tab id, navigation index,
-/// URL (length-prefixed bytes) and title (length-prefixed UTF-16), each
-/// field padded to four bytes.
 fn parse_navigation(p: &[u8]) -> Option<(i32, i32, String, String)> {
     let tab = i32_at(p, 4)?;
     let index = i32_at(p, 8)?;
@@ -56,8 +45,6 @@ fn parse_navigation(p: &[u8]) -> Option<(i32, i32, String, String)> {
     Some((tab, index, url, String::from_utf16_lossy(&units)))
 }
 
-/// The open tabs of every normal window, window by window in tab-strip
-/// order. Returns None if the data is not a session file.
 pub fn parse(data: &[u8]) -> Option<Vec<SessionTab>> {
     if data.get(..4)? != b"SNSS" {
         return None;
@@ -99,7 +86,6 @@ pub fn parse(data: &[u8]) -> Option<Vec<SessionTab>> {
                 }
             }
             NAVIGATION_PRUNED_FROM_BACK => {
-                // Navigations at and after `index` were removed.
                 if let (Some(tab), Some(index)) = (i32_at(p, 0), i32_at(p, 4)) {
                     if let Some(t) = tabs.get_mut(&tab) {
                         t.navigations.retain(|&i, _| i < index);
@@ -107,7 +93,6 @@ pub fn parse(data: &[u8]) -> Option<Vec<SessionTab>> {
                 }
             }
             NAVIGATION_PRUNED_FROM_FRONT => {
-                // The first `count` navigations were removed; the rest shift down.
                 if let (Some(tab), Some(count)) = (i32_at(p, 0), i32_at(p, 4)) {
                     if let Some(t) = tabs.get_mut(&tab) {
                         t.navigations = std::mem::take(&mut t.navigations)

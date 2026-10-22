@@ -1,9 +1,5 @@
 import Foundation
 
-// mbga: use the running MBGA browser from a terminal, a script or an
-// agent's shell. `mbga <command> [args]` runs one command and prints the
-// result. It talks to the socket MBGA opens while Settings ▸ Agents allows it.
-
 let guide = """
 mbga: drive the MBGA browser. Pages come back as short outlines with refs
 ([e12]) to act on; refs last until the page changes, then snapshot again.
@@ -59,11 +55,9 @@ enum Failure: Error {
     case message(String)
 }
 
-/// One connection to the browser, for any number of commands.
 final class Browser {
     private let fd: Int32
     private var pending = Data()
-    /// Which agent this is: each has its own current tab.
     private let session: String
 
     init(session: String = ProcessInfo.processInfo.environment["MBGA_SESSION"] ?? "default") throws {
@@ -110,8 +104,6 @@ final class Browser {
     }
 }
 
-// MARK: - Main
-
 let argv = Array(CommandLine.arguments.dropFirst())
 if argv.isEmpty || ["help", "-h", "--help", "guide"].contains(argv[0]) {
     print(guide)
@@ -119,7 +111,6 @@ if argv.isEmpty || ["help", "-h", "--help", "guide"].contains(argv[0]) {
 }
 do {
     var argv = argv
-    // A script goes over as its text.
     if argv[0] == "run" {
         guard argv.count >= 2 else { throw Failure.message("Usage: mbga run <file.js | - | -e 'code'>") }
         let rest = Array(argv.dropFirst(argv[1] == "-e" ? 3 : 2))

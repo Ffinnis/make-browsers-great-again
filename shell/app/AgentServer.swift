@@ -1,31 +1,20 @@
 import AppKit
 import Darwin
 
-// Agent access: lets agents on this Mac (Claude Code, other coding agents,
-// scripts) use the browser from their shell through the `mbga` command. The command talks to a Unix
-// socket in the data folder; only the same macOS user can connect, and the
-// socket exists only while Settings ▸ Agents allows it.
-
 enum AgentSettings {
     static let enabledKey = "agentAccess"
-    /// MBGA_DEBUG_AGENT=1 allows agents in a test copy without saving it
-    /// (the preferences are shared with the copy in real use).
     static let debug = ProcessInfo.processInfo.environment["MBGA_DEBUG_AGENT"]?.isEmpty == false
 
     static var enabled: Bool { debug || UserDefaults.standard.bool(forKey: enabledKey) }
 
-    /// Where the `mbga` command is installed by Settings.
     static var commandLink: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/mbga")
     }
 
-    /// The `mbga` command inside the app.
     static var bundledCommand: URL? {
         Bundle.main.url(forResource: "mbga", withExtension: nil, subdirectory: "bin")
     }
 
-    /// What `mbga help` prints: the one description of the commands, for
-    /// the skill and instructions given to agents.
     static var guide: String {
         guard let command = bundledCommand else { return "" }
         let process = Process()
@@ -43,8 +32,6 @@ enum AgentSettings {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/skills/mbga-browser/SKILL.md")
     }
 
-    /// A Claude Code skill, so Claude reaches for `mbga` whenever a task
-    /// touches the web. Returns an error to show.
     static func installClaudeSkill() -> String? {
         if !FileManager.default.fileExists(atPath: commandLink.path), let error = installCommand() { return error }
         let skill = [
@@ -73,13 +60,11 @@ enum AgentSettings {
         }
     }
 
-    /// A few lines for an AGENTS.md or CLAUDE.md, for any agent.
     static let instructions = [
         "## Browser",
         "Use the person's MBGA browser from the shell with `mbga` (~/.local/bin/mbga) for anything on the web: `mbga open <url>`, `mbga snapshot` (the page as an outline with refs like [e4]), `mbga click e4`, `mbga fill e6 \"text\" --enter`, `mbga read`, `mbga console`, `mbga network`. For many steps, write a script: `mbga run -e 'await open(url); return await evaluate(() => document.title)'`. Your tabs stay off the person's screen. Run `mbga help` for everything.",
     ].joined(separator: "\n")
 
-    /// Links ~/.local/bin/mbga to the app's command. Returns an error to show.
     static func installCommand() -> String? {
         guard let command = bundledCommand else { return "The command isn't in this build of MBGA." }
         let link = commandLink
@@ -94,10 +79,6 @@ enum AgentSettings {
     }
 }
 
-/// The socket. Each connection sends one JSON request per line,
-/// {"argv": ["click", "e4"]}, and gets one JSON reply per line,
-/// {"ok": true, "text": "..."}; commands run on the main thread, one at a
-/// time per connection.
 @MainActor
 final class AgentServer {
     let path: String
@@ -134,7 +115,6 @@ final class AgentServer {
             buffer.copyBytes(from: path.utf8)
             buffer[path.utf8.count] = 0
         }
-        // Only this user may connect, whatever the umask.
         let previous = umask(0o077)
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -176,11 +156,8 @@ final class AgentServer {
         unlink(path)
     }
 
-    /// Reads requests off one connection until it closes. Runs on its own
-    /// thread; each command hops to the main thread.
     private nonisolated func serve(_ client: Int32) {
         defer { close(client) }
-        // A connection is blocking; replies are written whole.
         _ = fcntl(client, F_SETFL, fcntl(client, F_GETFL, 0) & ~O_NONBLOCK)
         var pending = Data()
         var buffer = [UInt8](repeating: 0, count: 65536)
@@ -238,19 +215,12 @@ enum AgentReply: Sendable {
     case failure(String)
 }
 
-/// How agents share the browser with the person, kept in the data folder
-/// (agents.json) rather than the preferences, which test copies share.
 struct AgentPreferences: Codable, Equatable {
-    /// Agents open tabs in a space of their own, not the person's.
     var ownSpace = true
-    /// Their space uses a profile of its own, with its own cookies and
-    /// sign-ins, instead of one of the person's.
     var separateProfile = false
-    /// The person's profile agents use (nil: the first space's).
     var profileID: UInt64?
     var separateProfileID: UInt64?
     var spaceID: UInt64?
-    /// Sites agents may not read, use or open, e.g. "bank.com".
     var blockedSites: [String] = []
 
     static func load(from directory: URL) -> Self {
@@ -266,8 +236,6 @@ struct AgentPreferences: Codable, Equatable {
         try? encoder.encode(self).write(to: directory.appendingPathComponent("agents.json"), options: .atomic)
     }
 
-    /// The blocked site `url` belongs to, if any (a site covers its
-    /// subdomains).
     func blockedSite(for url: String) -> String? {
         guard let host = URLComponents(string: url)?.host?.lowercased() else { return nil }
         return blockedSites.first { site in

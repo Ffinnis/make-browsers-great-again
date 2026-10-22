@@ -1,5 +1,3 @@
-// Brings the app with the given process ID to the front.
-// Usage: activate <pid>
 import AppKit
 
 guard CommandLine.arguments.count == 2, let pid = pid_t(CommandLine.arguments[1]),

@@ -11,7 +11,6 @@ from typing import ClassVar
 
 from common import DEVTOOLS_PORT, ROOT, TOOLS, wait_exit
 
-# Keycodes (layout independent).
 KEY_TAB, KEY_Q = 48, 12
 KEY_DIGITS = [18, 19, 20, 21, 23, 22, 26, 28, 25]
 
@@ -19,8 +18,6 @@ KEY_DIGITS = [18, 19, 20, 21, 23, 22, 26, 28, 25]
 class Chromium:
     """Chromium or Google Chrome with a throwaway --user-data-dir."""
 
-    # The window gives web pages the same viewport as MBGA's default window
-    # (1280x820 with the sidebar), measured with window.innerWidth/Height.
     FLAGS: ClassVar[list[str]] = [
         "--no-first-run",
         "--no-default-browser-check",
@@ -28,7 +25,6 @@ class Chromium:
         "--window-position=224,99",
     ]
     WINDOW = "--window-size=1004,891"
-    # Hides the "Google API keys are missing" bar of Chromium builds.
     ENV: ClassVar[dict[str, str]] = {
         "GOOGLE_API_KEY": "no",
         "GOOGLE_DEFAULT_CLIENT_ID": "no",
@@ -57,7 +53,6 @@ class Chromium:
         for i, name in enumerate(profile_names, 1):
             prefs_dir = os.path.join(data, f"Profile {i}")
             os.makedirs(prefs_dir)
-            # "Continue where you left off", so a restore reopens all tabs.
             with open(os.path.join(prefs_dir, "Preferences"), "w") as f:
                 json.dump({"session": {"restore_on_startup": 1}, "profile": {"name": name}}, f)
 
@@ -94,7 +89,7 @@ class Chromium:
         )
 
     def quit(self, proc):
-        proc.terminate()  # SIGTERM saves the session like Cmd+Q
+        proc.terminate()
         wait_exit(proc)
 
 

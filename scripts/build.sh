@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Builds build/cmake/out/MBGA.app. Pass --run to launch it afterwards, or
-# --release to build build/release/out/MBGA.app, which updates itself from
-# GitHub (scripts/release.sh publishes it).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -12,7 +9,6 @@ RUN=0
 for arg in "$@"; do
   case "$arg" in
     --run) RUN=1 ;;
-    # MBGA_SIGN_IDENTITY: the identity to sign with (ad hoc if unset).
     --release)
       DIR="$BUILD/release"
       FLAGS+=(-DMBGA_UPDATES=ON "-DMBGA_SIGN_IDENTITY=${MBGA_SIGN_IDENTITY:--}")
@@ -24,8 +20,6 @@ for arg in "$@"; do
   esac
 done
 
-# Run scripts/check.sh before every commit, and leave formatting-only
-# commits out of git blame.
 if git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   git -C "$ROOT" config core.hooksPath .githooks
   git -C "$ROOT" config blame.ignoreRevsFile .git-blame-ignore-revs

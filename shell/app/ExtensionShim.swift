@@ -1,17 +1,6 @@
 import Foundation
 
-/// Runs in extension code (service workers, and extension pages shown in
-/// MBGA's views) before the extension's own scripts. MBGA's tabs are
-/// Alloy-style browsers, which Chrome's extension system can address by id
-/// but never lists, counts as active or puts in a window; this teaches the
-/// tabs, windows, action, menus and commands APIs about them, asking MBGA
-/// through fetches of the bridge origin (see MBEngine's extension bridge).
-/// Calls about Chrome's own windows (the extensions window) still go to
-/// Chrome.
 enum ExtensionShim {
-    /// The shim for one context: `token` proves requests come from it,
-    /// `instance` names the context (a worker's DevTools target id, or
-    /// "page") so MBGA can reach it again.
     static func source(token: String, instance: String) -> String {
         script
             .replacingOccurrences(of: "%TOKEN%", with: token)

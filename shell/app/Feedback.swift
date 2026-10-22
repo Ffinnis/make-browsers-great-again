@@ -1,6 +1,5 @@
 import AppKit
 
-/// A brief pill at the bottom of the page: "Archived 6 tabs · Undo ⌘Z".
 @MainActor
 final class ToastView: FlippedView {
     private let store: BrowserStore
@@ -81,8 +80,6 @@ final class ToastView: FlippedView {
     override func mouseDown(with event: NSEvent) {}
 }
 
-/// Media playing in a tab you're not looking at, at the bottom of the
-/// sidebar: what's playing, play/pause, and a click jumps back to it.
 @MainActor
 final class MiniPlayerView: HoverView {
     private let store: BrowserStore
@@ -127,7 +124,6 @@ final class MiniPlayerView: HoverView {
         let sameTab = self.media?.tab.id == media.tab.id
         let wasPaused = paused
         self.media = media
-        // Another tab taking over the player fades in its title and icon.
         if !sameTab, window != nil, !Motion.reduced {
             for view in [icon, title, subtitle] as [NSView] {
                 view.alphaValue = 0
@@ -139,7 +135,6 @@ final class MiniPlayerView: HoverView {
         icon.image = FaviconCache.shared.image(for: media.tab)
         title.stringValue = media.tab.displayTitle
         subtitle.stringValue = media.space.id == store.activeSpace.id ? media.tab.host : "\(media.space.icon) \(media.space.name)"
-        // Play and pause swap with a quick cross-fade.
         if sameTab, wasPaused != paused, let layer = playPause.layer, !Motion.reduced {
             let swap = CATransition()
             swap.type = .fade
@@ -157,8 +152,6 @@ final class MiniPlayerView: HoverView {
         updateHide(animated: true)
     }
 
-    /// The close button shows on hover while paused, and play/pause makes
-    /// room for it (it used to stay put and overlap).
     private func updateHide(animated: Bool) {
         let show = paused && hovering
         guard show == hide.isHidden || hide.alphaValue < 1 else { return }
@@ -199,8 +192,6 @@ final class MiniPlayerView: HoverView {
     }
 }
 
-/// A new version downloaded, at the bottom of the sidebar as in Arc: a click
-/// restarts into it. Hidden, it still installs when MBGA quits.
 @MainActor
 final class UpdateCardView: HoverView {
     private let fill = FillLayer()
@@ -263,8 +254,6 @@ final class UpdateCardView: HoverView {
     }
 }
 
-/// Offered once, when old Today tabs pile up: tidy them now, every day, or
-/// not at all. Nothing is lost: Undo and Recently Closed bring tabs back.
 final class CleanupCellView: NSTableCellView {
     private let store: BrowserStore
     private let fill = FillLayer()
@@ -323,8 +312,6 @@ final class CleanupCellView: NSTableCellView {
     }
 }
 
-/// Shown over the page while a sidebar tab is dragged onto it: where the
-/// little window will appear.
 @MainActor
 final class DropPreviewView: NSView {
     private let dim = CALayer()
@@ -402,8 +389,6 @@ final class DropPreviewView: NSView {
     }
 }
 
-/// An empty space: just a quiet search field, like the command bar's, to
-/// open the first tab.
 @MainActor
 final class EmptySpaceHintView: FlippedView {
     private let store: BrowserStore
@@ -428,9 +413,6 @@ final class EmptySpaceHintView: FlippedView {
     }
 }
 
-/// In place of the page when the visible tab is on screen in another
-/// window: a page can be live in one window at a time, so this one shows a
-/// picture of it, kept up to date. It comes here when this window does.
 @MainActor
 final class ElsewhereHintView: FlippedView {
     private let store: BrowserStore
@@ -443,7 +425,6 @@ final class ElsewhereHintView: FlippedView {
         super.init(frame: .zero)
         wantsLayer = true
         layer?.masksToBounds = true
-        // The page is white in either appearance, so this is too.
         appearance = NSAppearance(named: .aqua)
         icon.image = .symbol("macwindow.on.rectangle", size: 28)
         icon.contentTintColor = .tertiaryLabelColor
@@ -471,15 +452,12 @@ final class ElsewhereHintView: FlippedView {
         let top = bounds.midY - 50
         icon.frame = NSRect(x: bounds.midX - 20, y: top, width: 40, height: 34)
         title.frame = NSRect(x: 20, y: top + 46, width: bounds.width - 40, height: 20)
-        // The other window may be another size: the page keeps its top
-        // left, scaled to this one's width.
         if let size = store.elsewhereImage?.size, size.width > 0 {
             picture.frame = NSRect(x: 0, y: 0, width: bounds.width, height: bounds.width * size.height / size.width)
         }
     }
 }
 
-/// Looks like the command bar's field; clicking it opens the bar.
 private final class EmptySearchField: HoverView {
     var onClick: (() -> Void)?
     private let fill = FillLayer()
@@ -494,7 +472,6 @@ private final class EmptySearchField: HoverView {
         icon.image = .symbol("magnifyingglass", size: 15)
         icon.contentTintColor = .secondaryLabelColor
         for view in [icon, placeholder, chip] as [NSView] { addSubview(view) }
-        // The page is white in either appearance, so the field is too.
         appearance = NSAppearance(named: .aqua)
     }
 

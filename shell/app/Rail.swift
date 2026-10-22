@@ -1,12 +1,7 @@
 import AppKit
 
-/// The Compact layout: the sidebar as a narrow column of icons, Brave's
-/// "rail". Favorites, pinned and Today tabs show as their favicons, the
-/// selected one on a pill; the full sidebar slides out at the window edge.
 @MainActor
 final class SidebarRail: FlippedView {
-    /// Wide enough for the traffic lights above it to keep as much room
-    /// from the page as from the window's edge (they end about 69 pt in).
     static let width: CGFloat = 80
 
     private let store: BrowserStore
@@ -52,7 +47,6 @@ final class SidebarRail: FlippedView {
     }
 
     private func update() {
-        // Out of the window (another layout), it catches up when it's back.
         guard window != nil else {
             stale = true
             return
@@ -70,13 +64,11 @@ final class SidebarRail: FlippedView {
         for (view, tab) in zip(tabs, all) { view.configure(tab, space: space) }
         switcher.update()
         needsLayout = true
-        // A tab coming or going: the others move up or down to their places.
         if reflow { Motion.animate(Motion.reflow) { layoutSubtreeIfNeeded() } }
     }
 
     override func layout() {
         super.layout()
-        // Room for the traffic lights, then the way back to the full sidebar.
         toggle.frame = NSRect(x: (bounds.width - 28) / 2, y: 36, width: 28, height: 24)
         switcher.frame = NSRect(x: (bounds.width - 40) / 2, y: bounds.height - 8 - 32, width: 40, height: 32)
         scroll.frame = NSRect(x: 0, y: 66, width: bounds.width, height: max(switcher.frame.minY - 72, 0))
@@ -118,7 +110,6 @@ final class SidebarRail: FlippedView {
     }
 }
 
-/// A tab as its favicon on the rail.
 private final class RailTabView: HoverView {
     private let store: BrowserStore
     private let fill = FillLayer()
@@ -183,7 +174,6 @@ private final class RailTabView: HoverView {
     }
 }
 
-/// The active space's icon; a menu switches to another one.
 private final class RailSpaceSwitcher: HoverView {
     private let store: BrowserStore
     private let fill = FillLayer()

@@ -1,14 +1,9 @@
 import AppKit
 
-// Small AppKit building blocks shared by the window's views.
-
-/// A view laid out top-down, like the rest of the sidebar.
 class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
-/// Tracks whether the pointer is over it and redraws its layer when that
-/// changes or the appearance does.
 class HoverView: FlippedView {
     private(set) var hovering = false {
         didSet { if hovering != oldValue { hoverChanged() } }
@@ -43,17 +38,11 @@ class HoverView: FlippedView {
         if window == nil { hovering = false }
     }
 
-    /// Fades the hover state in or out.
     func hoverChanged() {
         FillLayer.animated(Motion.quick) { updateLayer() }
     }
 }
 
-/// Calls back on every display frame of a view's screen, with the time the
-/// frame will be shown, until stopped. For moves stepped frame by frame:
-/// views animated by Core Animation already sit at their destination as far
-/// as AppKit is concerned, and such moves can't turn around mid-way without
-/// jumping.
 @MainActor
 final class FrameTicker {
     private var link: CADisplayLink?
@@ -94,13 +83,9 @@ final class FrameTicker {
         stats.add(shown: link.timestamp, frame: link.targetTimestamp - link.timestamp, work: CACurrentMediaTime() - start)
     }
 
-    // MARK: Frame timing (MBGA_DEBUG_FPS)
-
     private static let debug = ProcessInfo.processInfo.environment["MBGA_DEBUG_FPS"]?.isEmpty == false
     private var stats = Stats()
 
-    /// Logs, when a move ends, how many frames it took, how many came late
-    /// (a frame was skipped) and how long the work for each took.
     private struct Stats {
         var frames = 0
         var late = 0
@@ -131,7 +116,6 @@ final class FrameTicker {
         }
     }
 
-    /// The link's target, so the link doesn't keep the ticker alive.
     private final class Target: NSObject {
         weak var ticker: FrameTicker?
 
@@ -142,11 +126,6 @@ final class FrameTicker {
 }
 
 extension NSView {
-    /// Whether the pointer is over this view, and not something above it, in
-    /// the key window. Tracking areas only report the pointer crossing them,
-    /// so when views move under a still pointer (a layout, a space switch)
-    /// hover is set from this instead; otherwise the view that moved away
-    /// stays lit and the one now under the pointer doesn't light up.
     var isUnderPointer: Bool {
         guard let window, window.isKeyWindow, let content = window.contentView else { return false }
         let point = window.mouseLocationOutsideOfEventStream
@@ -155,13 +134,9 @@ extension NSView {
     }
 }
 
-/// A rounded, filled layer whose color resolves against the view's
-/// appearance, with an optional hairline and soft shadow. Changes are
-/// instant unless made inside `animated`, so selecting a tab never fades.
 final class FillLayer: CALayer {
     private nonisolated(unsafe) static var animating = false
 
-    /// Runs `changes` with fill changes animated along `curve`.
     @MainActor
     static func animated(_ curve: Motion.Curve, _ changes: () -> Void) {
         animating = !Motion.reduced
@@ -187,7 +162,6 @@ final class FillLayer: CALayer {
         Self.animating ? super.action(forKey: event) : NSNull()
     }
 
-    /// Sets colors from dynamic NSColors in `appearance`.
     func paint(fill: NSColor?, border: NSColor? = nil, shadow: NSColor? = nil, in appearance: NSAppearance) {
         appearance.performAsCurrentDrawingAppearance {
             backgroundColor = fill?.cgColor
@@ -202,13 +176,10 @@ final class FillLayer: CALayer {
 }
 
 extension NSTextField {
-    /// Sets the text unless it is already that, which would redraw it.
     func setIfChanged(_ text: String) {
         if stringValue != text { stringValue = text }
     }
 
-    /// The width its text needs on one line. (A truncating label's intrinsic
-    /// size doesn't report it reliably.)
     var textWidth: CGFloat { ceil(attributedStringValue.size().width) + 4 }
 }
 
@@ -224,8 +195,6 @@ enum Label {
         return label
     }
 
-    /// A shortcut or action chip: small centered text on a rounded fill (set
-    /// the layer's background), centered vertically however tall it is.
     static func chip(_ text: String = "") -> NSTextField {
         let label = NSTextField(frame: .zero)
         label.cell = CenteredTextCell(textCell: text)
@@ -244,7 +213,6 @@ enum Label {
         return label
     }
 
-    /// Wrapping text for sheets and cards.
     static func wrapping(_ text: String, size: CGFloat = 12, color: NSColor = .secondaryLabelColor) -> NSTextField {
         let label = NSTextField(wrappingLabelWithString: text)
         label.font = Theme.font(size)
@@ -254,7 +222,6 @@ enum Label {
     }
 }
 
-/// Draws its one line centered in the cell's height rather than at the top.
 private final class CenteredTextCell: NSTextFieldCell {
     override func titleRect(forBounds rect: NSRect) -> NSRect {
         var title = super.titleRect(forBounds: rect)
@@ -276,8 +243,6 @@ extension NSImage {
     }
 }
 
-/// A borderless symbol button that shows a quiet fill on hover, like the
-/// sidebar's toolbar buttons.
 final class SymbolButton: HoverView {
     var action: (() -> Void)?
     var isEnabled = true {
@@ -327,7 +292,6 @@ final class SymbolButton: HoverView {
     }
 }
 
-/// Lets the user drag the window by a view's empty area; double-click zooms.
 class WindowDragView: FlippedView {
     override func mouseDown(with event: NSEvent) {
         if event.clickCount == 2 {
@@ -338,7 +302,6 @@ class WindowDragView: FlippedView {
     }
 }
 
-/// An NSButton or menu item that runs a closure.
 final class ClosureTarget: NSObject {
     let run: () -> Void
     init(_ run: @escaping () -> Void) { self.run = run }
@@ -348,7 +311,6 @@ final class ClosureTarget: NSObject {
 private nonisolated(unsafe) var closureTargetKey: UInt8 = 0
 
 extension NSControl {
-    /// Makes the control run `action`; the closure lives as long as the control.
     func onAction(_ action: @escaping () -> Void) {
         let target = ClosureTarget(action)
         objc_setAssociatedObject(self, &closureTargetKey, target, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
@@ -358,7 +320,6 @@ extension NSControl {
 }
 
 extension NSButton {
-    /// A push button running `action`.
     static func push(_ title: String, action: @escaping () -> Void) -> NSButton {
         let button = NSButton(title: title, target: nil, action: nil)
         button.bezelStyle = .push
@@ -368,7 +329,6 @@ extension NSButton {
 }
 
 extension NSMenu {
-    /// Adds an item that runs `action`; the item keeps its closure alive.
     @discardableResult
     func add(_ title: String, state: Bool? = nil, enabled: Bool = true, _ action: @escaping () -> Void) -> NSMenuItem {
         let target = ClosureTarget(action)
@@ -393,9 +353,6 @@ extension NSMenu {
 }
 
 extension NSView {
-    /// Shows or hides a view, fading if `animated` (a change to what this
-    /// view shows) and at once otherwise (a reused cell taking new content).
-    /// Nothing happens if it is already so.
     func setVisible(_ visible: Bool, animated: Bool, curve: Motion.Curve = Motion.quick) {
         guard animated, window != nil, !Motion.reduced else {
             layer?.removeAnimation(forKey: "alphaValue")
@@ -408,7 +365,6 @@ extension NSView {
         fade(visible: visible, curve: curve)
     }
 
-    /// Fades a view in or out, hiding it once it is gone.
     func fade(visible: Bool, curve: Motion.Curve = Motion.quick) {
         if visible, isHidden {
             alphaValue = 0

@@ -1,10 +1,7 @@
 #!/bin/bash
-# Downloads the plain Chromium build the benchmarks compare against: the
-# Mac arm64 snapshot at the branch point of Chromium 154, the version MBGA's
-# CEF is built on. Installs into third_party/chromium/.
 set -euo pipefail
 
-POSITION=1689411 # refs/heads/main@{#1689411}, 154.0.8037.0
+POSITION=1689411
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/third_party/chromium"
 DL="$ROOT/third_party/chromium-dl"

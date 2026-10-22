@@ -1,7 +1,5 @@
 import AppKit
 
-/// A small window floating over the page that never takes focus from it,
-/// so the person keeps typing in the page while it shows.
 @MainActor
 class FloatingPanel: NSPanel {
     let card = NSVisualEffectView()
@@ -41,10 +39,6 @@ class FloatingPanel: NSPanel {
     }
 }
 
-// MARK: - Suggestions
-
-/// The logins saved for a site, under the sign-in field being filled. Rows
-/// pick by click, or by the arrow keys and Return the page passes on.
 @MainActor
 final class SuggestionPanel: FloatingPanel {
     var onChoose: ((SavedLogin) -> Void)?
@@ -85,7 +79,6 @@ final class SuggestionPanel: FloatingPanel {
             row.frame = NSRect(x: Self.inset, y: y, width: width - Self.inset * 2, height: h)
             card.addSubview(row)
         }
-        // Below the field, or above it near the bottom of the screen.
         var frame = NSRect(x: field.minX, y: field.minY - 4 - height, width: width, height: height)
         if let screen = window.screen?.visibleFrame, frame.minY < screen.minY {
             frame.origin.y = field.maxY + 4
@@ -182,17 +175,12 @@ private final class SuggestionRow: FlippedView {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-// MARK: - Offer to save
-
-/// "Save password for github.com?" at the top right of the page, once a
-/// sign-in went through with a password MBGA hasn't saved.
 @MainActor
 final class SaveOfferPanel: FloatingPanel {
     enum Choice {
         case save, never, notNow
     }
 
-    /// The tab whose sign-in it asks about.
     private(set) var tabID: UInt64?
     private var answer: ((Choice) -> Void)?
     private var timeout: Timer?
@@ -256,7 +244,6 @@ final class SaveOfferPanel: FloatingPanel {
         }
     }
 
-    /// Goes away without an answer: the person moved on.
     func dismiss() {
         timeout?.invalidate()
         tabID = nil
@@ -277,10 +264,6 @@ final class SaveOfferPanel: FloatingPanel {
     }
 }
 
-// MARK: - Settings list
-
-/// The saved logins of one profile in Settings, searchable by site and
-/// username.
 @MainActor
 final class PasswordListView: NSStackView, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     var logins: [SavedLogin] = [] {

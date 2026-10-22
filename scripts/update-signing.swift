@@ -1,12 +1,3 @@
-// The release key MBGA's updates are signed with (Ed25519, as the app
-// checks them with CryptoKit).
-//
-//   swift scripts/update-signing.swift generate
-//       prints a new private key, then its public key
-//   MBGA_UPDATE_KEY=<private> swift scripts/update-signing.swift public-key
-//   MBGA_UPDATE_KEY=<private> swift scripts/update-signing.swift sign <file>
-//       prints the file's SHA-256 (hex), then the signature of that digest
-//       (base64)
 import CryptoKit
 import Foundation
 
