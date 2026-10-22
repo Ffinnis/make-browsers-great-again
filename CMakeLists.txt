@@ -45,6 +45,11 @@ set(CMAKE_OSX_DEPLOYMENT_TARGET ${MBGA_MIN_MACOS})
 set(CEF_FRAMEWORK "${CEF_BINARY_DIR_RELEASE}/Chromium Embedded Framework.framework")
 
 find_program(CARGO cargo HINTS "$ENV{HOME}/.cargo/bin" REQUIRED)
+find_program(KACHE kache HINTS "$ENV{HOME}/.cargo/bin")
+set(CORE_ENV MACOSX_DEPLOYMENT_TARGET=${MBGA_MIN_MACOS})
+if(KACHE AND NOT DEFINED ENV{RUSTC_WRAPPER})
+  list(APPEND CORE_ENV RUSTC_WRAPPER=${KACHE})
+endif()
 set(CORE_DIR "${CMAKE_SOURCE_DIR}/core")
 set(CORE_TARGET_DIR "${CMAKE_BINARY_DIR}/core-target")
 set(CORE_LIB "${CORE_TARGET_DIR}/release/libmbga_core.a")
@@ -55,11 +60,11 @@ file(GLOB_RECURSE CORE_SOURCES CONFIGURE_DEPENDS "${CORE_DIR}/src/*.rs")
 add_custom_command(
   OUTPUT "${CORE_LIB}" "${CORE_SWIFT}" "${CORE_GEN}/mbga_coreFFI.h"
          "${CORE_GEN}/mbga_coreFFI.modulemap"
-  COMMAND ${CMAKE_COMMAND} -E env MACOSX_DEPLOYMENT_TARGET=${MBGA_MIN_MACOS}
+  COMMAND ${CMAKE_COMMAND} -E env ${CORE_ENV}
           "${CARGO}" build --release --lib
           --manifest-path "${CORE_DIR}/Cargo.toml"
           --target-dir "${CORE_TARGET_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E env MACOSX_DEPLOYMENT_TARGET=${MBGA_MIN_MACOS}
+  COMMAND ${CMAKE_COMMAND} -E env ${CORE_ENV}
           "${CARGO}" run --release --quiet --features bindgen
           --bin uniffi-bindgen
           --manifest-path "${CORE_DIR}/Cargo.toml"
