@@ -50,9 +50,8 @@ TRIALS = {
     "intensive-throttling-60s": "--enable-features=IntensiveWakeUpThrottling:grace_period_seconds/60",
     "invisible-svg": "--enable-features=InvisibleSVGAnimationThrottling",
     # Speed: what the memory defaults cost.
-    "no-low-end-mode": "-enable-low-end-device-mode",
     "no-optimize-for-size": "-js-flags",
-    "no-v8-size-or-low-end": "-enable-low-end-device-mode -js-flags",
+    "low-end-mode": "--enable-low-end-device-mode",
 }
 
 
