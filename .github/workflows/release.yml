@@ -39,6 +39,22 @@ jobs:
         with:
           path: third_party/cef
           key: cef-${{ hashFiles('scripts/fetch-cef.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('core/Cargo.lock') }}
+      # Download the crates up front, retrying when the runner's network
+      # drops out, so the long build after it never needs the network.
+      - name: Fetch Rust crates
+        run: |
+          for attempt in 1 2 3 4 5; do
+            cargo fetch --locked --manifest-path core/Cargo.toml && exit 0
+            echo "::warning::Fetching crates failed (attempt $attempt), retrying"
+            sleep $((attempt * 15))
+          done
+          exit 1
       - name: Raise the version
         id: version
         env:
@@ -76,6 +92,7 @@ jobs:
           MBGA_UPDATE_KEY: ${{ secrets.MBGA_UPDATE_KEY }}
           MBGA_ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
           MBGA_ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          CARGO_NET_OFFLINE: "true"
         run: scripts/release.sh
       - name: Merge the release into the other branch
         env:
