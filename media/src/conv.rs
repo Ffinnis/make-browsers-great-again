@@ -925,8 +925,13 @@ impl Converter {
             let kind: [u8; 4] = [data[4], data[5], data[6], data[7]];
             if &kind == b"moof" {
                 let rest = &data[size..];
-                let Some((mdat_size, _)) = box_extent(rest)? else {
-                    return Ok(Poll::Idle);
+                let mdat_size = match box_extent(rest) {
+                    Ok(Some((mdat_size, _))) => mdat_size,
+                    Ok(None) => return Ok(Poll::Idle),
+                    Err(e) => {
+                        self.input.clear();
+                        return Err(e);
+                    }
                 };
                 if rest.get(4..8) != Some(b"mdat") {
                     self.input.consume(size);

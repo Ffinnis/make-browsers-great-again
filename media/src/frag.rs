@@ -78,7 +78,8 @@ fn parse_traf(
     if flags & 0x20 != 0 {
         defaults.flags = r.u32()?;
     }
-    let mut pos = if flags & 0x20000 != 0 { 0 } else { *data_end };
+    let base = if flags & 0x20000 != 0 { 0 } else { *data_end };
+    let mut pos = base;
     if let Some(tfdt) = children.iter().find(|b| &b.kind == b"tfdt") {
         let mut r = Reader::new(tfdt.body);
         let (version, _) = r.full_header()?;
@@ -91,8 +92,9 @@ fn parse_traf(
         let (version, flags) = r.full_header()?;
         let count = r.u32()? as usize;
         if flags & 0x1 != 0 {
-            let offset = r.u32()? as i32;
-            pos = usize::try_from(offset).map_or_else(|_| err("negative data offset"), Ok)?;
+            let offset = i64::from(r.u32()? as i32);
+            let start = i64::try_from(base).ok().and_then(|b| b.checked_add(offset));
+            pos = start.and_then(|p| usize::try_from(p).ok()).map_or_else(|| err("data offset before the moof"), Ok)?;
         }
         let first_flags = if flags & 0x4 != 0 { Some(r.u32()?) } else { None };
         let per_sample = [0x100, 0x200, 0x400, 0x800].iter().filter(|&&f| flags & f != 0).count() * 4;
@@ -184,4 +186,41 @@ pub fn write_fragment(sequence: u32, tracks: &[OutTrack]) -> Vec<u8> {
     }
     w.end();
     w.buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
+        let mut out = u32::try_from(body.len() + 8).unwrap().to_be_bytes().to_vec();
+        out.extend_from_slice(&kind);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn traf(track: u32, data_offset: i32) -> Vec<u8> {
+        let mut tfhd = vec![0, 0, 0, 0];
+        tfhd.extend_from_slice(&track.to_be_bytes());
+        let mut trun = vec![0, 0, 0x02, 0x01];
+        trun.extend_from_slice(&1u32.to_be_bytes());
+        trun.extend_from_slice(&data_offset.to_be_bytes());
+        trun.extend_from_slice(&4u32.to_be_bytes());
+        [make_box(*b"tfhd", &tfhd), make_box(*b"trun", &trun)].concat()
+    }
+
+    #[test]
+    fn trun_offsets_are_relative_to_the_traf_base() {
+        let moof_len = 8 + 2 * (8 + 16 + 8 + 16);
+        let first = i32::try_from(moof_len + 8).unwrap();
+        let moof = make_box(*b"moof", &[make_box(*b"traf", &traf(1, first)), make_box(*b"traf", &traf(2, 4))].concat());
+        assert_eq!(moof.len(), moof_len);
+        let unit = [moof, make_box(*b"mdat", &[1, 1, 1, 1, 0, 0, 0, 0, 2, 2, 2, 2])].concat();
+        let lookup = |_| Some((Defaults::default(), 0));
+        let runs = parse_moof(&unit, &lookup).unwrap();
+        let start = moof_len + 8;
+        assert_eq!(runs[0].samples[0].data, start..start + 4);
+        assert_eq!(runs[1].samples[0].data, start + 8..start + 12);
+        assert_eq!(unit[runs[1].samples[0].data.clone()], [2, 2, 2, 2]);
+    }
 }

@@ -598,6 +598,19 @@ fn garbage_fails_without_wedging() {
     assert!(c.poll().is_err(), "media before init");
 }
 
+#[test]
+fn a_broken_box_after_a_moof_fails_once() {
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    w.append(&mut c, &fixture("video-init.mp4"));
+    let segment = fixture("video-0.m4s");
+    let moof = find_path(&segment, &[b"moof"])[0];
+    c.push(&[&segment[moof.0..moof.1], &[0, 0, 0, 0, b'm', b'd', b'a', b't'][..]].concat());
+    assert!(c.poll().is_err());
+    assert!(matches!(c.poll(), Ok(Poll::Idle)));
+    assert!(!w.append(&mut c, &segment).bytes.is_empty());
+}
+
 fn make_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
     let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
     out.extend_from_slice(&kind);
