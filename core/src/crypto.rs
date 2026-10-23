@@ -1,6 +1,3 @@
-//! The few primitives MBGA needs, from the system's `CommonCrypto`: reading
-//! other browsers' cookies and passwords, and sealing MBGA's own passwords.
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Hash {
     Sha1,
@@ -9,13 +6,10 @@ pub enum Hash {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Cipher {
-    /// AES with a 16-, 24- or 32-byte key.
     Aes,
-    /// Triple DES with a 24-byte key and an 8-byte IV.
     TripleDes,
 }
 
-// The only unsafe code in the core: calls into CommonCrypto.
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 mod sys {
@@ -57,7 +51,6 @@ mod sys {
     }
 
     pub fn pbkdf2(hash: Hash, password: &[u8], salt: &[u8], rounds: u32, out: &mut [u8]) -> bool {
-        // kCCPRFHmacAlgSHA1 and kCCPRFHmacAlgSHA256.
         let prf = if hash == Hash::Sha1 { 1 } else { 3 };
         // SAFETY: each pointer comes with its slice's length, and `out` is
         // writable for `out.len()` bytes.
@@ -78,7 +71,6 @@ mod sys {
     }
 
     pub fn cbc(encrypt: bool, cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-        // kCCAlgorithmAES and kCCAlgorithm3DES.
         let alg = if cipher == Cipher::Aes { 0 } else { 2 };
         let mut out = vec![0u8; data.len() + 16];
         let mut moved = 0usize;
@@ -107,7 +99,6 @@ mod sys {
     }
 
     pub fn hmac(hash: Hash, key: &[u8], data: &[u8]) -> Vec<u8> {
-        // kCCHmacAlgSHA1 and kCCHmacAlgSHA256.
         let (alg, len) = if hash == Hash::Sha1 { (0, 20) } else { (2, 32) };
         let mut mac = vec![0u8; len];
         // SAFETY: key and data come with their lengths, and `mac` has room for
@@ -162,13 +153,11 @@ mod sys {
     }
 }
 
-/// A `len`-byte key derived with PBKDF2 over HMAC-`hash`.
 pub fn pbkdf2(hash: Hash, password: &[u8], salt: &[u8], rounds: u32, len: usize) -> Option<Vec<u8>> {
     let mut key = vec![0u8; len];
     sys::pbkdf2(hash, password, salt, rounds, &mut key).then_some(key)
 }
 
-/// CBC mode with PKCS#7 padding. None when the key, IV or padding is wrong.
 pub fn cbc(encrypt: bool, cipher: Cipher, key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
     sys::cbc(encrypt, cipher, key, iv, data)
 }
@@ -181,13 +170,11 @@ pub fn digest(hash: Hash, data: &[u8]) -> Vec<u8> {
     sys::digest(hash, data)
 }
 
-/// `len` bytes from the system's secure random generator.
 pub fn random(len: usize) -> Option<Vec<u8>> {
     let mut out = vec![0u8; len];
     sys::random(&mut out).then_some(out)
 }
 
-/// Compares in time that doesn't depend on where the bytes differ.
 pub fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }

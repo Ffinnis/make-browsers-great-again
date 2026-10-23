@@ -1,6 +1,4 @@
 #!/usr/bin/env bash
-# Prints the physical memory footprint of every MBGA process (what Activity
-# Monitor calls "Memory"), grouped by process type.
 set -euo pipefail
 
 total=0

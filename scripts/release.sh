@@ -1,20 +1,4 @@
 #!/usr/bin/env bash
-# Builds a release of MBGA at the version in CMakeLists.txt and publishes it
-# on GitHub. Every installed copy checks the latest release's update.json,
-# downloads MBGA.zip and offers to restart into it.
-#
-# The archive is signed with the release key, kept in your login keychain as
-# "MBGA update signing key" (or given in MBGA_UPDATE_KEY). Copies only accept
-# updates signed with it: back it up, and never publish it.
-#
-# The app is signed as opendoc is: with your Apple Development identity and
-# the hardened runtime, then by Xcode with the team's Developer ID (managed
-# in the cloud, so no certificate to keep) and notarized by Apple. Set
-# MBGA_SIGN_IDENTITY and MBGA_TEAM to use another team.
-#
-# Xcode talks to Apple with the account signed into it, or, where there is
-# none (the Release workflow in CI), with the App Store Connect API key in
-# MBGA_ASC_KEY_PATH, MBGA_ASC_KEY_ID and MBGA_ASC_ISSUER_ID.
 set -euo pipefail
 
 export MBGA_SIGN_IDENTITY="${MBGA_SIGN_IDENTITY:-Apple Development: Roman Potapov (LKU8Y4CMYF)}"
@@ -58,7 +42,6 @@ OUT="$ROOT/build/release/assets"
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
-# Xcode signs and notarizes archives, so the app goes into one.
 echo "Sending ${TAG} to Apple to be notarized…"
 ARCHIVE="$ROOT/build/release/MBGA.xcarchive"
 rm -rf "$ARCHIVE"
@@ -84,7 +67,6 @@ xcodebuild -exportArchive -archivePath "$ARCHIVE" -exportOptionsPlist "$OUT/Expo
   tail -20 "$OUT/upload.log" >&2
   exit 1
 }
-# Apple usually takes a few minutes.
 for _ in $(seq 120); do
   if xcodebuild -exportNotarizedApp -archivePath "$ARCHIVE" -exportPath "$OUT/notarized" \
     ${AUTH[@]+"${AUTH[@]}"} >"$OUT/notarized.log" 2>&1; then
@@ -106,8 +88,6 @@ xcrun stapler validate -q "$APP"
 spctl --assess --type execute "$APP"
 
 echo "Packing ${TAG}…"
-# The zip is what copies update from; the disk image is for installing:
-# MBGA beside a link to Applications, to drag it onto.
 ditto -c -k --keepParent --sequesterRsrc "$APP" "$OUT/MBGA.zip"
 mkdir "$OUT/dmg"
 ditto "$APP" "$OUT/dmg/MBGA.app"

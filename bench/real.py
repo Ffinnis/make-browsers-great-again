@@ -55,12 +55,12 @@ from common import (
 QUICK = bool(os.environ.get("BENCH_QUICK"))
 WINDOW = 20 if QUICK else 120
 EARLY, LATE, END = (30, 60, 90) if QUICK else (120, 360, 480)
-SELECT_PAUSE = 0.8  # seconds on each tab while opening them all
+SELECT_PAUSE = 0.8
 IDLE_BEFORE = 5 if QUICK else 30
 MBGA_DATA = os.path.expanduser("~/Library/Application Support/MBGA")
 ARC_APP = "/Applications/Arc.app"
 ARC_BUNDLE = "company.thebrowser.Browser"
-FAVORITE_KEYS = [18, 19, 20, 21, 23, 22, 26, 28]  # 1-8: Cmd+9 is the last tab
+FAVORITE_KEYS = [18, 19, 20, 21, 23, 22, 26, 28]
 
 
 def hid_idle_seconds():
@@ -124,8 +124,6 @@ class Arc:
         return out.stdout.strip()
 
     def launch(self):
-        # Opened as the Dock would: AppleScript only reaches an app Launch
-        # Services started. Its window takes a moment to be scriptable.
         subprocess.run(["open", "-a", ARC_APP], check=True)
         deadline = time.time() + 60
         while True:

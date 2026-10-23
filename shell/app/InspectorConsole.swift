@@ -1,10 +1,5 @@
 import AppKit
 
-// Console: the page's messages and errors, and a prompt to run JavaScript
-// in it (in the paused frame while the debugger is stopped).
-
-/// One line of the console: a message the page logged, an uncaught error,
-/// a browser warning, or something typed at the prompt and its result.
 @MainActor
 final class ConsoleMessage {
     enum Level: Int { case verbose, info, warning, error }
@@ -13,23 +8,17 @@ final class ConsoleMessage {
     let id: Int
     let kind: Kind
     let level: Level
-    /// console.log, console.table, startGroup… (Runtime's types).
     let type: String
-    /// Arguments as remote objects, or none for plain text.
     let args: [JSON]
     let text: String
     let url: String
-    /// Zero-based.
     let line: Int
     let column: Int
     let stack: [JSON]
     let timestamp: Date
-    /// How deep in console.group it was logged.
     let depth: Int
-    /// The group it is in, hidden while that group is collapsed.
     let group: Int?
     var repeats = 1
-    /// For an uncaught error: revoked once a rejection is handled.
     var exceptionID: Int?
 
     init(id: Int, kind: Kind, level: Level, type: String, args: [JSON], text: String, url: String, line: Int, column: Int,
@@ -51,14 +40,12 @@ final class ConsoleMessage {
 
     var isGroupStart: Bool { type == "startGroup" || type == "startGroupCollapsed" }
 
-    /// Whether `other` says the same thing from the same place.
     func repeats(_ other: ConsoleMessage) -> Bool {
         kind == .log && other.kind == .log && type == other.type && level == other.level && url == other.url
             && line == other.line && column == other.column && !isGroupStart && args.count == other.args.count
             && plain == other.plain && args.allSatisfy { $0.str("objectId") == nil }
     }
 
-    /// The message as text, for filtering and copying.
     lazy var plain: String = ConsoleFormat.message(self).string
 }
 
@@ -66,12 +53,10 @@ final class ConsoleMessage {
 final class ConsoleModel: InspectorModel {
     private weak var session: InspectorSession?
     private(set) var messages: [ConsoleMessage] = []
-    /// Messages were added, changed or cleared.
     let changed = Signal<Void>()
     var preserveLog = UserDefaults.standard.bool(forKey: "inspector.console.preserve") {
         didSet { UserDefaults.standard.set(preserveLog, forKey: "inspector.console.preserve") }
     }
-    /// Collapsed groups, by the id of the message that started them.
     var collapsedGroups: Set<Int> = []
     private var nextID = 0
     private var groups: [Int] = []
@@ -104,7 +89,6 @@ final class ConsoleModel: InspectorModel {
         session?.call("Log.disable")
     }
 
-    /// Errors logged, as the console counts them (repeats included).
     var errorCount: Int {
         messages.filter { $0.level == .error && $0.kind == .log }.reduce(0) { $0 + $1.repeats }
     }
@@ -117,13 +101,9 @@ final class ConsoleModel: InspectorModel {
         changed.send()
     }
 
-    // MARK: Events
-
     private func consoleCalled(_ params: JSON) {
         let type = params.str("type") ?? "log"
         let args = params.list("args")
-        // MBGA's own page scripts report through the console; their reports
-        // (a password sent from a sign-in form among them) aren't the page's.
         if type == "debug", args.first?.str("value")?.hasPrefix("__mbga_") == true { return }
         let frame = params.obj("stackTrace")?.list("callFrames").first
         let level: ConsoleMessage.Level = switch type {
@@ -178,7 +158,6 @@ final class ConsoleModel: InspectorModel {
 
     private func logEntry(_ params: JSON) {
         guard let entry = params.obj("entry") else { return }
-        // Errors pages log themselves arrive through consoleAPICalled.
         if entry.str("source") == "javascript" || entry.str("source") == "console-api" { return }
         let level: ConsoleMessage.Level = switch entry.str("level") {
         case "error": .error
@@ -225,19 +204,13 @@ final class ConsoleModel: InspectorModel {
         changed.send()
     }
 
-    // MARK: Prompt
-
-    /// Commands typed at the prompt, oldest first, shared by every tab.
     static var history: [String] = UserDefaults.standard.stringArray(forKey: "inspector.console.history") ?? [] {
         didSet {
-            // Test copies share the person's defaults; theirs isn't kept.
             guard InspectorSettings.debugPanel == nil else { return }
             UserDefaults.standard.set(Array(history.suffix(200)), forKey: "inspector.console.history")
         }
     }
 
-    /// Runs `expression` as typed at the prompt, in the paused frame if the
-    /// debugger is stopped, and logs it and its result.
     func evaluate(_ expression: String) {
         guard let session, !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
         if Self.history.last != expression { Self.history.append(expression) }
@@ -257,8 +230,6 @@ final class ConsoleModel: InspectorModel {
         }
     }
 
-    /// The value `expression` would have, without side effects (for the
-    /// preview under the prompt), or nil.
     func preview(_ expression: String) async -> JSON? {
         guard let session, !expression.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
         guard let result = try? await run(expression, in: session, preview: true), result["exceptionDetails"] == nil else { return nil }
@@ -280,12 +251,9 @@ final class ConsoleModel: InspectorModel {
         params["userGesture"] = !preview
         params["awaitPromise"] = !preview
         if let context = session.mainContextID { params["contextId"] = context }
-        // What's typed may wait as long as it likes (an awaited fetch).
         return try await session.send("Runtime.evaluate", params, timeout: preview ? 2 : 3600)
     }
 
-    /// Names that complete `prefix` at the prompt: properties of what comes
-    /// before its last dot, or globals.
     func completions(for text: String) async -> (prefix: String, names: [String]) {
         guard let session else { return ("", []) }
         let tail = String(text.reversed().prefix { $0.isLetter || $0.isNumber || $0 == "_" || $0 == "$" }.reversed())
@@ -293,7 +261,6 @@ final class ConsoleModel: InspectorModel {
         var target = "globalThis"
         if before.hasSuffix(".") {
             let head = before.dropLast()
-            // The expression before the dot: back to an unmatched bracket or space.
             var depth = 0, start = head.endIndex
             for index in head.indices.reversed() {
                 let char = head[index]
@@ -342,12 +309,8 @@ final class ConsoleModel: InspectorModel {
     }
 }
 
-// MARK: - Formatting
-
 @MainActor
 enum ConsoleFormat {
-    /// The message's text as DevTools shows it: format specifiers filled
-    /// in, strings bare, other values summarised in their colours.
     static func message(_ message: ConsoleMessage) -> NSAttributedString {
         let out = NSMutableAttributedString()
         let font = InspectorTheme.mono(11)
@@ -371,7 +334,6 @@ enum ConsoleFormat {
             if out.length > 0 { out.add(" ", color, font: font) }
             if arg.str("type") == "string" {
                 let value = (arg.str("value") ?? "").clipped(10000)
-                // Results show strings as values; logged strings are text.
                 if message.kind == .result {
                     out.add("\"\(value)\"", InspectorTheme.string, font: font)
                 } else {
@@ -386,7 +348,6 @@ enum ConsoleFormat {
         return out
     }
 
-    /// `console.log("%s is %d", a, b)` and the like; %c styles are dropped.
     private static func substitute(_ format: String, args: inout ArraySlice<JSON>, color: NSColor, font: NSFont) -> NSAttributedString {
         let out = NSMutableAttributedString()
         var current = color
@@ -427,7 +388,6 @@ enum ConsoleFormat {
         return out
     }
 
-    /// The `color:` of a %c style, if it names one simply.
     private static func cssColor(_ style: String) -> NSColor? {
         guard let range = style.range(of: #"(?:^|;)\s*color\s*:\s*([^;]+)"#, options: .regularExpression) else { return nil }
         let value = style[range].split(separator: ":").last?.trimmingCharacters(in: .whitespaces).lowercased() ?? ""
@@ -440,7 +400,6 @@ enum ConsoleFormat {
         return nil
     }
 
-    /// console.table as a text grid, from the argument's preview.
     private static func table(_ arg: JSON?) -> NSAttributedString? {
         guard let preview = arg?.obj("preview") else { return nil }
         let rows = preview.list("properties")
@@ -476,7 +435,6 @@ enum ConsoleFormat {
         return out
     }
 
-    /// "app.js:12", for the message's source link.
     static func location(_ message: ConsoleMessage) -> String? {
         guard !message.url.isEmpty else { return nil }
         var name = URL(string: message.url)?.lastPathComponent ?? message.url
@@ -488,8 +446,6 @@ enum ConsoleFormat {
 private extension Comparable {
     func clamped(to range: ClosedRange<Self>) -> Self { min(max(self, range.lowerBound), range.upperBound) }
 }
-
-// MARK: - Panel
 
 final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private let toolbar = InspectorToolbar()
@@ -599,8 +555,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
 
     override func focusFilter() { window?.makeFirstResponder(filter) }
 
-    // MARK: Messages
-
     private func visible(_ message: ConsoleMessage, levels selected: Set<Int>) -> Bool {
         if let group = message.group, isHidden(group: group) { return false }
         if !selected.contains(0), message.kind == .log {
@@ -612,7 +566,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
             }
             if !selected.contains(index) { return false }
         } else if selected.contains(0), message.level == .verbose, message.kind == .log {
-            // Verbose messages only when asked for, as in DevTools.
             return false
         }
         guard !filterText.isEmpty else { return true }
@@ -626,7 +579,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
     private func isHidden(group: Int) -> Bool {
         guard let model else { return false }
         if model.collapsedGroups.contains(group) { return true }
-        // A group inside a collapsed one.
         if let parent = model.messages.first(where: { $0.id == group })?.group { return isHidden(group: parent) }
         return false
     }
@@ -640,7 +592,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
         let warnings = model?.messages.filter { $0.level == .warning }.reduce(0) { $0 + $1.repeats } ?? 0
         counts.attributedStringValue = countsText(errors: errors, warnings: warnings)
         empty.isHidden = !(model?.messages.isEmpty ?? true)
-        // Appending is common; reloading everything would collapse what's open.
         if previous.count <= shown.count, zip(previous, shown).allSatisfy({ $0 === $1 }), !previous.isEmpty {
             let added = shown.count - previous.count
             if added > 0 { outline.insertItems(at: IndexSet(integersIn: previous.count..<shown.count), inParent: nil) }
@@ -681,8 +632,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
         model?.evaluate(text)
         DispatchQueue.main.async { [weak self] in self?.scrollToEndNow() }
     }
-
-    // MARK: Interaction
 
     @objc private func clicked() {
         let row = outline.clickedRow
@@ -729,7 +678,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
             model?.clear()
             return true
         }
-        // Typing goes to the prompt.
         if let chars = event.characters, !chars.isEmpty, event.modifierFlags.isDisjoint(with: [.command, .control]),
            chars.unicodeScalars.allSatisfy({ CharacterSet.alphanumerics.union(.punctuationCharacters).contains($0) }) {
             window?.makeFirstResponder(prompt.textView)
@@ -816,8 +764,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
         }
     }
 
-    // MARK: Outline
-
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         switch item {
         case nil: shown.count
@@ -850,8 +796,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
         return false
     }
 
-    /// What a message opens to: the call stack of an error, or the
-    /// properties of the objects it logged.
     private var childCache: [Int: [AnyObject]] = [:]
     private func children(of message: ConsoleMessage) -> [AnyObject] {
         if let cached = childCache[message.id] { return cached }
@@ -914,7 +858,6 @@ final class ConsolePanel: InspectorPanelView, NSOutlineViewDataSource, NSOutline
     }
 }
 
-/// A frame of an error's call stack.
 private final class StackFrameItem {
     let function: String
     let url: String
@@ -936,7 +879,6 @@ private final class StackFrameItem {
     var title: String { "at \(function) (\(place))" }
 }
 
-/// Message rows: tinted for errors and warnings, a hairline between.
 private final class ConsoleRowView: InspectorRowView {
     var separator = false
 
@@ -948,8 +890,6 @@ private final class ConsoleRowView: InspectorRowView {
     }
 }
 
-/// One message: its level's glyph, the text (wrapped), how many times it
-/// repeated and where it came from.
 private final class ConsoleMessageCell: NSTableCellView {
     private let icon = NSImageView()
     private let text = NSTextField(wrappingLabelWithString: "")
@@ -980,8 +920,6 @@ private final class ConsoleMessageCell: NSTableCellView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// The text's width in a row `width` wide: what's left of the glyph,
-    /// the repeat count and the source link.
     static func textWidth(_ width: CGFloat, indent: CGFloat, link: Bool, repeats: Int) -> CGFloat {
         max(width - indent - 22 - (repeats > 1 ? 24 : 0) - (link ? linkWidth + 12 : 8), 40)
     }
@@ -1034,7 +972,6 @@ private final class ConsoleMessageCell: NSTableCellView {
 
     override func layout() {
         super.layout()
-        // The outline indents children; messages indent by their group.
         let x = indent
         icon.frame = NSRect(x: x + 4, y: 4, width: 14, height: 14)
         var left = x + 22
@@ -1049,17 +986,12 @@ private final class ConsoleMessageCell: NSTableCellView {
 
     override var isFlipped: Bool { true }
 
-    /// Whether `point` is on the source link.
     func linkHit(_ point: NSPoint) -> Bool {
         !link.isHidden && link.frame.insetBy(dx: -2, dy: -3).contains(point)
             && point.x >= link.frame.maxX - (link.attributedStringValue.size().width + 4)
     }
 }
 
-// MARK: - Prompt
-
-/// The prompt under the messages: JavaScript with history, completion as
-/// you type, and a preview of the result before you run it.
 final class ConsolePrompt: FlippedView, NSTextViewDelegate {
     let textView = PromptTextView()
     private let scroll = NSScrollView()
@@ -1119,7 +1051,6 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
         line.backgroundColor = InspectorTheme.separator.cgColor
     }
 
-    /// Room for what's typed, up to a few lines, and the preview.
     var preferredHeight: CGFloat {
         guard let layout = textView.layoutManager, let container = textView.textContainer else { return 30 }
         layout.ensureLayout(for: container)
@@ -1147,9 +1078,6 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
         scheduleCompletions()
     }
 
-    // MARK: Keys
-
-    /// Handles a key the text view would; true if handled.
     fileprivate func handle(_ selector: Selector) -> Bool {
         let text = textView.string
         let caret = textView.selectedRange()
@@ -1159,7 +1087,6 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
             if !completions.isHidden, completions.selected != nil, NSEvent.modifierFlags.isEmpty == false { return false }
             hideCompletions()
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return true }
-            // An unfinished block gets a new line rather than running.
             if isIncomplete(text) { return false }
             textView.string = ""
             previewLabel.stringValue = ""
@@ -1236,8 +1163,6 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
         schedulePreview()
     }
 
-    // MARK: Preview
-
     private func schedulePreview() {
         previewTask?.cancel()
         let text = textView.string
@@ -1250,7 +1175,6 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
             guard !Task.isCancelled else { return }
             let result = await model.preview(text)
             guard !Task.isCancelled, let self, textView.string == text else { return }
-            // A bare value typed is its own preview.
             if let result, !(result.str("type") == "function" && !text.contains("(")), result.str("type") != "undefined" || text.contains("(") {
                 setPreview(RemoteValue.summary(result).oneLine.clipped(300))
             } else {
@@ -1266,8 +1190,6 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
         if had != !text.isEmpty { onResize?() }
         needsLayout = true
     }
-
-    // MARK: Completion
 
     private func scheduleCompletions() {
         completionTask?.cancel()
@@ -1317,12 +1239,9 @@ final class ConsolePrompt: FlippedView, NSTextViewDelegate {
     }
 }
 
-/// The prompt's text view, which lets the prompt take Return, arrows,
-/// Tab and Escape first.
 final class PromptTextView: NSTextView {
     fileprivate weak var prompt: ConsolePrompt?
 
-    // NSTextView handles every command the prompt doesn't take.
     // swiftlint:disable:next prohibited_super_call
     override func doCommand(by selector: Selector) {
         if prompt?.handle(selector) == true { return }
@@ -1338,7 +1257,6 @@ final class PromptTextView: NSTextView {
     }
 }
 
-/// Completions floating over the messages, above the caret.
 private final class CompletionList: NSView, NSTableViewDataSource, NSTableViewDelegate {
     private let table = NSTableView()
     private let scroll = NSScrollView()

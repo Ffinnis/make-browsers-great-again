@@ -1,12 +1,8 @@
-//! Movie fragments: reading the samples out of a moof and its mdat, and
-//! writing converted samples back as one moof and one mdat.
-
 use std::ops::Range;
 
 use crate::bytes::{boxes, err, Reader, Result, Writer};
 use crate::init::Defaults;
 
-/// Sample flags: a sync sample, and one that depends on others.
 pub const SYNC: u32 = 0x0200_0000;
 pub const NOT_SYNC: u32 = 0x0101_0000;
 
@@ -16,7 +12,6 @@ pub struct Sample {
     pub cto: i64,
     pub duration: u32,
     pub flags: u32,
-    /// Where the sample's bytes are, from the start of the moof.
     pub data: Range<usize>,
 }
 
@@ -31,23 +26,15 @@ pub struct Run {
     pub samples: Vec<Sample>,
 }
 
-/// Looks up a track by id: its trex defaults, and where a traf without tfdt
-/// continues from.
 pub type TrackLookup<'a> = &'a dyn Fn(u32) -> Option<(Defaults, i64)>;
 
-/// The most samples one fragment may hold, all tracks together: about 36
-/// minutes of 60 fps video, or 45 of 48 kHz AAC. Bounds the work a trun
-/// whose samples take no bytes in it can ask for.
 pub const MAX_SAMPLES: usize = 1 << 17;
 
-/// The samples of each traf. `unit` is the moof and its mdat, laid out as
-/// they arrived.
 pub fn parse_moof(unit: &[u8], lookup: TrackLookup<'_>) -> Result<Vec<Run>> {
     let Some(moof) = boxes(unit)?.into_iter().next().filter(|b| &b.kind == b"moof") else {
         return err("expected moof");
     };
     let mut runs = Vec::new();
-    // Without default-base-is-moof, each traf's data follows the previous one's.
     let mut data_end = 0usize;
     let mut budget = MAX_SAMPLES;
     for traf in boxes(moof.body)? {
@@ -108,8 +95,6 @@ fn parse_traf(
             pos = usize::try_from(offset).map_or_else(|_| err("negative data offset"), Ok)?;
         }
         let first_flags = if flags & 0x4 != 0 { Some(r.u32()?) } else { None };
-        // Each sample takes at least 4 bytes when its count can be trusted;
-        // otherwise only the overall cap bounds it.
         let per_sample = [0x100, 0x200, 0x400, 0x800].iter().filter(|&&f| flags & f != 0).count() * 4;
         if per_sample > 0 && count > r.remaining() / per_sample {
             return err("trun shorter than its sample count");
@@ -157,7 +142,6 @@ pub struct OutTrack {
     pub samples: Vec<OutSample>,
 }
 
-/// One moof with a traf per track, then one mdat holding every sample.
 pub fn write_fragment(sequence: u32, tracks: &[OutTrack]) -> Vec<u8> {
     let mut w = Writer::new();
     w.begin(*b"moof");
@@ -167,14 +151,12 @@ pub fn write_fragment(sequence: u32, tracks: &[OutTrack]) -> Vec<u8> {
     let mut offsets = Vec::new();
     for t in tracks.iter().filter(|t| !t.samples.is_empty()) {
         w.begin(*b"traf");
-        // default-base-is-moof
         w.begin_full(*b"tfhd", 0, 0x20000);
         w.u32(t.id);
         w.end();
         w.begin_full(*b"tfdt", 1, 0);
         w.u64(t.base_dts);
         w.end();
-        // Data offset, and each sample's duration, size, flags and offset.
         w.begin_full(*b"trun", 1, 0xf01);
         w.u32(t.samples.len() as u32);
         offsets.push(w.len());

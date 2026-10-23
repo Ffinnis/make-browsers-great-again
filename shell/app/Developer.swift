@@ -2,36 +2,16 @@ import AppKit
 import CoreImage.CIFilterBuiltins
 import Darwin
 
-// Developer Mode: a floating toolbar along the top of the page for people
-// building websites. It shows how the page loaded (status, time, console
-// errors) and gathers the tools reached for all day: reload without the
-// cache, pick an element, preview dark mode or a phone, screenshot the whole
-// page, open it on a real phone.
-
-// MARK: - Settings
-
-/// Settings ▸ Developer, shared by the toolbar, the Develop menu and the
-/// command bar.
 enum DeveloperSettings {
     static let enabledKey = "developerMode"
-    /// The toolbar shows on every site, not only local ones.
     static let everywhereKey = "developerToolbarEverywhere"
-    /// The toolbar shrinks to a small pill while the pointer is away.
     static let collapsesKey = "developerToolbarCollapses"
-    /// Shrunk, it's only a small handle rather than the page's status.
     static let minimizedKey = "developerToolbarMinimized"
-    /// Where along the top of the page the toolbar sits.
     static let anchorKey = "developerToolbarAnchor"
-    /// DevTools opens in a window of its own instead of beside the page.
     static let devToolsInWindowKey = "devToolsInWindow"
-    /// The docked DevTools panel's width.
     static let devToolsWidthKey = "devToolsWidth"
-    /// ⌥⌘I opens Chrome's DevTools rather than MBGA's inspector sidebar.
     static let chromeDevToolsKey = "useChromeDevTools"
 
-    /// MBGA_DEBUG_DEVELOPER=1 (or =expanded, never shrinking) turns
-    /// Developer Mode on in a test copy without saving it: the preferences
-    /// are shared with the copy in real use.
     static let debug = ProcessInfo.processInfo.environment["MBGA_DEBUG_DEVELOPER"].flatMap { $0.isEmpty ? nil : $0 }
 
     static var enabled: Bool { debug != nil || UserDefaults.standard.bool(forKey: enabledKey) }
@@ -51,11 +31,7 @@ enum DevToolbarAnchor: String, CaseIterable {
     case leading, center, trailing
 }
 
-// MARK: - Sites
-
 enum DevSite {
-    /// Whether `url` is a site being built: a local server (localhost, a
-    /// .local or .test name, an address on this network) or a file.
     static func isLocal(_ url: String) -> Bool {
         guard let parts = URLComponents(string: url) else { return false }
         if parts.scheme == "file" { return true }
@@ -68,13 +44,10 @@ enum DevSite {
             || (octets[0] == 172 && (16...31).contains(octets[1]))
     }
 
-    /// Whether `url` is a web page or a file, rather than one of an
-    /// extension's pages or the browser's own.
     static func isSite(_ url: String) -> Bool {
         ["http", "https", "file"].contains(URLComponents(string: url)?.scheme?.lowercased())
     }
 
-    /// "localhost:3000", a file's name, or a site's host.
     static func label(_ url: String) -> String {
         guard let parts = URLComponents(string: url) else { return url }
         if parts.scheme == "file" { return (parts.path as NSString).lastPathComponent }
@@ -89,7 +62,6 @@ enum DevSite {
             || host == "[::1]" || host.hasPrefix("127.")
     }
 
-    /// The same address on another port, from its root: another app.
     static func url(_ url: String, onPort port: Int) -> String {
         guard var parts = URLComponents(string: url), parts.host != nil else { return "http://localhost:\(port)/" }
         parts.port = port
@@ -100,14 +72,10 @@ enum DevSite {
     }
 }
 
-/// Dev servers listening on this Mac, found by trying the ports dev tools
-/// use by default. (5000 and 7000 are left out: AirPlay listens there.)
 enum DevPorts {
     static let common = [3000, 3001, 3002, 3333, 4000, 4173, 4200, 4321, 5173, 5174, 5500, 6006,
                          8000, 8001, 8080, 8081, 8787, 8888, 9000]
 
-    /// Calls back on the main thread with the ports something accepts
-    /// connections on, over IPv4 or IPv6 (Vite listens on ::1 only).
     static func scan(_ done: @escaping @MainActor ([Int]) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             var open = [Bool](repeating: false, count: common.count)
@@ -158,9 +126,7 @@ enum DevPorts {
     }
 }
 
-/// Opening a local site on a phone on the same network.
 enum DevShare {
-    /// This Mac's address on the local network.
     static func lanAddress() -> String? {
         var list: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&list) == 0, let first = list else { return nil }
@@ -175,14 +141,12 @@ enum DevShare {
                               nil, 0, NI_NUMERICHOST) == 0 else { continue }
             let name = String(cString: entry.pointee.ifa_name)
             let ip = String(decoding: host.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
-            // Wi-Fi or Ethernet first; VPN tunnels can't be reached by a phone.
             if name.hasPrefix("en") { return ip }
             if found == nil, !name.hasPrefix("utun") { found = ip }
         }
         return found
     }
 
-    /// `url` as a phone on this network reaches it.
     static func phoneURL(_ url: String) -> String {
         guard DevSite.isLoopback(url), var parts = URLComponents(string: url), let lan = lanAddress() else { return url }
         parts.host = lan
@@ -203,15 +167,11 @@ enum DevShare {
     }
 }
 
-// MARK: - Emulation
-
 struct DevicePreset: Equatable {
     let name: String
     let symbol: String
     let width: CGFloat
     let height: CGFloat
-    /// Phones and tablets get a mobile viewport, touch and their browser's
-    /// user agent; laptops are just a narrower window.
     let userAgent: String?
 
     private static let iPhone = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Mobile/15E148 Safari/604.1"
@@ -241,7 +201,6 @@ enum NetworkPreset: CaseIterable {
         }
     }
 
-    /// Round trip in ms and bytes per second each way, as Chrome's presets.
     var conditions: (latency: Double, throughput: Double) {
         switch self {
         case .unthrottled: (0, 0)
@@ -281,7 +240,6 @@ enum ColorSchemePreview: String {
     }
 }
 
-/// The emulations and tools on for one tab; they last as long as the tab.
 struct DevTabState: Equatable {
     var colorScheme = ColorSchemePreview.system
     var reducedMotion = false
@@ -292,17 +250,14 @@ struct DevTabState: Equatable {
     var landscape = false
     var picking = false
 
-    /// The page's size in a device preview.
     var viewport: NSSize? {
         device.map { landscape ? NSSize(width: $0.height, height: $0.width) : NSSize(width: $0.width, height: $0.height) }
     }
 }
 
-/// How the tab's page loaded, as the engine reported it.
 struct DevPageReport: Equatable {
     var errors = 0
     var warnings = 0
-    /// HTTP status, or a negative network error code.
     var status: Int?
     var duration: TimeInterval?
 
@@ -328,7 +283,6 @@ struct DevPageReport: Equatable {
 }
 
 extension MBWebView {
-    /// Sends what changed from `old` to the engine.
     func apply(_ state: DevTabState, from old: DevTabState = DevTabState()) {
         if state.colorScheme != old.colorScheme {
             emulateMediaFeature("prefers-color-scheme", value: state.colorScheme == .system ? "" : state.colorScheme.rawValue)
@@ -347,16 +301,10 @@ extension MBWebView {
     }
 }
 
-// MARK: - Toolbar
-
-/// The toolbar's strip along the top of the page. Only the pill in it takes
-/// the pointer; it can be dragged to either side and snaps there.
 @MainActor
 final class DevToolbarView: NSView {
     private let store: BrowserStore
     private let pill: DevPillView
-    /// Shown (1) or gone (0); expanded with every tool (1) or just the
-    /// status (0); and the pill's centre along the strip.
     private var presence = Spring(0, response: 0.26 * Motion.slow)
     private var expansion = Spring(0, response: 0.24 * Motion.slow)
     private var position = Spring(0, response: Motion.springResponse)
@@ -365,7 +313,6 @@ final class DevToolbarView: NSView {
     private var collapseTimer: Timer?
     private var anchor = DeveloperSettings.anchor
     private var dragStart: (pointer: CGFloat, center: CGFloat)?
-    /// Gliding to its anchor after a drag; otherwise it sits exactly there.
     private var sliding = false
 
     static let height: CGFloat = 56
@@ -417,7 +364,6 @@ final class DevToolbarView: NSView {
         !DeveloperSettings.collapses || pill.isUnderPointer || pill.menuOpen || store.visibleDevState.picking
     }
 
-    /// Follows the visible tab: its status and whether it gets the toolbar.
     private func update() {
         let shown = store.developerToolbarShown
         pill.update()
@@ -443,8 +389,6 @@ final class DevToolbarView: NSView {
             expansion.target = 1
             pill.scanPorts()
         } else {
-            // A moment's grace, so passing the pointer over the page's own top
-            // bar doesn't make it flicker.
             let timer = Timer(timeInterval: 1.2, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self else { return }
@@ -466,7 +410,6 @@ final class DevToolbarView: NSView {
             guard let start = dragStart else { return }
             let half = pill.frame.width / 2
             let center = min(max(start.center + x - start.pointer, half + 8), bounds.width - half - 8)
-            // Tracks the pointer exactly, and keeps its speed for the release.
             position.velocity = (center - position.value) * 60
             position.value = center
             position.target = center
@@ -483,7 +426,6 @@ final class DevToolbarView: NSView {
         }
     }
 
-    /// Where the pill's centre sits at its anchor at `width`.
     private func anchorCenter(width: CGFloat) -> CGFloat {
         switch anchor {
         case .leading: 12 + width / 2
@@ -532,13 +474,11 @@ final class DevToolbarView: NSView {
         let e = expansion.value
         let width = pill.width(expanded: e)
         let height = pill.height(expanded: e)
-        // The handle sits close to the top edge, the status a little lower.
         let top = pill.minimized ? 6 + 2 * e : 8
         if !sliding, dragStart == nil {
             position.target = anchorCenter(width: width)
             position.settle()
         }
-        // Drops in from just above as it appears.
         let p = presence.value
         let half = width / 2
         let center = min(max(position.value, half + 8), max(bounds.width - half - 8, half + 8))
@@ -548,10 +488,6 @@ final class DevToolbarView: NSView {
     }
 }
 
-/// The pill itself: a piece of the system's Liquid Glass floating over the
-/// page (frosted material before macOS 26). Collapsed it names the page's
-/// server and anything wrong with it, or minimized it's only a small handle,
-/// red if something is wrong; on hover it widens to the tools.
 @MainActor
 final class DevPillView: HoverView {
     enum DragPhase { case began, moved, ended }
@@ -561,19 +497,13 @@ final class DevPillView: HoverView {
     var onMenuClosed: (() -> Void)?
     private(set) var menuOpen = false
     private(set) var minimized = DeveloperSettings.minimized
-    /// Something's wrong with the page: the handle turns red.
     private var troubled = false
-    /// 0 collapsed to the status, 1 with every tool.
     var expansion: CGFloat = 0 {
         didSet { if expansion != oldValue { needsLayout = true } }
     }
 
     private let store: BrowserStore
-    /// NSGlassEffectView, or a visual effect view before macOS 26.
     private let glass: NSView
-    /// Under the glass: the page blurred in a soft halo that fades out
-    /// around the pill, and a wide shadow with a tight one where it meets
-    /// the page, so it lifts off busy pages.
     private let halo = NSVisualEffectView()
     private let wideShadow = CALayer()
     private let contactShadow = CALayer()
@@ -595,7 +525,6 @@ final class DevPillView: HoverView {
     private var mouseDownX: CGFloat?
     private var dragging = false
 
-    /// The colour-scheme button shows only while a scheme is previewed.
     private var tools: [DevButton] {
         [reload, pick, devtools] + (scheme.isHidden ? [] : [scheme]) + [device, more]
     }
@@ -653,8 +582,6 @@ final class DevPillView: HoverView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    // MARK: Content
-
     func update() {
         minimized = DeveloperSettings.minimized
         let url = store.visibleTab?.url ?? ""
@@ -668,7 +595,6 @@ final class DevPillView: HoverView {
             let split = label.lastIndex(of: ":").map { (String(label[..<$0]), String(label[$0...])) }
             host.attributedStringValue = attributed(split?.0 ?? label, port: split?.1)
         }
-        // A loading page's name dims, as Next.js dims its logo while building.
         Motion.animate(Motion.quick) { host.animator().alphaValue = loading ? 0.45 : 1 }
         let failed = report.status.map { $0 < 0 || $0 >= 400 } ?? false
         problem.setIfChanged(failed && !loading ? report.statusText ?? "" : "")
@@ -709,13 +635,10 @@ final class DevPillView: HoverView {
         return text
     }
 
-    // MARK: Size
-
     private static let collapsedHeight: CGFloat = 26
     private static let expandedHeight: CGFloat = 32
     private static let handleSize = NSSize(width: 40, height: 10)
 
-    /// The status end: host, then what's wrong, if anything.
     private var statusWidth: CGFloat {
         var width = 12 + host.textWidth
         if !problem.stringValue.isEmpty { width += 6 + problem.textWidth }
@@ -765,8 +688,6 @@ final class DevPillView: HoverView {
             ? NSColor.systemRed.withAlphaComponent(0.8 * (1 - expansion)).cgColor : nil
         CATransaction.commit()
         let mid = bounds.height / 2
-        // The tools come in as the pill widens, and the status too from a
-        // handle.
         let alpha = min(max((expansion - 0.3) / 0.7, 0), 1)
         for view in [host, problem, errors, warnings] as [NSView] { view.alphaValue = minimized ? alpha : 1 }
         var x: CGFloat = 12
@@ -803,7 +724,6 @@ final class DevPillView: HoverView {
 
     override func updateLayer() {
         let dark = effectiveAppearance.isDark
-        // The view is flipped: positive offsets fall below the pill.
         wideShadow.shadowRadius = 20
         wideShadow.shadowOffset = CGSize(width: 0, height: 10)
         wideShadow.shadowColor = NSColor.black.withAlphaComponent(dark ? 0.6 : 0.28).cgColor
@@ -812,8 +732,6 @@ final class DevPillView: HoverView {
         contactShadow.shadowColor = NSColor.black.withAlphaComponent(dark ? 0.4 : 0.14).cgColor
     }
 
-    /// A capsule that fades out over the halo's spread, stretched to any
-    /// width (its middle repeats) so the pill can grow without a new mask.
     private static let haloMask: NSImage = {
         let spread = haloSpread, height: CGFloat = 32 + 2 * haloSpread
         let size = NSSize(width: height * 2, height: height)
@@ -821,7 +739,6 @@ final class DevPillView: HoverView {
             guard let context = NSGraphicsContext.current?.cgContext else { return false }
             let core = rect.insetBy(dx: spread, dy: spread)
             let path = CGPath(roundedRect: core, cornerWidth: core.height / 2, cornerHeight: core.height / 2, transform: nil)
-            // A shadow drawn from far outside leaves only its soft edge here.
             context.setShadow(offset: CGSize(width: 0, height: -2000), blur: spread * 0.9, color: NSColor.black.cgColor)
             context.translateBy(x: 0, y: 2000)
             context.addPath(path)
@@ -837,10 +754,6 @@ final class DevPillView: HoverView {
         onHover?(hovering)
     }
 
-    // MARK: Pointer
-
-    /// The status end of the pill opens the address menu on click; anywhere
-    /// that isn't a button drags the pill along the top of the page.
     override func mouseDown(with event: NSEvent) {
         mouseDownX = event.locationInWindow.x
         dragging = false
@@ -868,14 +781,11 @@ final class DevPillView: HoverView {
         if point.x < statusWidth { showMenu(addressMenu(), under: nil) }
     }
 
-    /// A right-click anywhere on the pill offers to get it out of the way.
     override func rightMouseDown(with event: NSEvent) {
         let menu = NSMenu()
         hideItems(in: menu)
         showMenu(menu, under: nil)
     }
-
-    // MARK: Menus
 
     func scanPorts() {
         if let lastScan, Date().timeIntervalSince(lastScan) < 4 { return }
@@ -977,7 +887,6 @@ final class DevPillView: HoverView {
         menu.add("Developer Settings…") { [store] in store.openSettings?(.developer) }
     }
 
-    /// Runs once the menu has closed, so the popover has the pill to point at.
     private func showPhone() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
@@ -996,8 +905,6 @@ final class DevPillView: HoverView {
     }
 }
 
-/// A tool in the pill, like the sidebar's toolbar buttons: a monochrome
-/// symbol with a quiet fill on hover, and the accent colour while on.
 final class DevButton: HoverView {
     var action: (() -> Void)?
     var isOn = false {
@@ -1044,8 +951,6 @@ final class DevButton: HoverView {
     }
 }
 
-/// A console count as DevTools shows it: only the glyph is coloured, the
-/// number is plain text, and nothing shows at zero.
 final class DevCount: HoverView {
     var action: (() -> Void)?
     var count = 0 {
@@ -1089,7 +994,6 @@ final class DevCount: HoverView {
     }
 }
 
-/// Other browsers installed, to check the page in.
 enum DevBrowsers {
     struct Browser {
         let name: String
@@ -1112,7 +1016,6 @@ enum DevBrowsers {
     }
 }
 
-/// A QR code of the page's address on this network, for a phone's camera.
 final class DevPhoneViewController: NSViewController {
     private let url: String
 

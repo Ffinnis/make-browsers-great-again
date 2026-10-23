@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Sets MBGA_VERSION in CMakeLists.txt to the version after the latest
-# release tag and prints it. Pass patch (the default), minor or major.
-# Running it again before that version is released changes nothing, so a
-# failed release can be retried.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

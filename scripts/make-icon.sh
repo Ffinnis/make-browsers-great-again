@@ -1,8 +1,4 @@
 #!/usr/bin/env bash
-# Renders assets/icon.svg into the layer of shell/resources/AppIcon.icon, the
-# Icon Composer document the build compiles into the app icon. The SVG uses
-# filters that only browsers draw faithfully, so it is rasterized with
-# headless Chrome. Run it after editing the SVG and commit the PNG.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -22,9 +18,6 @@ done
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-# macOS cuts the icon shape itself, so the art is drawn edge to edge: the
-# tile is scaled up from Apple's 824 pt grid to the full 1024 canvas and its
-# shape, edge and shadow are dropped.
 {
   cat <<'HTML'
 <html><head><style>

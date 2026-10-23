@@ -1,15 +1,6 @@
 import AppKit
 
-// Application: the site's cookies, storage, caches and service workers. A
-// navigator on the left picks what to look at (a menu at the top when the
-// sidebar is narrow); the right shows it, editable where the page's own
-// storage is.
-
-// MARK: - Model
-
-/// What changed in the site's storage.
 enum ApplicationChange {
-    /// The page moved to another origin: everything is fetched again.
     case origin
     case domStorage(local: Bool)
     case serviceWorkers
@@ -17,25 +8,18 @@ enum ApplicationChange {
     case caches
 }
 
-/// The site's storage as the inspector follows it: DOM storage (kept up to
-/// date by events), service workers, IndexedDB databases and caches.
 @MainActor
 final class ApplicationModel: InspectorModel {
     private weak var session: InspectorSession?
     let changed = Signal<ApplicationChange>()
-    /// "https://example.com", or "" before the page is known.
     private(set) var origin = ""
     private(set) var frameID = ""
-    /// The storage partition DOM storage and IndexedDB are keyed by.
     private(set) var storageKey: String?
-    /// Key and value pairs, in the order the page has them.
     private(set) var localItems: [[String]] = []
     private(set) var sessionItems: [[String]] = []
-    /// Service worker registrations and versions, by id.
     private(set) var registrations: [String: JSON] = [:]
     private(set) var versions: [String: JSON] = [:]
     private(set) var workerErrors: [JSON] = []
-    /// IndexedDB database names, and each one's stores once read.
     private(set) var databaseNames: [String] = []
     private(set) var databases: [String: JSON] = [:]
     private(set) var caches: [JSON] = []
@@ -65,7 +49,6 @@ final class ApplicationModel: InspectorModel {
         if forceUpdateOnReload { session.call("ServiceWorker.setForceUpdateOnPageLoad", ["forceUpdateOnPageLoad": false]) }
     }
 
-    /// Learns the page's origin and storage key, then fetches everything.
     func reset() {
         localItems = []
         sessionItems = []
@@ -100,13 +83,10 @@ final class ApplicationModel: InspectorModel {
 
     var host: String { URLComponents(string: origin)?.host ?? "" }
 
-    /// Identifies the site's storage for IndexedDB and Cache Storage.
     var storageParams: JSON {
         if let storageKey { return ["storageKey": storageKey] }
         return ["securityOrigin": origin]
     }
-
-    // MARK: DOM storage
 
     private func storageID(local: Bool) -> JSON {
         var id: JSON = ["isLocalStorage": local]
@@ -183,8 +163,6 @@ final class ApplicationModel: InspectorModel {
         changed.send(.domStorage(local: local))
     }
 
-    // MARK: Service workers
-
     private func serviceWorkerEvent(_ method: String, _ params: JSON) {
         switch method {
         case "ServiceWorker.workerRegistrationUpdated":
@@ -205,7 +183,6 @@ final class ApplicationModel: InspectorModel {
         changed.send(.serviceWorkers)
     }
 
-    /// The site's registrations, by scope.
     var siteRegistrations: [JSON] {
         registrations.values.filter { origin.isEmpty || ($0.str("scopeURL") ?? "").hasPrefix(origin) }
             .sorted { ($0.str("scopeURL") ?? "") < ($1.str("scopeURL") ?? "") }
@@ -225,8 +202,6 @@ final class ApplicationModel: InspectorModel {
         session?.call("ServiceWorker.setForceUpdateOnPageLoad", ["forceUpdateOnPageLoad": on])
         changed.send(.serviceWorkers)
     }
-
-    // MARK: IndexedDB and caches
 
     func refreshDatabases() {
         guard !origin.isEmpty, let session else { return }
@@ -269,9 +244,6 @@ final class ApplicationModel: InspectorModel {
     }
 }
 
-// MARK: - Panel
-
-/// What the navigator can show.
 private enum AppSection: Hashable {
     case manifest, serviceWorkers, storage, frames
     case localStorage, sessionStorage, cookies
@@ -310,8 +282,6 @@ private enum AppSection: Hashable {
     }
 }
 
-/// A row of the navigator: a group heading or a section, with children for
-/// databases and caches.
 private final class NavItem {
     let title: String
     let section: AppSection?
@@ -328,7 +298,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
     private let navigator = InspectorOutlineView()
     private let navigatorScroll = NSScrollView()
     private let navigatorEdge = NSView()
-    /// Stands in for the navigator when the sidebar is narrow.
     private let narrowBar = InspectorToolbar()
     private let picker = NSPopUpButton()
     private let detail = FlippedView()
@@ -336,8 +305,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
     private var items: [NavItem] = []
     private var selected: AppSection = .storage
     private var shownView: AppSectionView?
-    /// Views of sections that keep no per-item state, kept to switch back
-    /// quickly.
     private var views: [AppSection: AppSectionView] = [:]
     private weak var observedModel: ApplicationModel?
     private var narrow = false
@@ -428,7 +395,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
         observedModel = model
         model.changed.observe(self) { [weak self] change in self?.modelChanged(change) }
         rebuildItems()
-        // Selecting its row may have shown it already.
         if shownView == nil { show(selected, session: session, model: model) }
     }
 
@@ -436,7 +402,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
         switch change {
         case .origin:
             rebuildItems()
-            // Databases and caches of the old site are gone.
             switch selected {
             case .database, .objectStore, .cache: select(.storage)
             default: shownView?.reload()
@@ -448,8 +413,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
         }
         shownView?.modelChanged(change)
     }
-
-    // MARK: Navigator
 
     private func rebuildItems() {
         let model = observedModel
@@ -597,8 +560,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
         return menu
     }
 
-    // MARK: Outline
-
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         (item as? NavItem)?.children.count ?? items.count
     }
@@ -643,7 +604,6 @@ final class ApplicationPanel: InspectorPanelView, NSOutlineViewDataSource, NSOut
     }
 }
 
-/// A navigator row: a symbol and a title.
 private final class NavCell: NSTableCellView {
     private let icon = NSImageView()
     private let label = Label.make("", size: 11.5)
@@ -672,14 +632,10 @@ private final class NavCell: NSTableCellView {
     }
 }
 
-// MARK: - Sections
-
-/// The right side for one section of the navigator.
 @MainActor
 private class AppSectionView: FlippedView {
     weak var session: InspectorSession?
     weak var model: ApplicationModel?
-    /// Moves the navigator to another section.
     var open: ((AppSection) -> Void)?
     let toolbar = InspectorToolbar()
 
@@ -691,7 +647,6 @@ private class AppSectionView: FlippedView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// The area below the toolbar.
     var contentFrame: NSRect {
         NSRect(x: 0, y: InspectorToolbar.height, width: bounds.width, height: max(bounds.height - InspectorToolbar.height, 0))
     }
@@ -701,14 +656,11 @@ private class AppSectionView: FlippedView {
         toolbar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: InspectorToolbar.height)
     }
 
-    /// Fetches what it shows again.
     func reload() {}
     func modelChanged(_ change: ApplicationChange) {}
     func focusFilter() {}
 }
 
-/// A row of a section's table: text per column, numbers to sort by, and
-/// whatever it stands for.
 private struct AppRow {
     let id: String
     var values: [String: String]
@@ -717,14 +669,11 @@ private struct AppRow {
     var payload: Any?
 }
 
-/// A sortable, filterable, optionally editable table of rows.
 @MainActor
 private final class AppTable: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     let table = InspectorTableView()
     let scroll: NSScrollView
-    /// Columns edited in place by double-clicking.
     var editable: Set<String> = []
-    /// Columns shown in the code font.
     var mono: Set<String> = []
     var onSelect: ((AppRow?) -> Void)?
     var onEdit: ((AppRow, String, String) -> Void)?
@@ -766,7 +715,6 @@ private final class AppTable: NSObject, NSTableViewDataSource, NSTableViewDelega
 
     var selected: [AppRow] { table.selectedRowIndexes.compactMap { shown.indices.contains($0) ? shown[$0] : nil } }
 
-    /// Shows `rows`, keeping the selection on the same ids.
     func set(_ rows: [AppRow]) {
         let keep = Set(selected.map(\.id))
         self.rows = rows
@@ -794,7 +742,6 @@ private final class AppTable: NSObject, NSTableViewDataSource, NSTableViewDelega
         if indexes.isEmpty { onSelect?(nil) }
     }
 
-    /// Starts editing `column` of the row with `id`.
     func edit(id: String, column: String) {
         guard let row = shown.firstIndex(where: { $0.id == id }),
               let index = table.tableColumns.firstIndex(where: { $0.identifier.rawValue == column }) else { return }
@@ -822,7 +769,6 @@ private final class AppTable: NSObject, NSTableViewDataSource, NSTableViewDelega
         guard isEditable, let field = cell.textField else { return cell }
         field.isEditable = true
         field.cell?.sendsActionOnEndEditing = true
-        // The full value while editing, not the one-line version.
         field.stringValue = text
         field.onAction { [weak self, weak field] in
             guard let self, let field, field.stringValue != text else { return }
@@ -841,7 +787,6 @@ private final class AppTable: NSObject, NSTableViewDataSource, NSTableViewDelega
     }
 }
 
-/// A value shown below a table: as a JSON tree when it parses, else text.
 private final class ValuePreview: FlippedView {
     private let tree = ValueTreeView()
     private let code = CodeView()
@@ -889,7 +834,6 @@ private final class ValuePreview: FlippedView {
         }
     }
 
-    /// Remote objects, expanded.
     func show(object: JSON, session: InspectorSession?) {
         empty.isHidden = true
         code.isHidden = true
@@ -901,7 +845,6 @@ private final class ValuePreview: FlippedView {
     }
 }
 
-/// A table above a value preview, split to taste.
 private class TableSection: AppSectionView {
     let list: AppTable
     let preview = ValuePreview()
@@ -927,8 +870,6 @@ private class TableSection: AppSectionView {
 
     override func focusFilter() { window?.makeFirstResponder(filterField) }
 }
-
-// MARK: DOM storage
 
 private final class DOMStorageSection: TableSection {
     private let local: Bool
@@ -1012,15 +953,12 @@ private final class DOMStorageSection: TableSection {
             key = "key\(n)"
         }
         model.setItem(local: local, key: key, value: "")
-        // Editing starts once the page has it.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             self?.list.filter = ""
             self?.list.edit(id: key, column: "key")
         }
     }
 }
-
-// MARK: Cookies
 
 private final class CookiesSection: TableSection {
     private var cookies: [JSON] = []
@@ -1084,14 +1022,12 @@ private final class CookiesSection: TableSection {
         if case .origin = change { reload() }
     }
 
-    /// The site's cookies: every cookie whose domain covers the page's host.
     override func reload() {
         guard let session, let model else { return }
         let host = model.host
         session.call("Network.getAllCookies") { [weak self] result, _ in
             guard let self else { return }
             guard let all = result?.list("cookies") else {
-                // Older engines only answer for URLs.
                 session.call("Network.getCookies", ["urls": [session.url]]) { [weak self] result, _ in
                     self?.show(result?.list("cookies") ?? [])
                 }
@@ -1136,8 +1072,6 @@ private final class CookiesSection: TableSection {
         preview.show(decode.isOn ? (value.removingPercentEncoding ?? value) : value)
     }
 
-    /// The cookie set again with `changes`. Host-only cookies are set by
-    /// URL so they stay host-only.
     private func set(_ cookie: JSON, _ changes: JSON, then done: @escaping @MainActor () -> Void) {
         guard let session else { return }
         let cookie = cookie.merging(changes) { $1 }
@@ -1178,7 +1112,6 @@ private final class CookiesSection: TableSection {
                 changes["expires"] = date.timeIntervalSince1970
                 changes["session"] = false
             } else if let seconds = Double(text) {
-                // A max-age.
                 changes["expires"] = Date().timeIntervalSince1970 + seconds
                 changes["session"] = false
             } else {
@@ -1186,7 +1119,6 @@ private final class CookiesSection: TableSection {
             }
         default: return
         }
-        // Name, domain and path identify a cookie: changing one replaces it.
         if ["name", "domain", "path"].contains(column) {
             deleteCookie(cookie) { [weak self] in self?.set(cookie, changes) { self?.reload() } }
         } else {
@@ -1233,9 +1165,6 @@ private final class CookiesSection: TableSection {
     }
 }
 
-// MARK: IndexedDB
-
-/// Every database of the site.
 private final class DatabasesSection: TableSection {
     init() {
         super.init(columns: [("name", "Database", 160), ("version", "Version", 60), ("stores", "Object stores", 200)], key: "databases")
@@ -1282,7 +1211,6 @@ private final class DatabasesSection: TableSection {
     }
 }
 
-/// One database: its version and stores with their keys and indexes.
 private final class DatabaseSection: AppSectionView {
     private let name: String
     private let tree = ValueTreeView()
@@ -1356,7 +1284,6 @@ private final class DatabaseSection: AppSectionView {
     }
 }
 
-/// One object store's entries, a page at a time, by key or by an index.
 private final class ObjectStoreSection: TableSection {
     private let database: String
     private let store: String
@@ -1431,7 +1358,6 @@ private final class ObjectStoreSection: TableSection {
         load(append: false)
     }
 
-    /// `text` as a key: a number if it reads as one, else a string.
     private static func key(_ text: String) -> JSON {
         if let number = Double(text) { return ["type": "number", "number": number] }
         return ["type": "string", "string": text]
@@ -1472,7 +1398,6 @@ private final class ObjectStoreSection: TableSection {
         status.stringValue = "\(entries.count)\(hasMore ? "+" : "") entr\(entries.count == 1 ? "y" : "ies")"
     }
 
-    /// The protocol's key for a key shown as a remote object.
     private func protocolKey(_ object: JSON) async -> JSON? {
         switch object.str("type") {
         case "number": return object.num("value").map { ["type": "number", "number": $0] }
@@ -1509,9 +1434,6 @@ private final class ObjectStoreSection: TableSection {
     }
 }
 
-// MARK: Cache storage
-
-/// Every cache of the site.
 private final class CachesSection: TableSection {
     init() {
         super.init(columns: [("name", "Cache", 200), ("origin", "Origin", 200)], key: "caches")
@@ -1555,7 +1477,6 @@ private final class CachesSection: TableSection {
     }
 }
 
-/// One cache's entries, with the selected response's headers and body.
 private final class CacheSection: TableSection {
     private let id: String
     private let name: String
@@ -1677,9 +1598,6 @@ private final class CacheSection: TableSection {
     }
 }
 
-// MARK: Manifest, service workers, frames
-
-/// The page's web app manifest, parsed, with its errors.
 private final class ManifestSection: AppSectionView {
     private let tree = ValueTreeView()
     private let empty = InspectorEmptyView("This page has no web app manifest.")
@@ -1734,7 +1652,6 @@ private final class ManifestSection: AppSectionView {
     }
 }
 
-/// The site's service workers and what can be done with them.
 private final class ServiceWorkersSection: AppSectionView, NSTableViewDataSource, NSTableViewDelegate {
     private let table = InspectorTableView()
     private var scroll: NSScrollView!
@@ -1825,7 +1742,6 @@ private final class ServiceWorkersSection: AppSectionView, NSTableViewDataSource
         showDetails()
     }
 
-    /// The newest version's state, as "activated · running".
     private func status(_ registration: JSON) -> String {
         guard let version = model?.versions(of: registration.str("registrationId") ?? "").first else { return "" }
         return "#\(version.str("versionId") ?? "") \(version.str("status") ?? "") · \(version.str("runningStatus") ?? "")"
@@ -1879,7 +1795,6 @@ private final class ServiceWorkersSection: AppSectionView, NSTableViewDataSource
     func tableViewSelectionDidChange(_ notification: Notification) { showDetails() }
 }
 
-/// The page's frames, nested.
 private final class FramesSection: AppSectionView {
     private let tree = ValueTreeView()
 
@@ -1932,9 +1847,6 @@ private final class FramesSection: AppSectionView {
     }
 }
 
-// MARK: Storage overview
-
-/// How much the site stores, by kind, and clearing it.
 private final class StorageOverviewSection: AppSectionView {
     private let scroll = NSScrollView()
     private let content = FlippedView()
@@ -2076,7 +1988,6 @@ private final class StorageOverviewSection: AppSectionView {
     }
 }
 
-/// A thin rounded meter.
 private final class UsageBar: NSView {
     var fraction: Double = 0 {
         didSet { needsDisplay = true }

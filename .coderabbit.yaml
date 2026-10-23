@@ -1,0 +1,45 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: en-US
+reviews:
+  profile: chill
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - dev
+  path_filters:
+    - "!third_party/**"
+    - "!core/Cargo.lock"
+    - "!.swiftlint-baseline.json"
+  tools:
+    swiftlint:
+      enabled: false
+    clippy:
+      enabled: false
+    ruff:
+      enabled: false
+    shellcheck:
+      enabled: false
+  path_instructions:
+    - path: "core/**"
+      instructions: >-
+        The core owns all browser state and needs tests for new state. unsafe
+        is only allowed in core/src/crypto.rs, with a comment saying why each
+        block is sound. No printing, unwrap() panics or todo!().
+    - path: "shell/**"
+      instructions: >-
+        The shell renders snapshots from the core and keeps no browser state
+        of its own; new state belongs in core/. Only shell/engine/ and
+        shell/helper/ may include CEF; everything else goes through MBEngine.
+        AppKit only, no SwiftUI. MBGA is built to use as little memory as
+        possible, so flag anything that grows memory use, keeps work running
+        in background tabs or adds per-tab overhead.
+    - path: "bench/**"
+      instructions: >-
+        Benchmarks compare MBGA with other browsers. Check that changes keep
+        the measurements fair and repeatable across browsers.
+chat:
+  auto_reply: true

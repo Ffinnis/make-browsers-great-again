@@ -3,19 +3,14 @@ import AppKit
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuItemValidation {
     let core: BrowserCore
-    /// The first window's store. Agents, Settings and imports work through
-    /// it, and its window hides rather than closes.
     private(set) lazy var primary = BrowserStore(core: core)
-    /// The store of the window in front, which menu commands act on.
     var store: BrowserStore { BrowserStore.front ?? primary }
-    /// The browser windows, the first window's first.
     private var windows: [BrowserWindow] = []
     private var sleepTimer: Timer?
     private var pressureSource: DispatchSourceMemoryPressure?
     private var scrollMonitor: Any?
     private var settings: SettingsWindowController?
     private var agentServer: AgentServer?
-    /// Safari-style: the Develop menu is there only in Developer Mode.
     private var developMenu: NSMenuItem?
 
     init(core: BrowserCore) {
@@ -23,16 +18,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // MBGA_APPEARANCE=light|dark overrides the system appearance, for
-        // screenshots of either look.
         switch ProcessInfo.processInfo.environment["MBGA_APPEARANCE"] {
         case "light": NSApp.appearance = NSAppearance(named: .aqua)
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
         default: break
         }
         NSApp.mainMenu = buildMainMenu()
-        // Before the first tab: a profile's extension workers start with its
-        // first tab, and the host must be there to see them start.
         let extensions = ExtensionHost(core: core, devTools: BrowserDevTools(available: hasBrowserDevTools),
                                        dataDirectory: dataDirectory)
         ExtensionHost.shared = extensions
@@ -56,18 +47,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         store.wakeAlwaysAwakeTabs()
         window.makeKeyAndOrderFront(nil)
         Updater.shared.start(store: primary)
-        // MBGA_DEBUG_LITTLE_WINDOW pops the visible tab out at launch, for
-        // screenshots of little windows.
         if ProcessInfo.processInfo.environment["MBGA_DEBUG_LITTLE_WINDOW"]?.isEmpty == false, let tab = store.visibleTabID {
             store.openInLittleWindow(tab)
         }
-        // MBGA_DEBUG_EXTENSIONS=<url> opens the extensions window at launch,
-        // on that page if it's a URL.
         if let page = ProcessInfo.processInfo.environment["MBGA_DEBUG_EXTENSIONS"] {
             store.showExtensions(url: page.contains(":") ? page : "")
         }
-        // MBGA_DEBUG_LAYOUTS=<seconds> switches between Full and Focus that
-        // often (every 3 s if not a number), for captures of the transition.
         if let every = ProcessInfo.processInfo.environment["MBGA_DEBUG_LAYOUTS"], !every.isEmpty {
             let timer = Timer(timeInterval: Double(every) ?? 3, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -77,13 +62,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             RunLoop.main.add(timer, forMode: .common)
         }
-        // MBGA_DEBUG_COMMAND_CLOSE=<seconds> closes the command bar that
-        // long after launch, for captures of it closing.
         if let after = ProcessInfo.processInfo.environment["MBGA_DEBUG_COMMAND_CLOSE"].flatMap(Double.init) {
             DispatchQueue.main.asyncAfter(deadline: .now() + after) { [weak self] in self?.store.commandBar = nil }
         }
-        // MBGA_DEBUG_PEEK=<seconds> shows the sidebar peeking over the page
-        // in Focus mode, then not, that often, for captures of the slide.
         if let every = ProcessInfo.processInfo.environment["MBGA_DEBUG_PEEK"], !every.isEmpty {
             store.setLayout(.focus)
             let timer = Timer(timeInterval: Double(every) ?? 2, repeats: true) { [weak self] _ in
@@ -94,8 +75,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             }
             RunLoop.main.add(timer, forMode: .common)
         }
-        // MBGA_DEBUG_DEVELOPER_DO=light,device:0,rotate,pick,screenshot runs
-        // developer toolbar actions two seconds after launch, for captures.
         if let actions = ProcessInfo.processInfo.environment["MBGA_DEBUG_DEVELOPER_DO"], !actions.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 guard let store = self?.store else { return }
@@ -114,13 +93,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 }
             }
         }
-        // MBGA_DEBUG_SETTINGS=general|privacy|developer opens Settings at launch.
         if let raw = ProcessInfo.processInfo.environment["MBGA_DEBUG_SETTINGS"],
            let pane = SettingsPane.allCases.first(where: { $0.title.lowercased() == raw }) {
             showSettings(pane)
         }
-        // MBGA_DEBUG_SIGNINS=1 brings the first browser's sign-ins into the
-        // active space's profile at launch and logs how it went.
         if ProcessInfo.processInfo.environment["MBGA_DEBUG_SIGNINS"] != nil {
             let home = ProcessInfo.processInfo.environment["MBGA_IMPORT_HOME"] ?? NSHomeDirectory()
             Task { [store, core] in
@@ -133,8 +109,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
                 NSLog("sign-ins: %@ (added %d, kept %d)", SignIns.describe(outcome, from: source.name), outcome.added, outcome.kept)
             }
         }
-        // MBGA_DEBUG_PASSWORDS=1 does the same with the first browser's
-        // saved passwords.
         if ProcessInfo.processInfo.environment["MBGA_DEBUG_PASSWORDS"] != nil {
             let home = ProcessInfo.processInfo.environment["MBGA_IMPORT_HOME"] ?? NSHomeDirectory()
             Task { [store, core] in
@@ -156,7 +130,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             store.commandBar = .newTab
         }
 
-        // Two-finger swipes in the sidebar switch spaces.
         scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
             guard let store = self?.windows.first(where: { $0.window === event.window })?.store else { return event }
             return store.pager.handle(event) ? nil : event
@@ -181,8 +154,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         _ = core.persist()
-        // The engine must close every browser before the process exits; the
-        // message loop returns to main.swift once that is done.
         MBEngine.closeAllAndQuit()
         return .terminateCancel
     }
@@ -203,8 +174,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        // Closing the first window keeps the browser running, like other Mac
-        // apps; other windows close for good.
         guard sender === windows.first?.window else { return true }
         sender.orderOut(nil)
         BrowserStore.windowsChanged()
@@ -219,9 +188,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         closed.store.windowClosed()
     }
 
-    /// Another window on the spaces, its own space and tab chosen apart from
-    /// the others'. It starts on the front window's space, ready for an
-    /// address.
     @objc func newWindow(_ sender: Any?) {
         let store = BrowserStore(core: core, newWindow: true)
         let window = makeWindow(for: store)
@@ -241,7 +207,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         window.titleVisibility = .hidden
         window.title = "MBGA"
         window.minSize = NSSize(width: 640, height: 420)
-        // The hidden sidebar and Focus mode's traffic lights follow the pointer.
         window.acceptsMouseMovedEvents = true
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -250,8 +215,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             if !window.setFrameUsingName("MainWindow") { window.center() }
             window.setFrameAutosaveName("MainWindow")
         } else if let front = self.store.window {
-            // Down and right of the window in front, as other Mac apps do,
-            // smaller if that would run off the screen.
             var frame = front.frame.offsetBy(dx: 24, dy: -24)
             if let area = (front.screen ?? NSScreen.main)?.visibleFrame {
                 frame.size.width = min(frame.width, area.maxX - frame.minX)
@@ -284,15 +247,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         guard let main = NSApp.mainMenu, let develop = developMenu else { return }
         let shown = develop.menu === main
         if DeveloperSettings.enabled, !shown {
-            // After View, as in Safari.
             let view = main.items.firstIndex { $0.title == "View" } ?? 2
             main.insertItem(develop, at: view + 1)
         } else if !DeveloperSettings.enabled, shown {
             main.removeItem(develop)
         }
     }
-
-    // MARK: - Menu actions
 
     @objc func openSettings(_ sender: Any?) { showSettings(nil) }
     @objc func reloadIgnoringCache(_ sender: Any?) { if !MBEngine.performChromeCommand(.reloadIgnoringCache) { store.hardReload() } }
@@ -317,7 +277,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         if let app = sender.representedObject as? URL { store.openVisible(in: app) }
     }
 
-    // In the extensions window (Chrome's own), tab commands are Chrome's.
     @objc func newTab(_ sender: Any?) { if !MBEngine.performChromeCommand(.newTab) { store.commandBar = .newTab } }
     @objc func openLocation(_ sender: Any?) { if !MBEngine.performChromeCommand(.focusLocation) { store.commandBar = .editCurrent } }
     @objc func closeTab(_ sender: Any?) {
@@ -328,8 +287,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             NSApp.keyWindow?.performClose(sender)
         }
     }
-    /// Closes the window even when its traffic lights are hidden (Focus
-    /// mode), which `performClose` won't.
     @objc func closeWindow(_ sender: Any?) {
         guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
         if window.delegate?.windowShouldClose?(window) ?? true { window.close() }
@@ -363,8 +320,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     @objc func showExtensions(_ sender: Any?) { store.showExtensions() }
     @objc func checkForUpdates(_ sender: Any?) { Updater.shared.check(userInitiated: true) }
     @objc func restartToUpdate(_ sender: Any?) { Updater.shared.restartToUpdate() }
-    /// Edit ▸ Undo reaches the app only when no page or text field took it;
-    /// then it undoes the last closed tab, cleared list or deleted folder.
     @objc func undo(_ sender: Any?) { store.undoClose() }
     @objc func setArchiveInterval(_ sender: NSMenuItem) { store.setArchiveAfterHours(UInt32(sender.tag)) }
     @objc func setTintStyle(_ sender: NSMenuItem) {
@@ -444,8 +399,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
             : "Sites will share a few renderer processes, as in Chrome on Android. Sign-in pages and sites that ask for isolation keep their own process. This saves about a fifth of memory."
         alert.runModal()
     }
-
-    // MARK: - Menu
 
     private func buildMainMenu() -> NSMenu {
         let main = NSMenu()
@@ -612,14 +565,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
     }
 }
 
-/// A browser window: its store, the window, and what follows the pointer
-/// in it.
 @MainActor
 private struct BrowserWindow {
     let store: BrowserStore
     let window: NSWindow
     let sidebarReveal: SidebarReveal
-    /// Brings the store forward as the window becomes main.
     let frontObserver: NSObjectProtocol
 }
 

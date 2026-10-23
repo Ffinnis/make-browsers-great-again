@@ -1,9 +1,5 @@
 import Foundation
 
-// mbga: use the running MBGA browser from a terminal, a script or an
-// agent's shell. `mbga <command> [args]` runs one command and prints the
-// result. It talks to the socket MBGA opens while Settings ▸ Agents allows it.
-
 let guide = """
 mbga: drive the MBGA browser. Pages come back as short outlines with refs
 ([e12]) to act on; refs last until the page changes, then snapshot again.
@@ -23,14 +19,17 @@ mbga: drive the MBGA browser. Pages come back as short outlines with refs
   press <key> [--times N]      Enter, Tab, Escape, ArrowDown, Shift+Tab, a…
   select <ref> <option>        choose in a <select>
   hover <ref> | scroll [down|up|top|bottom|<ref>] [px]
-  wait load | <ms> | text <t> | gone <t>   [--timeout s]
-  eval <js>                    run JavaScript in the page, print JSON
+  wait load | idle | <ms> | text <t> | gone <t>   [--timeout s]
+                               idle: no requests for half a second
+  eval <js> [--timeout s]      run JavaScript in the page, print JSON
   screenshot [--full] [--out path]   PNG at CSS pixels; prints its path
   console [--errors] [--clear] messages since the page loaded
+  network [--failed] [--api] [--filter t] [--max N] | network --body N
+                               requests since you first used the tab
 
 Refs can also be css=<selector> or text=<words> when you know the page.
 
-  run <file.js | - | -e 'code'> [--timeout s]
+  run <file.js | - | -e 'code'> [--tab tN] [--timeout s]
       a script, run inside MBGA, with every command as an async function
       returning its text: open(url) → "tN", goto, click(target), fill(target,
       text, {enter: true}), press, select, wait('load' | ms | {text}),
@@ -46,9 +45,10 @@ last, else the one on screen). Set MBGA_SESSION=<name> to keep your own
 current tab apart from other agents'. Your tabs open in the Agents space,
 off the person's screen. Refs in cross-site frames look like f1:e3.
 
-  network [--failed] [--api] [--filter t] [--max N] | network --body N
-                               requests since you first used the tab Typical loop: open → snapshot → click/fill →
-snapshot. Prefer snapshot/read/find over screenshots: far fewer tokens.
+Typical loop: open → snapshot → click/fill → snapshot. open, goto and
+click wait for the page to load and its requests to quiet down, so there's
+no need to sleep; for content that comes later, wait text <t>. Prefer
+snapshot/read/find over screenshots: far fewer tokens.
 """
 
 let socketPath = ProcessInfo.processInfo.environment["MBGA_SOCKET"]
@@ -59,11 +59,9 @@ enum Failure: Error {
     case message(String)
 }
 
-/// One connection to the browser, for any number of commands.
 final class Browser {
     private let fd: Int32
     private var pending = Data()
-    /// Which agent this is: each has its own current tab.
     private let session: String
 
     init(session: String = ProcessInfo.processInfo.environment["MBGA_SESSION"] ?? "default") throws {
@@ -110,8 +108,6 @@ final class Browser {
     }
 }
 
-// MARK: - Main
-
 let argv = Array(CommandLine.arguments.dropFirst())
 if argv.isEmpty || ["help", "-h", "--help", "guide"].contains(argv[0]) {
     print(guide)
@@ -119,20 +115,29 @@ if argv.isEmpty || ["help", "-h", "--help", "guide"].contains(argv[0]) {
 }
 do {
     var argv = argv
-    // A script goes over as its text.
     if argv[0] == "run" {
-        guard argv.count >= 2 else { throw Failure.message("Usage: mbga run <file.js | - | -e 'code'>") }
-        let rest = Array(argv.dropFirst(argv[1] == "-e" ? 3 : 2))
-        let source: String
-        if argv[1] == "-e", argv.count >= 3 {
-            source = argv[2]
-        } else if argv[1] == "-" {
-            source = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
-        } else if let text = try? String(contentsOfFile: argv[1], encoding: .utf8) {
-            source = text
-        } else {
-            throw Failure.message("Can't read \(argv[1]).")
+        var rest: [String] = []
+        var source: String?
+        var words = argv.dropFirst()
+        while let word = words.popFirst() {
+            if source == nil, word == "-e" {
+                guard let code = words.popFirst() else { break }
+                source = code
+            } else if word.hasPrefix("--") {
+                rest.append(word)
+                if ["--tab", "--timeout"].contains(word), let value = words.popFirst() { rest.append(value) }
+            } else if word == "-t", let value = words.popFirst() {
+                rest += ["--tab", value]
+            } else if source == nil, word == "-" {
+                source = String(decoding: FileHandle.standardInput.readDataToEndOfFile(), as: UTF8.self)
+            } else if source == nil {
+                guard let text = try? String(contentsOfFile: word, encoding: .utf8) else { throw Failure.message("Can't read \(word).") }
+                source = text
+            } else {
+                rest.append(word)
+            }
         }
+        guard let source else { throw Failure.message("Usage: mbga run <file.js | - | -e 'code'> [--tab tN] [--timeout s]") }
         argv = ["run", source] + rest
     }
     print(try Browser().run(argv))

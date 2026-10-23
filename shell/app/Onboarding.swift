@@ -2,14 +2,9 @@ import AppKit
 
 struct ImportRequest {
     let id = UUID()
-    /// The welcome sheet at first launch, rather than File ▸ Import.
     let firstLaunch: Bool
 }
 
-/// Finds other browsers on this Mac and imports their spaces, tabs and
-/// bookmarks, their sign-ins (cookies) and saved passwords. Shown once at
-/// first launch, and from File ▸ Import. First launch ends with a choice of
-/// layout and color.
 @MainActor
 final class ImportSheet: NSObject {
     let request: ImportRequest
@@ -23,15 +18,12 @@ final class ImportSheet: NSObject {
         case importing
         case signingIn
         case done(ImportSummary, [String])
-        /// First launch only: layout and color, after importing or not.
         case style
     }
 
     private var phase = Phase.scanning
     private var selected: Set<String> = []
-    /// Bring the chosen profiles' cookies too.
     private var signIns = true
-    /// And their saved passwords.
     private var passwords = true
     private weak var importButton: NSButton?
     private var imported = false
@@ -91,11 +83,7 @@ final class ImportSheet: NSObject {
         window.contentView = content
     }
 
-    // MARK: - Phases
-
     private func start() async {
-        // MBGA_DEBUG_ONBOARDING=style opens straight at the style step, for
-        // screenshots.
         if ProcessInfo.processInfo.environment["MBGA_DEBUG_ONBOARDING"] == "style" {
             phase = .style
             render()
@@ -109,7 +97,6 @@ final class ImportSheet: NSObject {
         render()
     }
 
-    /// The system's default browser if it was found, else the first one.
     private static func defaultChoice(_ sources: [ImportSourceInfo]) -> ImportSourceInfo? {
         let usable = sources.filter { $0.error == nil && !$0.profiles.isEmpty }
         let defaultBrowser = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!)
@@ -146,8 +133,6 @@ final class ImportSheet: NSObject {
         }
     }
 
-    /// Each imported profile's cookies into the MBGA profile it became, a
-    /// line per browser profile.
     private func bringSignIns(_ summary: ImportSummary, sources: [ImportSourceInfo]) async -> [String] {
         var notes: [String] = []
         for link in summary.profiles {
@@ -160,8 +145,6 @@ final class ImportSheet: NSObject {
         return notes
     }
 
-    /// Each imported profile's saved passwords into the MBGA profile it
-    /// became, a line per browser profile that had any.
     private func bringPasswords(_ summary: ImportSummary, sources: [ImportSourceInfo]) async -> [String] {
         var notes: [String] = []
         for link in summary.profiles {
@@ -175,7 +158,6 @@ final class ImportSheet: NSObject {
         return notes
     }
 
-    /// First launch goes on to choosing a style; otherwise the sheet closes.
     private func next() {
         if request.firstLaunch {
             phase = .style
@@ -190,11 +172,8 @@ final class ImportSheet: NSObject {
         guard request.firstLaunch else { return }
         store.core.finishOnboarding()
         store.refresh()
-        // Starting fresh opens the address bar, as any launch with no tab does.
         if !imported, store.visibleTabID == nil { store.commandBar = .newTab }
     }
-
-    // MARK: - Rendering
 
     private func render() {
         if case .style = phase {
@@ -260,8 +239,6 @@ final class ImportSheet: NSObject {
             addButtons(cancel: nil, primary: ("Start Browsing", finish))
         }
         resize()
-        // The new step fades in as the sheet takes its size, rather than
-        // being there all at once.
         if window.isVisible, !Motion.reduced {
             for view in [body, buttons] as [NSView] { view.alphaValue = 0 }
             Motion.animate(Motion.fade) {
@@ -270,7 +247,6 @@ final class ImportSheet: NSObject {
         }
     }
 
-    /// Fits the sheet to its content.
     private func resize() {
         guard let content = window.contentView else { return }
         content.layoutSubtreeIfNeeded()
@@ -286,7 +262,6 @@ final class ImportSheet: NSObject {
         }
     }
 
-    /// The cancel-style button on the left and the default one on the right.
     @discardableResult
     private func addButtons(cancel: (String, () -> Void)?, primary: (String, () -> Void)? = nil) -> NSButton? {
         if let (title, action) = cancel {
@@ -399,7 +374,6 @@ private func plural(_ n: UInt32, _ one: String, _ many: String? = nil) -> String
     "\(n.formatted()) \(n == 1 ? one : many ?? one + "s")"
 }
 
-/// A browser with a checkbox per profile (or one for the whole browser).
 private final class SourceRow: NSView {
     private let source: ImportSourceInfo
     private let toggled: (String, Bool) -> Void
@@ -488,7 +462,6 @@ private final class SourceRow: NSView {
     override var wantsUpdateLayer: Bool { true }
 
     override func updateLayer() {
-        // A quiet card, a few percent of the text color in either appearance.
         layer?.backgroundColor = Theme.faint(effectiveAppearance.isDark ? 0.06 : 0.04).cgColor
     }
 
@@ -503,7 +476,6 @@ private final class SourceRow: NSView {
         return box
     }
 
-    /// "Chrome · Work" is shown as "Work" under its browser's name.
     private func profileLabel(_ profile: ImportProfileInfo) -> String {
         let prefix = source.name + " · "
         return profile.name.hasPrefix(prefix) ? String(profile.name.dropFirst(prefix.count)) : profile.name
@@ -525,8 +497,6 @@ private final class SourceRow: NSView {
     }
 }
 
-/// Layout (Sidebar, Compact or Focus) and how strongly spaces tint the
-/// window, each with a small live preview. Choices apply at once.
 private final class StylePicker: NSStackView {
     private let store: BrowserStore
     private var layoutChoices: [StyleChoice] = []
@@ -598,7 +568,6 @@ private final class StylePicker: NSStackView {
     }
 }
 
-/// A preview with a title (and detail) that can be picked.
 private final class StyleChoice: NSView {
     let preview: StylePreview
     var onPick: (() -> Void)?
@@ -638,7 +607,6 @@ private final class StyleChoice: NSView {
     override func mouseDown(with event: NSEvent) { onPick?() }
 }
 
-/// A miniature MBGA window.
 private final class StylePreview: NSView {
     var layout: SidebarLayout { didSet { needsDisplay = true } }
     var style: TintStyle { didSet { needsDisplay = true } }

@@ -1,4 +1,3 @@
-# Editors pick these up, and shfmt reads its settings from here.
 root = true
 
 [*]

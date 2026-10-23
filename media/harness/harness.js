@@ -1,11 +1,3 @@
-// Runs each case in cases.json through worker.js in the real engine and
-// appends the output to a real MediaSource, the way shim.js does: `held`
-// groups first, then the append's own bytes, and a `drain` before
-// endOfStream().
-// Results land in window.results; ?case=a,b runs some cases, ?save=1 posts
-// each SourceBuffer's converted bytes to serve.py for ffprobe,
-// ?tune={...} hands the worker encoder settings to compare (self.mbgaTune),
-// and ?repeat=N runs everything N times, for timing.
 'use strict';
 
 const params = new URLSearchParams(location.search);
@@ -13,7 +5,6 @@ const log = (...args) => {
   document.querySelector('#log').textContent += args.join(' ') + '\n';
 };
 
-// What shim.js maps the page's codecs to.
 function mapMime(mime) {
   return mime
     .replace(/avc[13]\.[0-9a-fA-F]+/g, 'vp09.00.41.08')
@@ -69,7 +60,6 @@ class Converter {
     return this.request(sb, msg, [bytes]);
   }
 
-  // The seq the next append or drain on `sb` gets.
   next(sb) {
     return (this.seq.get(sb) || 0) + 1;
   }
@@ -95,7 +85,6 @@ async function startWorker() {
   const prefix = tune ? `self.mbgaTune = ${tune};\n` : '';
   const worker = new Worker(URL.createObjectURL(new Blob([prefix + source], { type: 'text/javascript' })));
   const conv = new Converter(worker);
-  // Like the shim: the module comes as bytes (?compiled=1 sends it compiled).
   worker.postMessage({ type: 'wasm', module: params.has('compiled') ? await WebAssembly.compile(wasm) : wasm });
   return conv;
 }
@@ -114,7 +103,6 @@ function appendTo(sb, bytes) {
   });
 }
 
-// Every box of `data` (recursing into containers), as [type, start, end].
 function* walk(data, start = 0, end = data.length) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const containers = ['moov', 'trak', 'mdia', 'minf', 'stbl', 'moof', 'traf', 'mvex', 'edts'];
@@ -135,8 +123,6 @@ function* walk(data, start = 0, end = data.length) {
   }
 }
 
-// Mutates the first box of a type: `set` maps offsets from the box's start
-// to u32 values. Malformed input built from good fixtures.
 function patch(data, patches) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   for (const p of patches) {
@@ -147,7 +133,6 @@ function patch(data, patches) {
   return data;
 }
 
-// The init, then each moof with its mdat.
 function units(data) {
   const out = [];
   let start = 0;
@@ -161,7 +146,6 @@ function units(data) {
   return out;
 }
 
-// The vp09 sample entries' sizes in some output.
 function vp09Sizes(data) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   return [...walk(data)].filter((b) => b[0] === 'vp09').map((b) => [view.getUint16(b[1] + 32), view.getUint16(b[1] + 34)]);
@@ -184,7 +168,6 @@ async function runCase(conv, c, sbBase, expected) {
   await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
   video.addEventListener('error', () => fail('video error: ' + (video.error && video.error.message)));
 
-  // Every SourceBuffer is made before any append, as players do.
   const states = c.sbs.map((spec, i) => {
     const id = sbBase + i;
     conv.post({ type: 'open', sb: id, mime: spec.mime, start: spec.start });
@@ -217,7 +200,6 @@ async function runCase(conv, c, sbBase, expected) {
       s.naturals.push([n.width, n.height, n.at === undefined ? null : +n.at.toFixed(3)]);
       if (n.seq !== undefined && !(n.seq < reply.seq)) fail(`${label}: natural of append ${n.seq} in ${reply.seq}`);
     }
-    // The output's times: there with media, within the input's.
     const media = reply.bytes && [...walk(new Uint8Array(reply.bytes))].some((b) => b[0] === 'moof');
     if (media !== !!reply.range) fail(`${label}: range ${JSON.stringify(reply.range)} for ${media ? 'media' : 'no media'}`);
     if (reply.range) {
@@ -229,8 +211,6 @@ async function runCase(conv, c, sbBase, expected) {
     }
     const parts = [];
     for (const g of reply.held || []) {
-      // Each group is an earlier append's, with that append's settings (the
-      // same throughout here), and a time range within the input's.
       if (!(g.seq < reply.seq) || !(g.end > g.start) || !(g.bytes.byteLength > 0)) {
         fail(`${label}: bad held group ${JSON.stringify({ seq: g.seq, start: g.start, end: g.end })} in ${reply.seq}`);
       }
@@ -254,10 +234,7 @@ async function runCase(conv, c, sbBase, expected) {
   for (const [i, s] of states.entries()) s.want = (c.expected && c.expected[i]) || (expected && expected[i]);
   await Promise.all(states.map(async (s) => {
     const actions = s.spec.actions || {};
-    // `units`: the files' moof+mdat units, appended in this order (indices,
-    // 0 the init), as players that load a fragment again do.
     const fetched = async (file) => {
-      // a+b: both in one append.
       const parts = await Promise.all(file.split('+').map(async (f) => new Uint8Array(await (await fetch(url(f))).arrayBuffer())));
       const data = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
       parts.reduce((at, p) => (data.set(p, at), at + p.length), 0);
@@ -273,13 +250,11 @@ async function runCase(conv, c, sbBase, expected) {
     for (const [index, file] of appends.entries()) {
       const action = actions[index] || {};
       if (action.wait) {
-        // With keepalive, as the shim's paused progressive downloads.
         const timer = action.keepalive && setInterval(() => conv.post({ type: 'keepalive', sb: s.id }), 100);
         await new Promise((r) => setTimeout(r, action.wait));
         clearInterval(timer);
       }
       if (action.drain) {
-        // As before endOfStream(), and then the page carries on.
         const reply = await conv.drain(s.id);
         if (reply.type === 'error') fail(`drain: ${reply.message}`);
         else await deliver(s, 'drain', reply);
@@ -290,8 +265,6 @@ async function runCase(conv, c, sbBase, expected) {
       let data = pieces ? pieces[index] : await fetched(file);
       if (action.patch) data = patch(data, action.patch);
       const step = s.spec.split || data.length;
-      // A progressive file's appends say where they start, and go on from
-      // `need` when a reply has one, as the shim's do.
       const progressive = s.spec.mime === 'progressive';
       for (let at = 0, next = 0; at < data.length; at = next) {
         next = at + step;
@@ -300,7 +273,6 @@ async function runCase(conv, c, sbBase, expected) {
         const t0 = performance.now();
         const replied = conv.append(s.id, piece.buffer, progressive ? at : undefined);
         if (action.abort) {
-          // The page's abort(): the shim drops the reply and resets.
           conv.post({ type: 'reset', sb: s.id });
         }
         const reply = await Promise.race([replied, new Promise((r) => setTimeout(() => r(null), 20000))]);
@@ -326,7 +298,6 @@ async function runCase(conv, c, sbBase, expected) {
         if (reply.need === undefined) continue;
         s.needs.push(reply.need);
         if (at + step < data.length) {
-          // The append the shim sent before it heard: dropped, empty.
           const stale = await conv.append(s.id, data.slice(at + step, at + 2 * step).buffer, at + step);
           if (stale.type !== 'output' || stale.bytes.byteLength || stale.held) fail(`stale append at ${at + step} not dropped`);
           s.dropped++;
@@ -350,11 +321,9 @@ async function runCase(conv, c, sbBase, expected) {
   if (ms.readyState === 'open' && !states.some((s) => s.sb && s.sb.updating)) ms.endOfStream();
   for (const s of states) conv.post({ type: 'close', sb: s.id });
 
-  // Timeline: one range, where the input's is.
   for (const [i, s] of states.entries()) {
     const got = s.sb ? ranges(s.sb.buffered) : [];
     const want = (c.expected && c.expected[i]) || (expected && expected[i]);
-    // Media appends only: the first is usually the init's.
     const media = s.times.filter((t) => !/init/.test(t.file));
     const info = {
       mime: s.mime,
@@ -379,7 +348,6 @@ async function runCase(conv, c, sbBase, expected) {
     if (s.spec.natural && JSON.stringify(s.natural) !== JSON.stringify(s.spec.natural)) {
       fail(`sb ${i}: natural size ${JSON.stringify(s.natural)}, expected ${JSON.stringify(s.spec.natural)}`);
     }
-    // Every natural size change: [width, height, at] (null: at once).
     if (s.spec.naturals) {
       const ok = s.naturals.length === s.spec.naturals.length && s.naturals.every((n, k) => {
         const e = s.spec.naturals[k];
@@ -402,9 +370,6 @@ async function runCase(conv, c, sbBase, expected) {
     }
   }
 
-  // Playback. A hidden tab pauses muted media, so this seeks through the
-  // timeline and counts decoded frames and audio bytes; whether time moves
-  // after play() is reported only.
   const hasVideo = states.some((s) => s.mime && s.mime.includes('vp09'));
   const hasAudio = states.some((s) => s.mime && s.mime.includes('flac'));
   const buffered = video.buffered;
@@ -420,13 +385,11 @@ async function runCase(conv, c, sbBase, expected) {
     seeks.push({ at: +video.currentTime.toFixed(3), readyState: video.readyState, width: video.videoWidth });
     if (video.readyState < 2) fail(`readyState ${video.readyState} after seeking to ${video.currentTime.toFixed(2)}`);
   }
-  // Muted media in a hidden tab doesn't play, but seeking prerolls audio.
   if (hasAudio && !(video.webkitAudioDecodedByteCount > 0)) fail('no audio decoded');
   try {
     await Promise.race([video.play(), new Promise((r) => setTimeout(r, 3000))]);
     await new Promise((r) => setTimeout(r, 1000));
   } catch (e) {
-    // Expected in a hidden tab; reported, not failed.
   }
   const quality = video.getVideoPlaybackQuality();
   result.playback = {
@@ -442,21 +405,17 @@ async function runCase(conv, c, sbBase, expected) {
   };
   if (hasVideo && !(video.videoWidth > 0 && quality.totalVideoFrames >= 3)) fail('video frames did not decode');
 
-  // A/V start alignment, against the input's.
   if (states.length === 2 && expected) {
     const [a, b] = states.map((s) => s.sb.buffered.start(0));
     const drift = Math.abs((a - b) - (expected[0][0] - expected[1][0]));
     result.avStartDrift = +drift.toFixed(4);
     if (drift > 0.034) fail(`A/V starts drift by ${drift.toFixed(3)} s`);
   }
-  // What the worker's codecs did for this case.
   const after = await conv.stats();
   result.worker = {};
   for (const key of Object.keys(after)) {
     if (typeof after[key] === 'number') result.worker[key] = after[key] - (before[key] || 0);
   }
-  // Counters that have to have moved, such as {"recycled": 1}: at least,
-  // or [least, most].
   for (const [key, want] of Object.entries(c.expectStats || {})) {
     const [least, most] = Array.isArray(want) ? want : [want, Infinity];
     const got = result.worker[key] || 0;
@@ -478,7 +437,6 @@ async function main() {
   const only = params.get('case');
   const results = [];
   let sbBase = 1;
-  // ?repeat=N runs the cases N times over, for timing.
   const runs = [];
   for (let i = 0; i < (Number(params.get('repeat')) || 1); i++) runs.push(...cases);
   for (const c of runs) {

@@ -1,10 +1,3 @@
-//! AAC to FLAC, one FLAC frame per AAC frame, so each output sample keeps
-//! the input's timestamp and duration and segments stay independent.
-//!
-//! HE-AAC (SBR, and PS on top of it) is decoded as its AAC-LC core: half
-//! the sample rate, and mono for PS. The FLAC stream declares what it holds,
-//! and the timestamps don't change, so it stays in sync.
-
 use symphonia_codec_aac::AacDecoder;
 use symphonia_core::codecs::audio::well_known::CODEC_ID_AAC;
 use symphonia_core::codecs::audio::{AudioCodecParameters, AudioDecoder, AudioDecoderOptions};
@@ -17,7 +10,6 @@ use crate::flac;
 const RATES: [u32; 13] = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 const FRAME: usize = 1024;
 
-/// What an `AudioSpecificConfig` says about the core the decoder will output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AacConfig {
     pub rate: u32,
@@ -34,7 +26,6 @@ impl AacConfig {
             r.rate()?;
             let core = r.object_type()?;
             if object == 29 {
-                // Parametric stereo rebuilds stereo from a mono core.
                 return Ok(AacConfig { rate, channels: 1 });
             }
             object = core;
@@ -48,7 +39,6 @@ impl AacConfig {
         }
     }
 
-    /// A plain AAC-LC config for the core, which is all the decoder takes.
     fn lc_config(self) -> Vec<u8> {
         let mut bits: u64 = 2;
         let mut len: u32 = 5;
@@ -103,10 +93,8 @@ impl Bits<'_> {
 pub struct AacToFlac {
     pub config: AacConfig,
     decoder: AacDecoder,
-    /// mdhd timescale of the track, to number FLAC frames by time.
     timescale: u32,
     planes: Vec<Vec<i16>>,
-    /// Nothing decoded since it was made or reset: no overlap carried.
     fresh: bool,
 }
 
@@ -122,15 +110,12 @@ impl AacToFlac {
         Ok(AacToFlac { config, decoder, timescale, planes: Vec::new(), fresh: true })
     }
 
-    /// The dfLa payload after its full-box header: one STREAMINFO block.
     pub fn dfla(&self) -> Vec<u8> {
         let mut out = vec![0x80, 0, 0, 34];
         out.extend_from_slice(&flac::streaminfo(self.config.rate, self.config.channels, FRAME as u32));
         out
     }
 
-    /// One AAC frame in, one FLAC frame out. A frame that fails to decode
-    /// becomes silence, so the timeline has no hole.
     pub fn convert(&mut self, aac: &[u8], dts: i64) -> Vec<u8> {
         self.fresh = false;
         let channels = self.config.channels as usize;
@@ -150,14 +135,11 @@ impl AacToFlac {
         flac::encode_frame(&self.planes, self.config.rate, frame)
     }
 
-    /// Forgets the overlap carried from the last frame, after a seek.
     pub fn reset(&mut self) {
         self.decoder.reset();
         self.fresh = true;
     }
 
-    /// Whether a new decoder would carry on the same: nothing decoded since
-    /// it was made or reset.
     pub fn fresh(&self) -> bool {
         self.fresh
     }
@@ -169,13 +151,9 @@ mod tests {
 
     #[test]
     fn reads_audio_specific_configs() {
-        // X's AAC-LC, 44.1 kHz stereo.
         assert_eq!(AacConfig::parse(&[0x12, 0x10]), Ok(AacConfig { rate: 44100, channels: 2 }));
-        // Explicit HE-AAC: SBR over a 22.05 kHz core.
         assert_eq!(AacConfig::parse(&[0x2b, 0x92, 0x08, 0x00]), Ok(AacConfig { rate: 22050, channels: 2 }));
-        // HE-AACv2 decodes as a mono core.
         assert_eq!(AacConfig::parse(&[0xeb, 0x8a, 0x08, 0x00]), Ok(AacConfig { rate: 22050, channels: 1 }));
-        // AAC-LC with an SBR sync extension decodes as the LC core.
         let he = AacConfig::parse(&[0x13, 0x90, 0x56, 0xe5, 0xa0]);
         assert_eq!(he, Ok(AacConfig { rate: 22050, channels: 2 }));
         assert!(AacConfig::parse(&[0x12, 0x30]).is_err());

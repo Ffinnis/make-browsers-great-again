@@ -1,27 +1,19 @@
 import AppKit
 import Security
 
-/// Brings another browser's cookies into an MBGA profile, so the sites it
-/// was signed in to still know the person. Chromium-based browsers (Arc
-/// too) encrypt them with a password kept in the keychain; macOS asks the
-/// person before MBGA may read it. Cookies MBGA already has are kept.
 @MainActor
 enum SignIns {
     struct Outcome {
         var added = 0
         var kept = 0
-        /// Sites with a cookie brought or already here.
         var sites = 0
         var error: String?
     }
 
-    /// Whether `source` has cookies MBGA can read.
     static func available(_ source: ImportSourceInfo) -> Bool {
         source.kind != .safari && source.error == nil
     }
 
-    /// `profileID` of `source`, as found by the last `detectBrowsers`, into
-    /// MBGA's `profile`.
     static func bring(from source: ImportSourceInfo, profileID: String, into profile: UInt64,
                       store: BrowserStore) async -> Outcome {
         guard available(source) else { return Outcome(error: "\(source.name)'s sign-ins can't be read.") }
@@ -58,8 +50,6 @@ enum SignIns {
         }
     }
 
-    /// "Signed in to 412 sites" ("Arc: signed in to 412 sites" when
-    /// `named`), or why not.
     static func describe(_ outcome: Outcome, from browser: String, named: Bool = false) -> String {
         if let error = outcome.error { return "Couldn't bring \(browser)'s sign-ins: \(error)" }
         if outcome.sites == 0 { return "\(browser) wasn't signed in to any sites." }
@@ -68,30 +58,21 @@ enum SignIns {
         return named ? "\(browser): \(text)" : text.prefix(1).uppercased() + text.dropFirst()
     }
 
-    /// The MBGA profile an imported browser profile most likely became:
-    /// the one named after it (with the browser's name when that was taken).
     static func likelyProfile(for profile: ImportProfileInfo, of source: ImportSourceInfo,
                               among profiles: [ProfileInfo]) -> ProfileInfo? {
         profiles.first { $0.name == profile.name } ?? profiles.first { $0.name == "\(profile.name) (\(source.name))" }
     }
 
-    /// "Arc · Work"; Chromium profiles are already named after their browser.
     static func title(_ profile: ImportProfileInfo, of source: ImportSourceInfo) -> String {
         profile.name.hasPrefix(source.name) ? profile.name : "\(source.name) · \(profile.name)"
     }
-
-    // MARK: Keychain
 
     struct KeychainError: Error {
         let message: String
     }
 
-    /// Keys read in the last two minutes, so bringing a browser's sign-ins
-    /// and then its passwords asks only once.
     private static var browserKeys: [String: Data] = [:]
 
-    /// The password in the keychain item a Chromium-based browser encrypts
-    /// its cookies and passwords with; nil for browsers that have none.
     static func browserKey(_ source: ImportSourceInfo) async -> Result<Data?, KeychainError> {
         guard let service = source.keychainService else { return .success(nil) }
         if let key = browserKeys[service] { return .success(key) }
@@ -106,10 +87,6 @@ enum SignIns {
         return .success(key)
     }
 
-    /// The password in the browser's keychain item. Reading another app's
-    /// item makes macOS ask the person first; this waits for their answer,
-    /// so call it off the main thread.
-    /// MBGA_DEBUG_KEYCHAIN_PASSWORD stands in for it in test copies.
     nonisolated static func keychainPassword(service: String, browser: String) -> Result<Data, KeychainError> {
         if let debug = ProcessInfo.processInfo.environment["MBGA_DEBUG_KEYCHAIN_PASSWORD"] {
             return .success(Data(debug.utf8))
@@ -139,9 +116,6 @@ enum SignIns {
         }
     }
 
-    /// Other keychain items that look like the browser's key, for forks
-    /// that name theirs differently. Reads names only, which needs no
-    /// permission.
     private nonisolated static func similarServices(to service: String, browser: String) -> [String] {
         let query: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,

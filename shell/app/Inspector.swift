@@ -1,10 +1,5 @@
 import AppKit
 
-// The inspector sidebar: MBGA's own developer tools, on the right of the
-// page as the sidebar is on its left. Its panel tabs sit on the window's
-// tint like the sidebar's toolbar; the panel itself is a card beside the
-// page's.
-
 enum InspectorPanelKind: String, CaseIterable {
     case elements, console, network, sources, application, performance
 
@@ -57,12 +52,9 @@ enum InspectorSettings {
         UserDefaults.standard.string(forKey: panelKey).flatMap(InspectorPanelKind.init) ?? .elements
     }
 
-    /// MBGA_DEBUG_INSPECTOR=<panel> opens the inspector on that panel in a
-    /// test copy.
     static let debugPanel = ProcessInfo.processInfo.environment["MBGA_DEBUG_INSPECTOR"].flatMap(InspectorPanelKind.init)
 }
 
-/// The sidebar: panel tabs on the tint above a card holding the panel.
 @MainActor
 final class InspectorView: FlippedView {
     static let headerHeight: CGFloat = 40
@@ -77,7 +69,6 @@ final class InspectorView: FlippedView {
         didSet { if cornerRadius != oldValue { card.cornerRadius = cornerRadius } }
     }
 
-    /// Follows the window's tint, the gradient's stops, along `curve` or at once.
     func setTint(_ stops: [RGB], curve: Motion.Curve?) {
         guard stops != InspectorTheme.tint else { return }
         InspectorTheme.tint = stops
@@ -100,7 +91,6 @@ final class InspectorView: FlippedView {
         }
     }
 
-    /// Test copies' agents select a row of the panel shown (`mbga inspector row N`).
     static let debugRow = Notification.Name("MBGAInspectorDebugRow")
 
     @available(*, unavailable)
@@ -114,7 +104,6 @@ final class InspectorView: FlippedView {
         empty.frame = card.content.bounds
     }
 
-    /// Shows the chosen panel with the visible tab's page.
     func update() {
         header.update()
         guard store.inspectorOpen else {
@@ -142,11 +131,8 @@ final class InspectorView: FlippedView {
         shownPanel = kind
     }
 
-    /// The panel shown, for ⌘F and the like.
     var currentPanel: InspectorPanelView? { shownPanel.flatMap { panels[$0] } }
 
-    /// With the keyboard in the inspector: ⌘F finds in the code being read
-    /// or filters the panel, and ⌘[ ⌘] step through the panels.
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard let window, let responder = window.firstResponder as? NSView, responder.isDescendant(of: self),
               event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command else {
@@ -174,7 +160,6 @@ final class InspectorView: FlippedView {
     }
 }
 
-/// The panel's card: a solid surface with the page card's corners and edge.
 final class InspectorCardView: NSView {
     let content = FlippedView()
     private let shadowLayer = CALayer()
@@ -204,7 +189,6 @@ final class InspectorCardView: NSView {
 
     override var wantsUpdateLayer: Bool { true }
 
-    /// The surface's colour changed with the window's tint.
     func updateSurface(curve: Motion.Curve?) {
         CATransaction.begin()
         if let curve, !Motion.reduced {
@@ -244,7 +228,6 @@ final class InspectorCardView: NSView {
     }
 }
 
-/// The panel tabs and the inspector's own buttons, on the window's tint.
 @MainActor
 final class InspectorHeaderView: WindowDragView {
     private let store: BrowserStore
@@ -280,7 +263,6 @@ final class InspectorHeaderView: WindowDragView {
 
     func update() {
         for (kind, tab) in tabs { tab.selected = kind == store.inspectorPanel }
-        // The console's own count, which follows its messages.
         let model = store.inspectorSession?.model(ConsoleModel.self)
         if model !== console {
             console?.changed.stopObserving(self)
@@ -307,7 +289,6 @@ final class InspectorHeaderView: WindowDragView {
         var x: CGFloat = 0
         let available = bounds.width - buttons - 4
         let full = InspectorPanelKind.allCases.map { tabs[$0]!.fullWidth }.reduce(0, +) + 2 * 5
-        // Titles while they fit; the selected one keeps its title longest.
         let compact = full > available
         for kind in InspectorPanelKind.allCases {
             let tab = tabs[kind]!
@@ -333,7 +314,6 @@ final class InspectorHeaderView: WindowDragView {
     }
 }
 
-/// A panel tab: its symbol, and its title when there's room.
 final class InspectorTabButton: HoverView {
     let kind: InspectorPanelKind
     var selected = false {
@@ -342,7 +322,6 @@ final class InspectorTabButton: HoverView {
     var compact = false {
         didSet { if compact != oldValue { title.isHidden = compact; needsLayout = true } }
     }
-    /// Errors, on the console's tab.
     var badge: Int? {
         didSet {
             guard badge != oldValue else { return }
@@ -411,7 +390,6 @@ final class InspectorTabButton: HoverView {
     }
 }
 
-/// The gap between the page and the inspector, dragged to resize it.
 final class InspectorResizeHandle: NSView {
     var onDrag: ((CGFloat) -> Void)?
 

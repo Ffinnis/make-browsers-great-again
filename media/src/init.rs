@@ -1,8 +1,3 @@
-//! The init segment: reading tracks out of a moov, and writing the moov the
-//! engine gets instead, with VP9 and FLAC sample entries in place of H.264
-//! and AAC. Everything else, edit lists included, is copied as it is, so the
-//! engine lays the converted samples on the same timeline as the originals.
-
 use crate::audio::AacToFlac;
 use crate::avc::AvcConfig;
 use crate::bytes::{boxes, child, err, path, Mp4Box, Reader, Result, Writer};
@@ -10,11 +5,9 @@ use crate::bytes::{boxes, child, err, path, Mp4Box, Reader, Result, Writer};
 pub enum Codec {
     Avc(AvcConfig),
     Aac(Box<AacToFlac>),
-    /// Passed through untouched.
     Other,
 }
 
-/// Sample values a fragment leaves out (trex).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Defaults {
     pub duration: u32,
@@ -27,13 +20,8 @@ pub struct Track {
     pub timescale: u32,
     pub codec: Codec,
     pub defaults: Defaults,
-    /// What the engine takes off presentation times: the media time of the
-    /// edit list's first entry, if it isn't an empty edit.
     pub edit_offset: i64,
-    /// The track header's width and height, for the display aspect.
     header_size: (f64, f64),
-    /// The original sample description, for tracks that pass through and
-    /// for building the converted one.
     entry: Vec<u8>,
     entry_kind: [u8; 4],
 }
@@ -43,7 +31,6 @@ impl Track {
         matches!(self.codec, Codec::Avc(_))
     }
 
-    /// The codec as the engine sees it after conversion, for MIME types.
     pub fn output_codec(&self) -> String {
         match self.codec {
             Codec::Avc(_) => "vp09.00.41.08".into(),
@@ -56,22 +43,15 @@ impl Track {
         matches!(&self.entry_kind, b"avc1" | b"avc3" | b"vp09" | b"av01" | b"hvc1" | b"hev1")
     }
 
-    /// The coded size in the sample entry, for a visual track.
     pub fn size(&self) -> Option<(u16, u16)> {
         let at = self.entry.get(8 + 24..8 + 28)?;
         Some((u16::from_be_bytes([at[0], at[1]]), u16::from_be_bytes([at[2], at[3]])))
     }
 
-    /// The size the engine would show an H.264 track at, worked out as its
-    /// MP4 parser does: the sample entry's size, wider or taller by the
-    /// pasp box's pixel aspect ratio, or else by the track header's aspect.
     pub fn natural(&self) -> Option<(u32, u32)> {
         self.natural_for(self.size()?)
     }
 
-    /// The same for a picture of `(width, height)`, such as a decoded frame
-    /// after the stream's SPS changed its size (avc3): the engine fits the
-    /// decoder's visible size to the container's aspect ratio.
     pub fn natural_for(&self, (width, height): (u16, u16)) -> Option<(u32, u32)> {
         if !self.is_video() {
             return None;
@@ -114,7 +94,6 @@ impl Track {
     }
 }
 
-/// The tracks a moov describes, in order.
 pub fn parse_moov(moov: &[u8]) -> Result<Vec<Track>> {
     let tracks = parse_traks(moov)?;
     if tracks.is_empty() {
@@ -123,12 +102,6 @@ pub fn parse_moov(moov: &[u8]) -> Result<Vec<Track>> {
     Ok(tracks)
 }
 
-/// The tracks of a progressive file worth delivering: video and audio the
-/// engine can play once converted, and Opus and FLAC, which it plays as
-/// they are. Timecode, metadata and text tracks (iPhone movies have them),
-/// and audio that can't be converted (MP3, AC-3), are left out, so the
-/// rest still plays. Video that can't be converted fails the file: playing
-/// its sound alone would pass for a picture that never shows up.
 pub fn parse_progressive(moov: &[u8]) -> Result<Vec<(Track, &[u8])>> {
     let mut out = Vec::new();
     let mut lost_video = false;
@@ -209,20 +182,16 @@ fn track_id(trak: &[u8]) -> Result<u32> {
     r.u32()
 }
 
-/// The track header's width and height (16.16 fixed point).
 fn header_size(trak: &[u8]) -> Result<(f64, f64)> {
     let Some(tkhd) = child(trak, *b"tkhd")? else {
         return Ok((0.0, 0.0));
     };
     let mut r = Reader::new(tkhd);
     let (version, _) = r.full_header()?;
-    // Times, ids, layer and so on, and the matrix.
     r.skip(if version == 1 { 84 } else { 72 })?;
     Ok((f64::from(r.u32()?) / 65536.0, f64::from(r.u32()?) / 65536.0))
 }
 
-/// The media time of the first edit, which the engine takes off every
-/// presentation time (it ignores the rest of an edit list).
 fn edit_offset(trak: &[u8]) -> Result<i64> {
     let Some(elst) = path(trak, &[b"edts", b"elst"])? else {
         return Ok(0);
@@ -284,7 +253,6 @@ fn parse_trak(trak: &[u8]) -> Result<Track> {
         timescale,
         codec,
         defaults: Defaults::default(),
-        // Broken ones only lose what they'd tell.
         edit_offset: edit_offset(trak).unwrap_or(0),
         header_size: header_size(trak).unwrap_or((0.0, 0.0)),
         entry: raw.buf,
@@ -292,11 +260,9 @@ fn parse_trak(trak: &[u8]) -> Result<Track> {
     })
 }
 
-/// The `AudioSpecificConfig` inside an mp4a entry's esds.
 fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
     let mut r = Reader::new(entry);
     r.skip(8)?;
-    // QuickTime sound descriptions grow with their version.
     let extra = match r.u16()? {
         1 => 16,
         2 => 36,
@@ -305,7 +271,6 @@ fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
     let Some(children) = entry.get(28 + extra..) else {
         return err("truncated mp4a");
     };
-    // QuickTime puts it inside a wave box.
     let esds = match child(children, *b"esds")? {
         Some(esds) => Some(esds),
         None => child(children, *b"wave")?.map(|wave| child(wave, *b"esds")).transpose()?.flatten(),
@@ -326,7 +291,6 @@ fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
             }
         }
         match tag {
-            // ES_Descriptor: ID, then flags saying which optional fields follow.
             3 => {
                 r.u16()?;
                 let flags = r.u8()?;
@@ -341,7 +305,6 @@ fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
                     r.u16()?;
                 }
             }
-            // DecoderConfigDescriptor: only MPEG-4 and MPEG-2 AAC convert.
             4 => {
                 let object = r.u8()?;
                 if !matches!(object, 0x40 | 0x66..=0x68) {
@@ -356,10 +319,6 @@ fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
     err("esds without AudioSpecificConfig")
 }
 
-/// The moov the engine gets, with the traks of `tracks` only. A progressive
-/// file's moov also loses its sample tables and gains an mvex, since its
-/// samples arrive as fragments. `size` gives a video track's coded size
-/// once the encoder's differs from the input's.
 pub fn write_moov(
     moov: &[u8],
     tracks: &[&Track],
@@ -413,9 +372,6 @@ pub fn write_moov(
     Ok(w.buf)
 }
 
-/// Copies a container box, letting `f` write any child itself (returning
-/// true) or have it descended into (false). trak, mdia, minf, stbl is as
-/// deep as a moov goes; boxes nested deeper than that are broken input.
 fn rewrite(
     w: &mut Writer,
     b: &Mp4Box<'_>,
@@ -457,8 +413,6 @@ fn is_sample_table(kind: [u8; 4]) -> bool {
     )
 }
 
-/// Sample tables for a track whose samples all live in fragments. Boxes
-/// other than the required ones are dropped: their entries would be wrong.
 fn write_empty_table(w: &mut Writer, kind: [u8; 4]) {
     match &kind {
         b"stts" | b"stsc" | b"stco" | b"co64" => {
@@ -505,10 +459,6 @@ fn write_stsd(w: &mut Writer, track: &Track, size: Option<(u16, u16)>) -> Result
     Ok(())
 }
 
-/// A vp09 entry with the avc1's pixel aspect, and its colour description if
-/// it had one, and its size unless the encoder scaled the frames. The track
-/// header keeps the input's size, which is what the page sees as the
-/// video's size either way.
 fn write_vp09(w: &mut Writer, avc1: &[u8], size: Option<(u16, u16)>) -> Result<()> {
     let Some(header) = avc1.get(..78) else {
         return err("truncated avc1");
@@ -524,7 +474,6 @@ fn write_vp09(w: &mut Writer, avc1: &[u8], size: Option<(u16, u16)>) -> Result<(
         }
         None => w.bytes(header),
     }
-    // Unspecified, unless colr says otherwise.
     let (mut primaries, mut transfer, mut matrix, mut full) = (2u8, 2u8, 2u8, 0u8);
     for c in &children {
         if &c.kind == b"colr" && c.body.get(..4) == Some(b"nclx") {
@@ -536,7 +485,6 @@ fn write_vp09(w: &mut Writer, avc1: &[u8], size: Option<(u16, u16)>) -> Result<(
         }
     }
     w.begin_full(*b"vpcC", 1, 0);
-    // Profile 0, level 4.1, 8-bit 4:2:0 (colocated), matching vp09.00.41.08.
     w.u8(0);
     w.u8(41);
     w.u8(8 << 4 | 1 << 1 | full);
@@ -554,8 +502,6 @@ fn write_vp09(w: &mut Writer, avc1: &[u8], size: Option<(u16, u16)>) -> Result<(
     Ok(())
 }
 
-/// The MIME type the converted init needs, such as
-/// `video/mp4; codecs="vp09.00.41.08,flac"`.
 pub fn mime(tracks: &[Track]) -> String {
     let kind = if tracks.iter().any(Track::visual) { "video" } else { "audio" };
     let codecs: Vec<String> = tracks.iter().map(Track::output_codec).collect();

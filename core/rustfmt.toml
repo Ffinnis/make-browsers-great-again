@@ -1,5 +1,3 @@
-# Matches the width the code was written to. Stable options only, so plain
-# `cargo fmt` from any toolchain gives the same result.
 edition = "2021"
 max_width = 120
 use_small_heuristics = "Max"

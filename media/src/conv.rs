@@ -1,18 +1,3 @@
-//! One converter per `SourceBuffer`: takes the bytes the page appends, and
-//! gives back init segments and fragments the engine can play.
-//!
-//! Video needs the engine's codecs, so a fragment with H.264 in it becomes a
-//! job: its samples as Annex-B, which the worker feeds to a `VideoDecoder`
-//! that carries on from one job to the next. Every frame the decoder puts
-//! out is encoded to VP9 and its chunk handed back here, and `write` puts
-//! the chunks so far into fragments. A decoder holds its last few frames
-//! until more input pushes them out, so a fragment's last frames can come
-//! out in a later append's output: then they go in `held`, which the page
-//! appends with the settings of the append they came from.
-//!
-//! Audio and other tracks are converted here and wait in the job for the
-//! video, so fragments come out whole and in order.
-
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
 
@@ -21,12 +6,9 @@ use crate::frag::{self, OutSample, OutTrack, Run, Sample, NOT_SYNC, SYNC};
 use crate::init::{self, Codec, Track};
 use crate::progressive::{self, Cuts, FileSample, Scan};
 
-/// How many frames back, and how many bytes, a GOP is kept for replaying.
-/// Streams whose keyframes aren't IDR pictures would otherwise keep all.
 const MAX_GOP: usize = 1200;
 const MAX_GOP_BYTES: usize = 32 << 20;
 
-/// Changes whenever `save_state`'s layout does.
 const STATE_VERSION: u32 = 2;
 
 fn put_opt(w: &mut Writer, v: Option<i64>) {
@@ -40,68 +22,40 @@ fn get_opt(r: &mut Reader<'_>) -> Result<Option<i64>> {
     Ok(some.then_some(v))
 }
 
-/// The most input that may wait to be converted: a fragment, or the part of
-/// a progressive file between its earliest and latest unconverted samples.
 pub const MAX_INPUT: usize = 192 << 20;
 
-/// Frames waiting for their chunks, per track. The decoder puts out every
-/// frame it will in a run or two, so more than this means frames it
-/// dropped.
 const MAX_FRAMES: usize = 1 << 16;
 
-/// Flags of a job sample: an IDR picture, where decoding can start.
 pub const KEY: u32 = 1;
-/// Decode only: the decoder restarted midway through a GOP (after a flush),
-/// so the GOP so far is decoded again, and its pictures were already
-/// encoded.
 pub const DECODE_ONLY: u32 = 2;
-/// Flush the decoder after this job, so all its frames come out now: the
-/// next fragment starts at a keyframe (or, for MSE segments, every one so
-/// far has), so nothing is lost by starting over.
 pub const FLUSH: u32 = 4;
-/// No data: only flush the decoder, so the frames of a stream that a new,
-/// different init replaces all come out, and are written, before it does.
 pub const FINISH: u32 = 8;
 
-/// While looking for a progressive file's moov, a box this much bigger than
-/// the bytes so far is skipped: the worker asks for the bytes after it.
 const SKIP_BOX: u64 = 1 << 20;
 
-/// A sample for the worker to decode, laid out for reading from JS.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct JobSample {
     pub track: u32,
     pub flags: u32,
-    /// Annex-B bytes, as an offset into the job's data.
     pub offset: u32,
     pub len: u32,
-    /// Microseconds; frames come back from the codecs with the same value.
     pub timestamp: f64,
     pub duration: f64,
-    /// `profile_idc`, constraint flags and `level_idc`, for "avc1.PPCCLL".
     pub codec: u32,
-    /// The input's bits per second so far.
     pub bitrate: u32,
 }
 
-/// What `frame` says to do with a decoded frame.
 pub const DROP: u32 = 0;
 pub const ENCODE: u32 = 1;
-/// Encode it as a keyframe: it's an IDR picture of the input.
 pub const ENCODE_KEY: u32 = 2;
 
-/// Frames of one earlier append in `held`, laid out for reading from JS.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HeldGroup {
-    /// The append (`begin`'s `seq`) whose input held these frames.
     pub seq: f64,
-    /// Their presentation times in seconds, on the stream's own timeline
-    /// (after the edit list, before the page's `timestampOffset`).
     pub start: f64,
     pub end: f64,
-    /// Their bytes in `held`.
     pub offset: u32,
     pub len: u32,
 }
@@ -110,17 +64,13 @@ pub struct HeldGroup {
 pub struct Job {
     pub samples: Vec<JobSample>,
     pub data: Vec<u8>,
-    /// Converted tracks that go out with the video.
     parts: Vec<OutTrack>,
 }
 
-/// Input bytes not converted yet. Consumed from the front with a cursor;
-/// what's left moves to the front only when there's room to make.
 #[derive(Default)]
 pub struct Input {
     buf: Vec<u8>,
     start: usize,
-    /// More than `MAX_INPUT` arrived, and some was dropped.
     overflow: bool,
 }
 
@@ -152,8 +102,6 @@ impl Input {
         }
     }
 
-    /// Room for `n` more bytes at the end: the buffer to write them into
-    /// (its spare capacity), or None past `MAX_INPUT`.
     pub fn room(&mut self, n: usize) -> Option<&mut Vec<u8>> {
         if self.len().checked_add(n).is_none_or(|total| total > MAX_INPUT) {
             self.overflow = true;
@@ -167,19 +115,15 @@ impl Input {
         Some(&mut self.buf)
     }
 
-    /// The buffer `room` handed out, to account for what was written.
     pub fn buffer(&mut self) -> &mut Vec<u8> {
         &mut self.buf
     }
 }
 
-/// The GOP so far, to replay into a decoder that restarted midway.
 #[derive(Default)]
 struct Gop {
-    /// Presentation time, duration and bytes in `data` of each sample.
     samples: Vec<(i64, u32, Range<usize>)>,
     data: Vec<u8>,
-    /// Its start is missing, or it grew past the limits.
     lost: bool,
 }
 
@@ -214,43 +158,27 @@ impl Gop {
 
 struct Stream {
     track: Track,
-    /// Where a traf without tfdt continues.
     next_dts: i64,
-    /// Where the last video fragment ended, to tell whether the next one
-    /// continues it.
     end_dts: Option<i64>,
     gop: Gop,
-    /// The worker's decoder restarted (or never started): the next job
-    /// starts at a keyframe, or replays the GOP.
     needs_key: bool,
-    /// Every fragment so far that continued the one before started with a
-    /// keyframe, so the decoder may as well be flushed after each.
     aligned: bool,
-    /// Counts the times decoding started over. Frames of an earlier run
-    /// still in the decoder come out before any of a later one.
     run: u64,
-    /// The latest presentation time of a frame handed out on this timeline.
     last_pts: Option<i64>,
     bytes: u64,
     ticks: u64,
 }
 
-/// A frame in a job whose chunk hasn't come back yet.
 struct Frame {
     pts: i64,
-    /// Grows to cover frames after it left out to cap the frame rate.
     duration: u32,
-    /// The append whose input held the frame, and the page's number for it.
     epoch: u32,
     seq: f64,
     run: u64,
-    /// An IDR picture: encoded as a keyframe.
     key: bool,
-    /// The decoded picture's visible size, (0, 0) if unknown.
     visible: (u16, u16),
 }
 
-/// An encoded frame waiting to be written.
 struct Chunk {
     pts: i64,
     duration: u32,
@@ -262,36 +190,18 @@ struct Chunk {
     data: Vec<u8>,
 }
 
-/// A converted video track's frames between the job and the output.
 #[derive(Default)]
 struct VideoOut {
-    /// Frames not decoded yet, by run and microsecond timestamp: the same
-    /// timestamps come again when a page appends a fragment once more, and
-    /// the decoder puts out an earlier run's frames first.
     frames: BTreeMap<(u64, i64), Frame>,
-    /// Frames being encoded, in the order they went to the encoder, with
-    /// their microsecond timestamps.
     encoding: VecDeque<(i64, Frame)>,
-    /// Encoded frames in the order they were decoded, which is
-    /// presentation order within a run.
     ready: Vec<Chunk>,
-    /// The append that last wrote frames to the output (not `held`).
     main_epoch: u32,
-    /// The coded size in the converted init, if the encoder's differs from
-    /// the input's.
     size: Option<(u16, u16)>,
-    /// The run and presentation time of the last frame sent to the encoder,
-    /// which a frame left out to cap the frame rate extends.
     last_kept: Option<(u64, i64)>,
-    /// The display size of the last frame written, as the engine would
-    /// show the input.
     natural: Option<(u32, u32)>,
 }
 
 impl VideoOut {
-    /// Whether a run's frames waiting have a gap in presentation order: a
-    /// fragment that ends mid-GOP can end on a frame whose B-frames come in
-    /// the next one.
     fn has_hole(&self, run: u64) -> bool {
         let mut frames: Vec<(i64, u32)> =
             self.frames.values().filter(|f| f.run == run).map(|f| (f.pts, f.duration)).collect();
@@ -302,9 +212,6 @@ impl VideoOut {
         })
     }
 
-    /// Makes the frame last sent to the encoder last until `f` ends, so
-    /// `f` can be left out. False if there's no such frame of `f`'s run
-    /// left to change: then `f` has to be encoded.
     fn stretch(&mut self, f: &Frame) -> bool {
         let Some((run, pts)) = self.last_kept.filter(|&(run, pts)| run == f.run && pts < f.pts) else {
             return false;
@@ -324,8 +231,6 @@ impl VideoOut {
         false
     }
 
-    /// Frames that will never come back: those of a run when frames of a
-    /// later one are still waiting, past the limit.
     fn trim(&mut self) {
         if self.frames.len() > MAX_FRAMES {
             let last = self.frames.values().map(|f| f.run).max().unwrap_or(0);
@@ -334,26 +239,20 @@ impl VideoOut {
     }
 }
 
-/// A progressive file's samples of one stream.
 struct Table {
     samples: Vec<FileSample>,
-    /// The lowest offset of each sample and all after it.
     keep: Vec<u64>,
-    /// How many went out.
     done: usize,
 }
 
 struct Progressive {
     tables: Vec<Table>,
     cuts: Cuts,
-    /// Where the fragment being gathered ends, once planned, and where the
-    /// last one ended.
     cut: Option<f64>,
     last_cut: f64,
 }
 
 impl Progressive {
-    /// A file that's all out, or broken: no more input is read.
     fn closed() -> Self {
         Progressive { tables: Vec::new(), cuts: Cuts::new(None, 0.0), cut: None, last_cut: 0.0 }
     }
@@ -368,66 +267,37 @@ pub struct Converter {
     progressive: bool,
     pub input: Input,
     streams: Vec<Stream>,
-    /// The input moov's body, to write the converted init from again when
-    /// the encoder's size changes.
     moov: Vec<u8>,
-    /// Whether the converted moov is a progressive file's.
     moov_progressive: bool,
     sequence: u32,
     job: Option<Job>,
     prog: Option<Progressive>,
     video: HashMap<u32, VideoOut>,
-    /// Counts appends (and drains), so frames know which they came in, and
-    /// the page's number for the current one.
     epoch: u32,
     seq: f64,
-    /// What the worker takes after each append: the output, and frames of
-    /// earlier appends to append before it, a group per append.
     pub output: Vec<u8>,
     pub held: Vec<u8>,
     pub held_groups: Vec<HeldGroup>,
-    /// Converted inits written to `output` or `held` since they were taken.
     pub inits_out: u32,
-    /// What a fresh converter needs to carry on from this one (`save_state`).
     pub state: Vec<u8>,
-    /// Where the worker puts an encoded chunk for `chunk`.
     pub chunk_buffer: Vec<u8>,
     pub error: String,
-    /// The converted init's MIME type, once there is one.
     pub mime: String,
-    /// The last input init segment, kept so a fresh converter can be primed
-    /// with it, and a counter that changes whenever it does.
     pub init: Vec<u8>,
     pub init_generation: u32,
     ftyp: Vec<u8>,
-    /// The converted init last written, ftyp and moov, and whether the
-    /// output needs it again: after `reset`, the page may have dropped the
-    /// append that had it.
     out_ftyp: Vec<u8>,
     out_init: Vec<u8>,
     reinit: bool,
-    /// Which of `held` and `output` got the init again in this append.
     reinit_done: [bool; 2],
-    /// The input ftyp, which goes out with the next converted init.
     pending_ftyp: Option<Vec<u8>>,
-    /// A finishing job ran for the changed init of this size at the front
-    /// of the input.
     finishing: Option<usize>,
-    /// The presentation time range of the media in `output`, in seconds on
-    /// the stream's own timeline.
     pub output_range: Option<(f64, f64)>,
-    /// The latest display size change written to `output` or `held`.
     pub natural_out: Option<Natural>,
     seek: Seek,
-    /// The offset asked for in this reply.
     pub need: Option<u64>,
 }
 
-/// Where a progressive file's input is: the file offset of its first byte,
-/// where to start (seconds), and the offset the next append has to start
-/// at, once asked for (`need`). Appends that say where they start
-/// (`offsets`) are taken only from there; without, input runs on and bytes
-/// before `skip_to` are dropped as they come.
 #[derive(Default)]
 struct Seek {
     base: u64,
@@ -437,25 +307,17 @@ struct Seek {
     skip_to: u64,
 }
 
-/// A change of the video's display size, for the worker to pass on.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Natural {
     pub width: u32,
     pub height: u32,
-    /// Where the first frame at this size is shown, in seconds on the
-    /// stream's own timeline; None for the first, which comes with the
-    /// first converted init, before any frame, and applies at once.
     pub at: Option<f64>,
-    /// The append that frame came in.
     pub seq: f64,
 }
 
-/// What `poll` found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Poll {
-    /// Everything complete so far is in `output`.
     Idle,
-    /// A job waits for its video.
     Job,
 }
 
@@ -464,8 +326,6 @@ impl Converter {
         Converter { progressive, ..Self::default() }
     }
 
-    /// Starts an append (or a drain): what comes out from here on belongs to
-    /// it, and frames of earlier ones go in `held`.
     pub fn begin(&mut self, seq: f64) {
         if self.reinit_done.iter().any(|&d| d) {
             self.reinit = false;
@@ -475,17 +335,13 @@ impl Converter {
         self.seq = seq;
     }
 
-    /// Whether input is still read: a progressive file that's all out has
-    /// only trailing boxes left.
     pub fn wants_input(&self) -> bool {
         self.prog.as_ref().is_none_or(|p| !p.finished())
     }
 
-    /// Takes the output, `held` and its groups, once JS has copied them.
     pub fn clear_output(&mut self) {
         for buf in [&mut self.output, &mut self.held] {
             buf.clear();
-            // A big append's output needn't stay allocated.
             if buf.capacity() > 16 << 20 {
                 *buf = Vec::new();
             }
@@ -497,10 +353,7 @@ impl Converter {
         self.need = None;
     }
 
-    /// Drops the output of an append that failed: the page never gets it,
-    /// so the converted init in it, if any, comes again before the next.
     pub fn discard_output(&mut self) {
-        // What was asked for still is.
         let need = self.seek.awaiting;
         self.clear_output();
         self.need = need;
@@ -511,31 +364,21 @@ impl Converter {
         self.forget_natural();
     }
 
-    /// The page may not have got the display size: it goes out again with
-    /// the next frame written.
     fn forget_natural(&mut self) {
         for v in self.video.values_mut() {
             v.natural = None;
         }
     }
 
-    /// Where a progressive file should start playing, in seconds on its
-    /// own timeline: samples before the keyframe at or before it are left
-    /// out. Before its moov is read.
     pub fn set_start(&mut self, seconds: f64) {
         if seconds.is_finite() && seconds > 0.0 {
             self.seek.start = seconds;
         }
     }
 
-    /// The next append of a progressive file starts at byte `offset` of
-    /// it. Whether to take it: only where the input left off, or where
-    /// `need` asked for; appends sent before the page heard of `need` are
-    /// dropped.
     pub fn offset(&mut self, offset: u64) -> bool {
         self.seek.offsets = true;
         if !self.wants_input() || !self.progressive {
-            // All out, or a fragmented file: nothing to seek in.
             return true;
         }
         let want = self.seek.awaiting.unwrap_or(self.seek.base + self.input.len() as u64);
@@ -549,8 +392,6 @@ impl Converter {
         true
     }
 
-    /// Asks for the file's bytes from `offset` on: everything before them
-    /// is done with.
     fn request(&mut self, offset: u64) {
         let have = self.seek.base + self.input.len() as u64;
         if (self.seek.base..=have).contains(&offset) {
@@ -566,16 +407,12 @@ impl Converter {
             }
             self.input.clear();
         } else if offset > have {
-            // Input that doesn't say where it starts runs on from here.
             self.seek.skip_to = offset;
             self.input.clear();
             self.seek.base = have;
         }
     }
 
-    /// The first video track's display size, as the engine would show the
-    /// input: its sample entry's size, stretched by its pixel aspect ratio,
-    /// or else to its track header's aspect.
     pub fn natural(&self) -> Option<(u32, u32)> {
         self.streams.iter().find(|s| s.track.is_video()).and_then(|s| s.track.natural())
     }
@@ -590,21 +427,17 @@ impl Converter {
         }
     }
 
-    /// Accounts for `len` bytes written past the end of the input, or
-    /// forgets them if they aren't wanted.
     pub fn committed(&mut self, len: usize) {
         if !self.wants_input() {
             let buf = self.input.buffer();
             buf.truncate(buf.len().saturating_sub(len));
         } else if self.seek.skip_to > self.seek.base {
-            // Bytes before the ones asked for, not kept.
             let n = (self.seek.skip_to - self.seek.base).min(self.input.len() as u64);
             self.input.consume(n as usize);
             self.seek.base += n;
         }
     }
 
-    /// Converts what's complete, up to the next job.
     pub fn poll(&mut self) -> Result<Poll> {
         if self.job.is_some() {
             return Ok(Poll::Job);
@@ -620,7 +453,6 @@ impl Converter {
         }
         let r = self.poll_progressive();
         if r.is_err() {
-            // A broken file stays broken; stop reading it.
             self.input.clear();
             self.prog = Some(Progressive::closed());
         }
@@ -631,9 +463,6 @@ impl Converter {
         self.job.as_ref()
     }
 
-    /// An encoded chunk for a frame of some job, with the frame's timestamp
-    /// and the coded size. Chunks of frames no job has, or that came too
-    /// late to be written in order, are dropped.
     pub fn chunk(&mut self, track: u32, timestamp: f64, key: bool, size: (u16, u16), data: Vec<u8>) -> Result<()> {
         if !timestamp.is_finite() {
             return err("chunk without a timestamp");
@@ -641,7 +470,6 @@ impl Converter {
         let Some(v) = self.video.get_mut(&track) else {
             return Ok(());
         };
-        // The encoder puts chunks out in the order it got the frames.
         let ts = timestamp.round() as i64;
         let Some(f) = v.encoding.iter().position(|(t, _)| *t == ts).and_then(|i| v.encoding.remove(i)).map(|(_, f)| f)
         else {
@@ -660,16 +488,6 @@ impl Converter {
         Ok(())
     }
 
-    /// The decoder put out the frame with `timestamp`: whether to encode
-    /// it (`ENCODE`, or `ENCODE_KEY` at an IDR picture) or `DROP` it.
-    /// Frames no job has, and frames that would go back in time (the
-    /// decoder puts frames out in presentation order within a run, unless
-    /// the input's timestamps are wrong), are dropped, so that what the
-    /// encoder gets is exactly what's written. `skip` asks to leave the
-    /// frame out to cap the frame rate: then the frame before it lasts
-    /// until the next, unless it's a keyframe or there's no frame before it
-    /// to stretch, and then it's encoded after all. `visible` is the
-    /// decoded picture's visible size, which the display size follows.
     pub fn frame(&mut self, track: u32, timestamp: f64, skip: bool, visible: (u16, u16)) -> u32 {
         let Some(v) = self.video.get_mut(&track) else {
             return DROP;
@@ -678,7 +496,6 @@ impl Converter {
             return DROP;
         }
         let ts = timestamp.round() as i64;
-        // The oldest run with a frame at this time: runs are few.
         let mut found = None;
         let mut next = v.frames.keys().next().map(|k| k.0);
         while let Some(run) = next {
@@ -692,7 +509,6 @@ impl Converter {
             return DROP;
         };
         f.visible = visible;
-        // The run's earlier frames, and earlier runs, have all come out.
         v.frames = v.frames.split_off(&(f.run, ts));
         if skip && !f.key && v.stretch(&f) {
             return DROP;
@@ -710,8 +526,6 @@ impl Converter {
         }
     }
 
-    /// The worker flushed `track`'s decoder and every chunk is in: frames
-    /// that didn't come out never will, and the next job starts over.
     pub fn flushed(&mut self, track: u32) {
         for s in self.streams.iter_mut().filter(|s| s.track.id == track) {
             s.needs_key = true;
@@ -723,8 +537,6 @@ impl Converter {
         }
     }
 
-    /// The worker lost its codecs (an error, or the engine reclaimed them):
-    /// frames in flight are gone, and the job too.
     pub fn restart(&mut self) {
         self.job = None;
         for s in &mut self.streams {
@@ -738,15 +550,11 @@ impl Converter {
         }
     }
 
-    /// Ends the current job, if any, and writes its fragment with every
-    /// chunk so far.
     pub fn write(&mut self) -> Result<()> {
         let parts = self.job.take().map(|j| j.parts).unwrap_or_default();
         self.write_parts(parts)
     }
 
-    /// The page aborted: drop partial input and decoding state, keep the
-    /// init, and send it again before the next output.
     pub fn reset(&mut self) {
         self.input.clear();
         self.input.overflow = false;
@@ -772,12 +580,6 @@ impl Converter {
         self.forget_natural();
     }
 
-    /// Whether a fresh converter primed with `init` and given this one's
-    /// `save_state` would carry on the same: nothing waits in this one
-    /// (no input, no frames in the codecs), and the state that matters fits
-    /// in `save_state`. An AAC decoder carries the overlap of its last
-    /// frame, which can't be moved, so streams with AAC are recycled only
-    /// before their first frame or right after a reset.
     pub fn recyclable(&self) -> bool {
         !self.progressive
             && self.prog.is_none()
@@ -791,9 +593,6 @@ impl Converter {
             })
     }
 
-    /// Writes what a fresh converter needs to carry on from this one into
-    /// `state`: where each stream is, the GOP it may replay, and the
-    /// counters that order frames and fragments.
     pub fn save_state(&mut self) {
         let mut w = Writer::new();
         w.u32(STATE_VERSION);
@@ -834,8 +633,6 @@ impl Converter {
         self.state = w.buf;
     }
 
-    /// Takes over a converter's `save_state`, after the same init primed
-    /// this one. Fails, changing nothing, if they don't match.
     pub fn load_state(&mut self, state: &[u8]) -> Result<()> {
         let mut r = Reader::new(state);
         if r.u32()? != STATE_VERSION {
@@ -920,8 +717,6 @@ impl Converter {
         self.error.clone_from(&e.0);
     }
 
-    /// Adds to `held` or the output, with the converted init first if the
-    /// page may have lost it.
     fn emit(&mut self, held: bool, bytes: &[u8], is_init: bool) {
         let i = usize::from(held);
         let buf = if held { &mut self.held } else { &mut self.output };
@@ -954,8 +749,6 @@ impl Converter {
         }
     }
 
-    /// A track's presentation times in some samples, in seconds on the
-    /// stream's own timeline (after the edit list, as the engine reads it).
     fn seconds(&self, id: u32, ticks: i64) -> f64 {
         let (timescale, edit) =
             self.streams.iter().find(|s| s.track.id == id).map_or((1, 0), |s| (s.track.timescale, s.track.edit_offset));
@@ -974,9 +767,6 @@ impl Converter {
         (start <= end).then(|| (self.seconds(t.id, start), self.seconds(t.id, end)))
     }
 
-    /// Writes the converted init again from the input moov, with the coded
-    /// sizes the encoder uses now. The first one says what size the video
-    /// is, at once: the page reads it as soon as the init is in.
     fn write_init(&mut self, held: bool) -> Result<()> {
         if let Some(ftyp) = self.pending_ftyp.take() {
             self.emit(held, &ftyp, true);
@@ -988,7 +778,6 @@ impl Converter {
         self.out_init.clone_from(&self.out_ftyp);
         self.out_init.extend_from_slice(&moov);
         self.emit(held, &moov, true);
-        // None since the first init, or since the page may have lost it.
         if self.video.values().all(|v| v.natural.is_none()) {
             let first = self.streams.iter().find(|s| s.track.is_video()).map(|s| (s.track.id, s.track.natural()));
             if let Some((id, Some((width, height)))) = first {
@@ -999,7 +788,6 @@ impl Converter {
         Ok(())
     }
 
-    /// Writes every video chunk so far, and `parts` with the first fragment.
     fn write_parts(&mut self, mut parts: Vec<OutTrack>) -> Result<()> {
         let mut ids: Vec<u32> = self.video.keys().copied().collect();
         ids.sort_unstable();
@@ -1008,15 +796,12 @@ impl Converter {
                 continue;
             };
             let mut ready = std::mem::take(&mut v.ready);
-            // Frames of earlier appends go in `held`, up to the first of
-            // this one's: after that, frames have to follow it.
             let held =
                 if v.main_epoch == self.epoch { 0 } else { ready.iter().take_while(|c| c.epoch != self.epoch).count() };
             if held < ready.len() {
                 v.main_epoch = self.epoch;
             }
             let main = ready.split_off(held);
-            // A group per earlier append, in the order they came.
             let mut rest = ready;
             while let Some(first) = rest.first() {
                 let epoch = first.epoch;
@@ -1031,8 +816,6 @@ impl Converter {
         Ok(())
     }
 
-    /// Writes chunks of one earlier append to `held`, as a group of their
-    /// own with that append's number and their time range.
     fn write_held(&mut self, id: u32, chunks: Vec<Chunk>) -> Result<()> {
         let Some(first) = chunks.first() else {
             return Ok(());
@@ -1048,7 +831,6 @@ impl Converter {
             return Ok(());
         }
         match self.held_groups.last_mut() {
-            // The same append's frames once more, right after: one group.
             Some(g) if g.seq.to_bits() == seq.to_bits() && g.offset as usize + g.len as usize == at => {
                 g.len += len as u32;
                 g.start = g.start.min(start);
@@ -1059,16 +841,11 @@ impl Converter {
         Ok(())
     }
 
-    /// Writes one track's chunks as fragments: a new one wherever the
-    /// timeline jumps, and a new init first where a keyframe has another
-    /// size. The first fragment takes `parts` along.
     fn write_video(&mut self, id: u32, chunks: Vec<Chunk>, held: bool, parts: &mut Vec<OutTrack>) -> Result<()> {
         let source = self.streams.iter().find(|s| s.track.id == id).and_then(|s| s.track.size());
         let mut current = self.video.get(&id).and_then(|v| v.size).or(source);
         let mut run: Vec<(i64, OutSample)> = Vec::new();
         for c in chunks {
-            // Decode times can't be negative; the engine would cut these
-            // frames off the timeline anyway.
             if c.pts < 0 {
                 continue;
             }
@@ -1085,9 +862,6 @@ impl Converter {
                 if gap == 0 {
                     continue;
                 }
-                // VP9 has no reordering, so each frame is decoded at its
-                // presentation time and lasts until the next one, unless the
-                // timeline jumps there.
                 if gap > 0 && gap <= i64::from(last.duration.max(1)) * 4 {
                     last.duration = u32::try_from(gap).unwrap_or(u32::MAX);
                 } else {
@@ -1102,15 +876,12 @@ impl Converter {
         Ok(())
     }
 
-    /// Notes where the display size changes: the first frame written at
-    /// another one.
     fn note_natural(&mut self, id: u32, c: &Chunk, source: Option<(u16, u16)>) {
         let visible = if c.visible.0 > 0 && c.visible.1 > 0 { Some(c.visible) } else { source };
         let natural = visible.and_then(|size| self.streams.iter().find(|s| s.track.id == id)?.track.natural_for(size));
         let Some((width, height)) = natural else {
             return;
         };
-        // The first since the page may have lost the last applies at once.
         let again = self.video.values().all(|v| v.natural.is_none());
         let at = (!again).then(|| self.seconds(id, c.pts));
         let Some(v) = self.video.get_mut(&id) else {
@@ -1140,7 +911,6 @@ impl Converter {
                 Ok(Some(extent)) => extent,
                 Ok(None) => return Ok(Poll::Idle),
                 Err(e) => {
-                    // Lost sync with the box structure; nothing after it can be read.
                     self.input.clear();
                     return Err(e);
                 }
@@ -1154,7 +924,6 @@ impl Converter {
             }
             let kind: [u8; 4] = [data[4], data[5], data[6], data[7]];
             if &kind == b"moof" {
-                // The moof's mdat has to be here too.
                 let rest = &data[size..];
                 let Some((mdat_size, _)) = box_extent(rest)? else {
                     return Ok(Poll::Idle);
@@ -1181,9 +950,6 @@ impl Converter {
                 continue;
             }
             if &kind == b"moov" {
-                // A different init replaces the streams: the frames the
-                // decoder still holds of the old ones come out first, to be
-                // written with what they came with.
                 let changed = self.streams.is_empty() || data.get(header..size) != Some(&self.moov[..]);
                 if changed && self.finishing != Some(size) {
                     if let Some(job) = self.finish_job() {
@@ -1198,23 +964,17 @@ impl Converter {
             let bytes = data[..size].to_vec();
             self.input.consume(size);
             match &kind {
-                // It goes out with the converted moov, after any frames of
-                // the init before.
                 b"ftyp" => {
                     self.pending_ftyp = Some(bytes.clone());
                     self.out_ftyp.clone_from(&bytes);
                     self.ftyp = bytes;
                 }
                 b"moov" => self.open_init(&bytes, header)?,
-                // styp, sidx, emsg, prft, free and the like mean nothing to
-                // the engine, and a stray mdat has nothing pointing into it.
                 _ => {}
             }
         }
     }
 
-    /// A job that only flushes the decoders of video tracks with frames in
-    /// them, if any have.
     fn finish_job(&self) -> Option<Job> {
         let mut job = Job::default();
         for s in &self.streams {
@@ -1241,12 +1001,7 @@ impl Converter {
         let body = &moov[header..];
         let tracks = init::parse_moov(body)?;
         let mime = init::mime(&tracks);
-        // Players append the same init again at every discontinuity or
-        // quality switch; the tracks carry on through an identical one.
         if body != self.moov || self.streams.is_empty() {
-            // Frames encoded for the old one go out with its timescale and
-            // sizes. Runs go on counting, so that frames of the old streams
-            // a decoder still puts out are told apart from the new ones'.
             self.write_parts(Vec::new())?;
             let run = self.streams.iter().map(|s| s.run).max().unwrap_or(0);
             for t in tracks.iter().filter(|t| t.is_video()) {
@@ -1274,7 +1029,6 @@ impl Converter {
         Ok(())
     }
 
-    /// Converts one moof+mdat. Returns true if it became a job.
     fn fragment(&mut self, unit: &[u8]) -> Result<bool> {
         if self.streams.is_empty() {
             return err("media segment before an init segment");
@@ -1284,8 +1038,6 @@ impl Converter {
         self.convert_runs(runs, unit, &[])
     }
 
-    /// `next_key` says, for tracks where it's known, whether the fragment
-    /// after this one starts with a keyframe.
     fn convert_runs(&mut self, runs: Vec<Run>, data: &[u8], next_key: &[(u32, bool)]) -> Result<bool> {
         let mut job = Job::default();
         let (epoch, seq) = (self.epoch, self.seq);
@@ -1319,14 +1071,11 @@ impl Converter {
                 if self.input.len() >= MAX_INPUT {
                     return err("no moov in the file's first 192 MB");
                 }
-                // A fragmented file, as X serves its fallback MP4s, reads
-                // like MSE segments.
                 return if self.progressive { Ok(Poll::Idle) } else { self.poll_fragmented() };
             }
             let Some(prog) = self.prog.as_mut() else {
                 return Ok(Poll::Idle);
             };
-            // Waiting for the bytes `need` asked for.
             if prog.finished() || self.seek.awaiting.is_some() {
                 return Ok(Poll::Idle);
             }
@@ -1334,8 +1083,6 @@ impl Converter {
             let cut = if let Some(cut) = prog.cut {
                 cut
             } else {
-                // From the first sample still to go out, so spans
-                // without samples are skipped, not cut up.
                 let first = self
                     .streams
                     .iter()
@@ -1346,7 +1093,6 @@ impl Converter {
                 prog.cut = Some(cut);
                 cut
             };
-            // Each stream's samples up to the cut, if all their bytes are here.
             let mut picks = Vec::new();
             for (stream, t) in self.streams.iter().zip(&prog.tables) {
                 let timescale = f64::from(stream.track.timescale);
@@ -1376,7 +1122,6 @@ impl Converter {
             }
             prog.cut = None;
             prog.last_cut = cut;
-            // Bytes before every remaining sample aren't needed again.
             let keep_from = prog.tables.iter().filter_map(|t| t.keep.get(t.done).copied()).min();
             let input = std::mem::take(&mut self.input);
             let became_job = self.convert_runs(runs, input.data(), &next_key);
@@ -1393,14 +1138,10 @@ impl Converter {
         }
     }
 
-    /// Reads the moov once it has arrived. Returns whether it has, and turns
-    /// the converter fragmented if the file is.
     fn open_progressive(&mut self) -> Result<bool> {
         let range = match progressive::find_moov(self.input.data())? {
             Scan::Moov(range) => range,
             Scan::NeedMore(Some(end)) if self.seek.offsets && end > self.input.len() as u64 + SKIP_BOX => {
-                // A big box in the way, the mdat of a file with its moov at
-                // the end: what comes after it is what's needed first.
                 self.request(self.seek.base.saturating_add(end));
                 return Ok(false);
             }
@@ -1443,7 +1184,6 @@ impl Converter {
         self.moov_progressive = true;
         self.write_init(false)?;
         self.reinit = false;
-        // The bytes of the first samples to go out.
         let need = tables.iter().filter_map(|t| t.keep.get(t.done).copied()).min();
         self.prog = Some(Progressive { tables, cuts, cut: None, last_cut: 0.0 });
         if let Some(need) = need {
@@ -1453,9 +1193,6 @@ impl Converter {
     }
 }
 
-/// Leaves out the samples before `start` seconds: video from the keyframe
-/// shown at or before it, other tracks from the sample playing then, and
-/// one before that, which an AAC decoder needs to start from.
 fn start_at(start: f64, tracks: &[Track], tables: &mut [Table]) {
     let seconds = |t: &Track, ticks: i64| ticks.saturating_sub(t.edit_offset) as f64 / f64::from(t.timescale);
     let video = tracks.iter().zip(tables.iter()).find(|(t, _)| t.is_video());
@@ -1521,8 +1258,6 @@ impl Stream {
         Ok(OutTrack { id, base_dts, samples: out })
     }
 
-    /// Adds a video fragment's samples to the job, as Annex-B, and its
-    /// frames to those waiting for chunks.
     fn video(
         &mut self,
         samples: &[Sample],
@@ -1553,7 +1288,6 @@ impl Stream {
         }
         let codec = avc.codec_word();
         let timescale = self.track.timescale;
-        // WebCodecs takes timestamps up to 2^53 microseconds (285 years).
         if samples.iter().any(|s| micros(s.pts(), timescale).unsigned_abs() > 1 << 53) {
             return err("timestamps out of range");
         }
@@ -1571,8 +1305,6 @@ impl Stream {
             });
         };
 
-        // Where decoding starts: anywhere if the decoder carries on from the
-        // last fragment, else at a keyframe, or by replaying the GOP so far.
         let starts_with_key = converted[0].0;
         if continues && !starts_with_key {
             self.aligned = false;
@@ -1584,8 +1316,6 @@ impl Stream {
         } else if continues && self.gop.usable() {
             (0, true, true)
         } else {
-            // Nothing to decode these from, the same as the engine would
-            // drop them.
             (converted.iter().position(|c| c.0).unwrap_or(converted.len()), false, true)
         };
         if new_run {
@@ -1602,9 +1332,6 @@ impl Stream {
         if !continues {
             self.last_pts = None;
         }
-        // After a flush mid-GOP (a drain), the flush put out frames whose
-        // B-frames, shown before them, come only now. Encoding those would
-        // send the encoder back in time, so they're only decoded.
         let floor = if replay { self.last_pts } else { None };
         let mut flags = Vec::with_capacity(samples.len());
         for (s, (key, _)) in samples.iter().zip(&converted).skip(start) {
@@ -1619,8 +1346,6 @@ impl Stream {
             out.frames.insert((self.run, micros(s.pts(), timescale)), frame);
             self.last_pts = Some(self.last_pts.map_or(s.pts(), |last| last.max(s.pts())));
         }
-        // Flushing puts out every frame decoded so far, so not while one
-        // waits for B-frames shown before it, still to come.
         let flush = next_key.unwrap_or(self.aligned) && !out.has_hole(self.run);
         let flush = if flush { FLUSH } else { 0 };
         for ((s, (_, range)), flags) in samples.iter().zip(&converted).skip(start).zip(flags) {
@@ -1629,7 +1354,6 @@ impl Stream {
         if start < samples.len() {
             self.needs_key = false;
         }
-        // Keep the GOP a later fragment may need to replay.
         if !continues {
             self.gop.clear();
         }
@@ -1639,7 +1363,6 @@ impl Stream {
         Ok(())
     }
 
-    /// The input's bits per second so far.
     fn bitrate(&self) -> u32 {
         let seconds = self.ticks as f64 / f64::from(self.track.timescale);
         if seconds <= 0.0 {
@@ -1649,8 +1372,6 @@ impl Stream {
     }
 }
 
-/// Ticks to whole microseconds, rounded the same way every time so frames
-/// can be matched up by their timestamps.
 fn micros(ticks: i64, timescale: u32) -> i64 {
     let ts = i128::from(timescale.max(1));
     let us = (i128::from(ticks) * 1_000_000 + ts / 2).div_euclid(ts);
@@ -1663,7 +1384,6 @@ mod tests {
 
     #[test]
     fn job_samples_are_40_bytes() {
-        // worker.js reads them at this stride.
         assert_eq!(size_of::<JobSample>(), 40);
     }
 

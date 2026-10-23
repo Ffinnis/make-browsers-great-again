@@ -1,6 +1,3 @@
-//! MBGA browser core. Owns all browser state and the tab sleep policy; the
-//! native shell only renders snapshots and forwards engine events.
-
 uniffi::setup_scaffolding!();
 
 pub mod blocker;
@@ -16,8 +13,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-// ------------------------------------------------------------------ records
-
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct TabInfo {
     pub id: u64,
@@ -28,22 +23,16 @@ pub struct TabInfo {
     pub live: bool,
     pub audible: bool,
     pub frozen: bool,
-    /// The tab's site is exempt from sleeping and freezing.
     pub keep_awake: bool,
-    /// The person chose to keep this one tab loaded (see `set_always_awake`).
     pub always_awake: bool,
-    /// Ads and trackers are allowed on the tab's site.
     pub ads_allowed: bool,
 }
 
-/// One visible row of a space's pinned tree. Folders and tabs are flattened
-/// depth-first; children of collapsed folders are omitted.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct PinnedRow {
     pub id: u64,
     pub depth: u32,
     pub parent_id: Option<u64>,
-    /// Position within the parent folder (or the pinned root).
     pub index: u32,
     pub tab: Option<TabInfo>,
     pub folder_name: Option<String>,
@@ -80,36 +69,27 @@ pub struct Snapshot {
     pub sleep_after_secs: u64,
     pub max_live_tabs: u32,
     pub strict_site_isolation: bool,
-    /// Something closed this session can be reopened.
     pub can_reopen: bool,
     pub block_ads: bool,
-    /// H.264 and AAC video plays by converting it; new pages only.
     pub convert_video: bool,
-    /// Today tabs untouched this long are archived; 0 is off.
     pub archive_after_hours: u32,
     pub cleanup_answered: bool,
-    /// Sites whose tabs are never put to sleep or frozen, with their
-    /// subdomains.
     pub keep_awake_sites: Vec<String>,
 }
 
-/// A page from history for the command bar.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct HistoryItem {
     pub url: String,
     pub title: String,
-    /// The query is the start of the page's site ("git" for github.com).
     pub site_prefix: bool,
 }
 
-/// Tabs brought back by undoing a close, and the space they are in.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct ReopenOutcome {
     pub space_id: u64,
     pub tabs: Vec<u64>,
 }
 
-/// A filter list for the shell to download into `filter_dir`.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct FilterList {
     pub file_name: String,
@@ -118,9 +98,7 @@ pub struct FilterList {
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct CloseOutcome {
-    /// False for pinned tabs and favorites, which stay in the sidebar asleep.
     pub removed: bool,
-    /// Tab to show next, if the closed tab was on screen.
     pub next_tab: Option<u64>,
 }
 
@@ -156,7 +134,6 @@ pub enum BrowserKind {
     Safari,
 }
 
-/// A profile of another browser and what importing it would bring.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct ImportProfileInfo {
     pub id: String,
@@ -165,7 +142,6 @@ pub struct ImportProfileInfo {
     pub pinned: u32,
     pub favorites: u32,
     pub today: u32,
-    /// Saved passwords; Safari's can't be counted.
     pub passwords: u32,
 }
 
@@ -174,13 +150,9 @@ pub struct ImportSourceInfo {
     pub id: String,
     pub name: String,
     pub kind: BrowserKind,
-    /// For showing the browser's app icon.
     pub bundle_id: Option<String>,
     pub profiles: Vec<ImportProfileInfo>,
-    /// Why the browser's data could not be read.
     pub error: Option<String>,
-    /// The keychain item with the password its cookies are encrypted with
-    /// (Chromium-based browsers).
     pub keychain_service: Option<String>,
 }
 
@@ -196,7 +168,6 @@ pub struct ImportSummary {
     pub pinned: u32,
     pub favorites: u32,
     pub today: u32,
-    /// The MBGA profile each imported profile became.
     pub profiles: Vec<ImportedProfileLink>,
 }
 
@@ -211,41 +182,32 @@ fn import_counts(c: import::Counts, profiles: Vec<ImportedProfileLink>) -> Impor
     ImportSummary { spaces: c.spaces, pinned: c.pinned, favorites: c.favorites, today: c.today, profiles }
 }
 
-/// A cookie of another browser, for the engine to set.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct ImportedCookie {
-    /// ".example.com" covers subdomains; "example.com" is that host alone.
     pub domain: String,
     pub name: String,
     pub value: String,
     pub path: String,
     pub secure: bool,
     pub http_only: bool,
-    /// Microseconds since 1601; 0 for a session cookie.
     pub expires: i64,
     pub created: i64,
     pub last_used: i64,
-    /// -1 unspecified, 0 none, 1 lax, 2 strict.
     pub same_site: i32,
-    /// 0 low, 1 medium, 2 high.
     pub priority: i32,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct CookieRead {
     pub cookies: Vec<ImportedCookie>,
-    /// Why they couldn't be read.
     pub error: Option<String>,
 }
 
-/// A saved password, without the password.
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct SavedLogin {
     pub id: u64,
     pub profile_id: u64,
-    /// "<https://example.com">: where it was saved.
     pub origin: String,
-    /// "example.com", as shown to people.
     pub site: String,
     pub username: String,
     pub created_ms: u64,
@@ -253,28 +215,19 @@ pub struct SavedLogin {
     pub changed_ms: u64,
 }
 
-/// What to ask once a sign-in form was sent.
 #[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordOffer {
-    /// Saved already, never saved on the site, or the passwords are locked.
     Nothing,
     Save,
-    /// The saved login with that username has another password now.
-    Update {
-        login_id: u64,
-    },
+    Update { login_id: u64 },
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
 pub struct PasswordImportOutcome {
     pub added: u32,
-    /// Saved logins whose password the import changed.
     pub updated: u32,
-    /// Saved already, or older than the one MBGA has.
     pub kept: u32,
-    /// Passwords that couldn't be decrypted.
     pub unreadable: u32,
-    /// Why nothing could be imported.
     pub error: Option<String>,
 }
 
@@ -297,8 +250,6 @@ fn saved_login(l: &passwords::Login) -> SavedLogin {
     }
 }
 
-// --------------------------------------------------------------------- core
-
 struct Inner {
     state: State,
     dirty: bool,
@@ -306,22 +257,18 @@ struct Inner {
     history_dirty: bool,
     revision: u64,
     data_dir: PathBuf,
-    /// Browsers found by the last `detect_browsers`, ready to import.
     detected: Vec<import::Source>,
     passwords: passwords::Store,
     passwords_dirty: bool,
-    /// None until the shell unlocks the passwords.
     password_key: Option<passwords::Key>,
 }
 
 #[derive(uniffi::Object)]
 pub struct BrowserCore {
     inner: Mutex<Inner>,
-    /// Consulted for every network request, on the engine's network thread.
     blocker: RwLock<blocker::Blocker>,
 }
 
-/// A length as the u32 that crosses to Swift, saturating instead of wrapping.
 pub(crate) fn to_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
@@ -342,7 +289,6 @@ fn load_passwords(dir: &Path) -> passwords::Store {
     fs::read(dir.join(PASSWORDS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-/// Writes `value` as JSON next to its final path, then renames it into place.
 fn write_atomic(dir: &Path, name: &str, value: &impl serde::Serialize) -> bool {
     let Ok(json) = serde_json::to_vec(value) else {
         return false;
@@ -351,7 +297,6 @@ fn write_atomic(dir: &Path, name: &str, value: &impl serde::Serialize) -> bool {
     fs::write(&tmp, json).is_ok() && private(&tmp, name) && fs::rename(&tmp, dir.join(name)).is_ok()
 }
 
-/// Only the person may read the passwords file, sealed as they are.
 fn private(path: &Path, name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
     name != PASSWORDS_FILE || fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok()
@@ -368,7 +313,6 @@ fn load_state(dir: &Path) -> State {
             s
         }
         _ => {
-            // Keep the unreadable file for inspection instead of losing it.
             let backup = dir.join(format!("{STATE_FILE}.corrupt-{}", now_ms()));
             let _ = fs::rename(&path, backup);
             State::new_default()
@@ -376,8 +320,6 @@ fn load_state(dir: &Path) -> State {
     }
 }
 
-/// The engine only accepts profile directories that are direct children of
-/// its root directory.
 fn profile_dir_in(data_dir: &Path, profile_id: Id) -> PathBuf {
     data_dir.join("engine").join(format!("Profile {profile_id}"))
 }
@@ -453,7 +395,6 @@ impl BrowserCore {
         self.inner.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Runs a mutation and marks the state changed.
     fn mutate<R>(&self, f: impl FnOnce(&mut State, u64) -> R) -> R {
         let mut inner = self.lock();
         let r = f(&mut inner.state, now_ms());
@@ -465,21 +406,16 @@ impl BrowserCore {
 
 #[uniffi::export]
 impl BrowserCore {
-    /// Loads state from `data_dir` (created if missing) or starts fresh.
     #[uniffi::constructor]
     pub fn new(data_dir: String) -> Arc<Self> {
         let data_dir = PathBuf::from(data_dir);
         let _ = fs::create_dir_all(&data_dir);
-        // The engine rejects profile directories reached through a symlink
-        // (e.g. /tmp -> /private/tmp) and silently falls back to in-memory
-        // storage, so always hand it the resolved path.
         let data_dir = fs::canonicalize(&data_dir).unwrap_or(data_dir);
         let mut state = load_state(&data_dir);
         let history = load_history(&data_dir);
         let mut passwords = load_passwords(&data_dir);
         passwords.keep_profiles(&state.profiles.iter().map(|p| p.id).collect::<Vec<_>>());
         let blocker = blocker::Blocker::new(state.block_ads, state.ads_allowed.iter().cloned());
-        // The engine is not running yet, so deleted profiles' storage is free.
         for id in std::mem::take(&mut state.doomed_profiles) {
             let _ = fs::remove_dir_all(profile_dir_in(&data_dir, id));
         }
@@ -567,9 +503,6 @@ impl BrowserCore {
         self.lock().state.visible_tab()
     }
 
-    // ---------------------------------------------------------- engine paths
-
-    /// Root directory for engine data; every profile directory lives inside.
     pub fn engine_root_dir(&self) -> String {
         self.lock().data_dir.join("engine").to_string_lossy().into_owned()
     }
@@ -582,8 +515,6 @@ impl BrowserCore {
         self.lock().state.profile_of_tab(tab_id)
     }
 
-    // -------------------------------------------------------------- profiles
-
     pub fn create_profile(&self, name: String) -> u64 {
         self.mutate(|s, _| s.create_profile(&name))
     }
@@ -592,8 +523,6 @@ impl BrowserCore {
         self.mutate(|s, _| s.rename_profile(id, &name));
     }
 
-    /// Returns the closed favorites, or None if it is the last profile or a
-    /// space still uses it.
     pub fn delete_profile(&self, id: u64) -> Option<Vec<u64>> {
         let closed = self.mutate(|s, _| s.delete_profile(id))?;
         let mut inner = self.lock();
@@ -603,8 +532,6 @@ impl BrowserCore {
         Some(closed)
     }
 
-    // ---------------------------------------------------------------- spaces
-
     pub fn create_space(&self, name: String, icon: String, color: u32, profile_id: u64) -> u64 {
         self.mutate(|s, _| s.create_space(&name, &icon, color, profile_id))
     }
@@ -613,12 +540,10 @@ impl BrowserCore {
         self.mutate(|s, _| s.update_space(id, &name, &icon, color));
     }
 
-    /// Returns the live tabs that must be reloaded under the new profile.
     pub fn set_space_profile(&self, id: u64, profile_id: u64) -> Vec<u64> {
         self.mutate(|s, _| s.set_space_profile(id, profile_id))
     }
 
-    /// Returns the closed tabs, or None if this is the last space.
     pub fn delete_space(&self, id: u64) -> Option<Vec<u64>> {
         self.mutate(|s, _| s.delete_space(id))
     }
@@ -631,12 +556,8 @@ impl BrowserCore {
         self.mutate(|s, now| s.set_active_space(id, now));
     }
 
-    // ------------------------------------------------------------------ tabs
-
     pub fn open_tab(&self, space_id: u64, url: String, activate: bool) -> Option<u64> {
         let id = self.mutate(|s, now| s.open_tab(space_id, &url, activate, now))?;
-        // The engine reports the first page's address unchanged, so the
-        // visit is counted here.
         let mut inner = self.lock();
         inner.history.record(&url, now_ms());
         inner.history_dirty = true;
@@ -652,15 +573,12 @@ impl BrowserCore {
         let Some(t) = inner.state.tabs.get(&id) else {
             return;
         };
-        // Engines repeat the same title/URL often; skip no-op updates.
         let changed = url.as_ref().is_some_and(|u| *u != t.url) || title.as_ref().is_some_and(|x| *x != t.title);
         if changed {
             let url_changed = url.as_ref().is_some_and(|u| *u != t.url);
             inner.state.update_tab(id, url.as_deref(), title.as_deref());
             inner.dirty = true;
             inner.revision += 1;
-            // Every navigation the engine reports is a visit; the title
-            // follows a moment later and belongs to the tab's current page.
             let page = inner.state.tabs[&id].url.clone();
             if url_changed {
                 inner.history.record(&page, now_ms());
@@ -672,7 +590,6 @@ impl BrowserCore {
         }
     }
 
-    /// Pages from history matching `query`, best first.
     pub fn suggest_history(&self, query: String, limit: u32) -> Vec<HistoryItem> {
         self.lock()
             .history
@@ -697,17 +614,14 @@ impl BrowserCore {
         self.mutate(|s, _| s.clear_today(space_id))
     }
 
-    /// Undoes the most recent close, clear, tidy-up or folder deletion.
     pub fn undo_close(&self) -> Option<ReopenOutcome> {
         self.mutate(|s, _| s.reopen_last()).map(|(space_id, tabs)| ReopenOutcome { space_id, tabs })
     }
 
-    /// Reopens one closed tab at the top of Today. Returns its space.
     pub fn reopen_tab(&self, id: u64) -> Option<u64> {
         self.mutate(|s, _| s.reopen_tab(id))
     }
 
-    /// Marks a tab as on screen in a window of its own, or back.
     pub fn set_shown_elsewhere(&self, id: u64, shown: bool) {
         self.mutate(|s, _| {
             s.shown_elsewhere.retain(|t| *t != id);
@@ -717,8 +631,6 @@ impl BrowserCore {
         });
     }
 
-    /// Selects a tab in a space with tabs but none selected. Returns it if
-    /// one was chosen.
     pub fn select_default_tab(&self, space_id: u64) -> Option<u64> {
         let mut inner = self.lock();
         let chosen = inner.state.select_default_tab(space_id, now_ms());
@@ -729,32 +641,24 @@ impl BrowserCore {
         chosen
     }
 
-    /// Selects another tab in the main window if `id` was on screen there.
     pub fn step_away(&self, id: u64) -> Option<u64> {
         self.mutate(|s, now| s.step_away(id, now))
     }
 
-    /// Tabs closed this session, most recent first.
     pub fn closed_tabs(&self, limit: u32) -> Vec<TabInfo> {
         let inner = self.lock();
         let s = &inner.state;
         s.closed_tabs().take(limit as usize).map(|t| tab_info(s, t)).collect()
     }
 
-    // --------------------------------------------------------------- tidying
-
-    /// How many Today tabs of a space nobody has looked at for `hours`.
     pub fn idle_today_count(&self, space_id: u64, hours: u32) -> u32 {
         to_u32(self.lock().state.idle_today(space_id, hours, now_ms()).len())
     }
 
-    /// Archives a space's Today tabs untouched for `hours`, as one undoable
-    /// step. Returns them; the shell must destroy their web views.
     pub fn archive_idle(&self, space_id: u64, hours: u32) -> Vec<u64> {
         self.mutate(|s, now| s.archive_idle(space_id, hours, now))
     }
 
-    /// Applies the archive policy. Cheap when there is nothing to archive.
     pub fn archive_by_policy(&self) -> Vec<u64> {
         let mut inner = self.lock();
         let archived = inner.state.archive_by_policy(now_ms());
@@ -769,12 +673,10 @@ impl BrowserCore {
         self.mutate(|s, _| s.policy.archive_after_hours = hours);
     }
 
-    /// Remembers that the person answered the offer to tidy up.
     pub fn answer_cleanup(&self) {
         self.mutate(|s, _| s.cleanup_answered = true);
     }
 
-    /// Stores a favicon (PNG) for the tab's host and attaches it to the tab.
     pub fn set_favicon(&self, tab_id: u64, png: Vec<u8>) {
         let mut inner = self.lock();
         let Some(tab) = inner.state.tabs.get(&tab_id) else {
@@ -797,8 +699,6 @@ impl BrowserCore {
         }
     }
 
-    // --------------------------------------------------------------- folders
-
     pub fn create_folder(&self, space_id: u64, name: String, parent: Option<u64>) -> Option<u64> {
         self.mutate(|s, _| s.create_folder(space_id, &name, parent))
     }
@@ -815,11 +715,6 @@ impl BrowserCore {
         self.mutate(|s, _| s.delete_folder(id))
     }
 
-    // ----------------------------------------------------------- drag & drop
-
-    /// Moves a tab or folder; `index` is in pre-removal coordinates.
-    /// Returns tabs that must be reloaded because their profile changed, or
-    /// None if the move is not allowed.
     pub fn move_item(&self, id: u64, target: DropTarget, index: u32) -> Option<Vec<u64>> {
         self.mutate(|s, _| s.move_item(id, target.into(), index as usize))
     }
@@ -839,8 +734,6 @@ impl BrowserCore {
         self.move_item(id, DropTarget::Favorites { profile_id }, u32::MAX)
     }
 
-    // ------------------------------------------------------------- lifecycle
-
     pub fn set_live(&self, id: u64, live: bool) {
         self.mutate(|s, now| s.set_live(id, live, now));
     }
@@ -849,36 +742,26 @@ impl BrowserCore {
         self.mutate(|s, _| s.set_audible(id, audible));
     }
 
-    /// Exempts the site of `url` from sleeping and freezing, or stops doing so.
     pub fn set_keep_awake(&self, url: String, keep: bool) {
         self.mutate(|s, _| s.set_keep_awake(&url, keep));
     }
 
-    /// Replaces the sites kept awake: domains or addresses, each covering
-    /// its subdomains.
     pub fn set_keep_awake_sites(&self, sites: Vec<String>) {
         self.mutate(|s, _| s.set_keep_awake_sites(&sites));
     }
 
-    /// Keeps one tab loaded whatever the sleep policy: never put to sleep,
-    /// frozen or archived, and loaded at launch. Or lets it sleep again.
     pub fn set_always_awake(&self, id: u64, awake: bool) {
         self.mutate(|s, _| s.set_always_awake(id, awake));
     }
 
-    /// Tabs kept always awake, which the shell loads at launch.
     pub fn always_awake_tabs(&self) -> Vec<u64> {
         self.lock().state.always_awake_tabs()
     }
 
-    // ------------------------------------------------------------ blocking
-
-    /// Where the shell downloads filter lists.
     pub fn filter_dir(&self) -> String {
         self.lock().data_dir.join("filters").to_string_lossy().into_owned()
     }
 
-    /// Filter lists and the scriptlets they use, for the shell to download.
     pub fn filter_lists(&self) -> Vec<FilterList> {
         blocker::LISTS
             .iter()
@@ -887,7 +770,6 @@ impl BrowserCore {
             .collect()
     }
 
-    /// The person's own rules file, created with a short guide if missing.
     pub fn user_filters_path(&self) -> String {
         let dir = PathBuf::from(self.filter_dir());
         let path = dir.join(blocker::USER_RULES);
@@ -905,30 +787,18 @@ impl BrowserCore {
         path.to_string_lossy().into_owned()
     }
 
-    /// Loads the blocking engine from the downloaded lists (compiling and
-    /// caching it if they changed). Slow the first time; call it off the
-    /// main thread. False if blocking is off or no list has been downloaded
-    /// yet; with blocking off the engine stays out of memory.
     pub fn load_filters(&self) -> bool {
         self.load_filters_from_disk(true)
     }
 
-    /// Loads the engine only from an up-to-date compiled cache, which takes
-    /// tens of milliseconds: call it before the first page loads.
     pub fn load_cached_filters(&self) -> bool {
         self.load_filters_from_disk(false)
     }
 
-    /// Whether the engine should cancel a request for `url` made by the
-    /// page at `page`. `kind` is "script", "image", "subdocument" and so on.
     pub fn should_block(&self, url: String, page: String, kind: String) -> bool {
         self.blocker.read().unwrap_or_else(std::sync::PoisonError::into_inner).should_block(&url, &page, &kind)
     }
 
-    /// The script to run in `page` as it starts loading: hiding rules,
-    /// scriptlets and the class/id collector. "" when blocking is off.
-    /// Whether `page` gets scriptlets, which must run before its own
-    /// scripts: only then does a new tab wait for them before loading.
     pub fn needs_early_script(&self, page: String) -> bool {
         self.blocker.read().unwrap_or_else(std::sync::PoisonError::into_inner).needs_early_script(&page)
     }
@@ -937,14 +807,10 @@ impl BrowserCore {
         self.blocker.read().unwrap_or_else(std::sync::PoisonError::into_inner).page_script(&page)
     }
 
-    /// A script adding the generic hiding rules for the class and id names
-    /// a page reported, or "".
     pub fn cosmetic_reply(&self, page: String, report: String) -> String {
         self.blocker.read().unwrap_or_else(std::sync::PoisonError::into_inner).cosmetic_reply(&page, &report)
     }
 
-    /// Turning blocking off frees the engine; after turning it on, call
-    /// `load_filters` (off the main thread) to load it again.
     pub fn set_block_ads(&self, enabled: bool) {
         self.mutate(|s, _| s.block_ads = enabled);
         let old = {
@@ -956,11 +822,9 @@ impl BrowserCore {
                 blocker.unload()
             }
         };
-        // Freed outside the lock, which requests wait on.
         drop(old);
     }
 
-    /// Turns blocking off for the site of `url`, or back on.
     pub fn set_ads_allowed(&self, url: String, allowed: bool) {
         let sites = self.mutate(|s, _| {
             s.set_ads_allowed(&url, allowed);
@@ -969,9 +833,6 @@ impl BrowserCore {
         self.blocker.write().unwrap_or_else(std::sync::PoisonError::into_inner).allowed = sites.into_iter().collect();
     }
 
-    /// How long a background tab stays loaded while idle, and how many
-    /// stay loaded at most. 0 turns either off; memory pressure still puts
-    /// tabs to sleep.
     pub fn set_policy(&self, sleep_after_secs: u64, max_live_tabs: u32) {
         self.mutate(|s, _| {
             s.policy.sleep_after_secs = if sleep_after_secs == 0 { 0 } else { sleep_after_secs.max(30) };
@@ -979,8 +840,6 @@ impl BrowserCore {
         });
     }
 
-    /// Chooses tabs to put to sleep, marks them asleep and returns them. The
-    /// shell must destroy their web views.
     pub fn collect_sleepers(&self, pressure: MemoryPressure) -> Vec<u64> {
         let pressure = match pressure {
             MemoryPressure::Normal => Pressure::Normal,
@@ -995,8 +854,6 @@ impl BrowserCore {
         sleepers
     }
 
-    /// Freezes idle hidden Today tabs (see `State::collect_freezers`).
-    /// The shell must freeze their web views.
     pub fn collect_freezers(&self) -> Vec<u64> {
         let mut inner = self.lock();
         let frozen = inner.state.collect_freezers(now_ms());
@@ -1006,7 +863,6 @@ impl BrowserCore {
         frozen
     }
 
-    /// Returns true if the tab was frozen; the shell must resume its web view.
     pub fn thaw(&self, id: u64) -> bool {
         let mut inner = self.lock();
         let thawed = inner.state.thaw(id);
@@ -1016,39 +872,28 @@ impl BrowserCore {
         thawed
     }
 
-    // ------------------------------------------------------- process model
-
     pub fn set_strict_site_isolation(&self, strict: bool) {
         self.mutate(|s, _| s.policy.strict_site_isolation = strict);
     }
 
-    /// Origins that keep a dedicated renderer when strict isolation is off.
     pub fn isolated_origins(&self) -> Vec<String> {
         model::ALWAYS_ISOLATED_ORIGINS.iter().map(ToString::to_string).collect()
     }
 
-    // ------------------------------------------------------------- video
-
-    /// Whether pages play H.264 and AAC by converting them. The engine
-    /// applies it to pages loaded afterwards.
     pub fn set_convert_video(&self, enabled: bool) {
         self.mutate(|s, _| s.convert_video = enabled);
     }
-
-    // ---------------------------------------------------------------- misc
 
     pub fn resolve_input(&self, text: String) -> String {
         let inner = self.lock();
         model::resolve_input(&text, &inner.state.search_template)
     }
 
-    /// A web search for `text`, even if it looks like an address.
     pub fn search_url(&self, text: String) -> String {
         let inner = self.lock();
         model::search_url(&text, &inner.state.search_template)
     }
 
-    /// True until the first-launch onboarding has been completed or skipped.
     pub fn needs_onboarding(&self) -> bool {
         !self.lock().state.onboarded
     }
@@ -1057,8 +902,6 @@ impl BrowserCore {
         self.mutate(|s, _| s.onboarded = true);
     }
 
-    /// Finds other browsers' tabs and bookmarks under `home`. Reads every
-    /// profile it finds, so call it off the main thread.
     pub fn detect_browsers(&self, home: String) -> Vec<ImportSourceInfo> {
         let exclude = self.lock().data_dir.clone();
         let sources = import::detect(Path::new(&home), &exclude);
@@ -1098,8 +941,6 @@ impl BrowserCore {
         infos
     }
 
-    /// The unexpired cookies of a profile found by `detect_browsers`;
-    /// Chromium-based browsers need the password from their keychain item.
     pub fn read_browser_cookies(&self, source_id: String, profile_id: String, password: Option<Vec<u8>>) -> CookieRead {
         let source = self.lock().detected.iter().find(|s| s.id == source_id).cloned();
         let Some(source) = source else {
@@ -1129,7 +970,6 @@ impl BrowserCore {
         }
     }
 
-    /// Imports the chosen profiles of browsers found by `detect_browsers`.
     pub fn import_browsers(&self, choices: Vec<ImportChoice>) -> ImportSummary {
         let detected = self.lock().detected.clone();
         let chosen: Vec<(&import::Source, &import::ImportedProfile)> = detected
@@ -1158,11 +998,6 @@ impl BrowserCore {
         import_counts(counts, links)
     }
 
-    // ------------------------------------------------------------ passwords
-
-    /// Unlocks saved passwords with the 32-byte secret the shell keeps in the
-    /// keychain (the first secret ever given becomes the key). False if the
-    /// passwords were sealed with another.
     pub fn unlock_passwords(&self, secret: Vec<u8>) -> bool {
         let Some(key) = passwords::Key::new(&secret) else { return false };
         let mut inner = self.lock();
@@ -1179,7 +1014,6 @@ impl BrowserCore {
         self.lock().password_key.is_some()
     }
 
-    /// Every login saved in a profile, by site, then username.
     pub fn saved_logins(&self, profile_id: u64) -> Vec<SavedLogin> {
         let inner = self.lock();
         let mut logins: Vec<SavedLogin> =
@@ -1188,19 +1022,16 @@ impl BrowserCore {
         logins
     }
 
-    /// Logins of a profile to offer on the page at `url`, best first.
     pub fn logins_for_page(&self, profile_id: u64, url: String) -> Vec<SavedLogin> {
         self.lock().passwords.matching(profile_id, &url).into_iter().map(saved_login).collect()
     }
 
-    /// A saved password, or None while the passwords are locked.
     pub fn login_password(&self, id: u64) -> Option<String> {
         let inner = self.lock();
         let key = inner.password_key.as_ref()?;
         inner.passwords.logins.iter().find(|l| l.id == id).and_then(|l| key.open(&l.password))
     }
 
-    /// Whether to offer saving a password sent from a page.
     pub fn password_offer(&self, profile_id: u64, url: String, username: String, password: String) -> PasswordOffer {
         let inner = self.lock();
         let Some(key) = inner.password_key.as_ref() else { return PasswordOffer::Nothing };
@@ -1211,8 +1042,6 @@ impl BrowserCore {
         }
     }
 
-    /// Saves a login for the page at `url`, replacing the password of the one
-    /// with that username. None while locked.
     pub fn save_login(&self, profile_id: u64, url: String, username: String, password: String) -> Option<u64> {
         let mut inner = self.lock();
         let key = inner.password_key.clone()?;
@@ -1234,14 +1063,12 @@ impl BrowserCore {
         }
     }
 
-    /// Never offers to save passwords on the site of `url` again.
     pub fn never_save_passwords(&self, profile_id: u64, url: String) {
         let mut inner = self.lock();
         inner.passwords.never_save(profile_id, &url);
         inner.passwords_dirty = true;
     }
 
-    /// Origins a profile never saves passwords on.
     pub fn never_saved_sites(&self, profile_id: u64) -> Vec<String> {
         let inner = self.lock();
         inner.passwords.never.iter().filter(|(p, _)| *p == profile_id).map(|(_, o)| o.clone()).collect()
@@ -1253,9 +1080,6 @@ impl BrowserCore {
         inner.passwords_dirty = true;
     }
 
-    /// Imports the passwords of a profile found by `detect_browsers` into
-    /// MBGA's profile `into`. Chromium-based browsers need the password from
-    /// their keychain item. Call it off the main thread, once unlocked.
     pub fn import_browser_passwords(
         &self,
         source_id: String,
@@ -1271,8 +1095,6 @@ impl BrowserCore {
         }
     }
 
-    /// Imports passwords exported to a CSV file (by the Passwords app, other
-    /// browsers or password managers) into MBGA's profile `into`.
     pub fn import_password_file(&self, path: String, into: u64) -> PasswordImportOutcome {
         let text = match fs::read(&path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -1284,8 +1106,6 @@ impl BrowserCore {
         }
     }
 
-    /// Writes state and history to disk if they changed. Atomic: write +
-    /// rename.
     pub fn persist(&self) -> bool {
         let mut inner = self.lock();
         let mut ok = true;
@@ -1315,8 +1135,6 @@ impl BrowserCore {
 }
 
 impl BrowserCore {
-    /// Builds a new engine (compiling the lists if allowed and needed) and
-    /// swaps it in. Nothing loads while blocking is off.
     fn load_filters_from_disk(&self, compile: bool) -> bool {
         if !self.blocker.read().unwrap_or_else(std::sync::PoisonError::into_inner).enabled {
             return false;
@@ -1331,7 +1149,6 @@ impl BrowserCore {
         fresh.enabled = blocker.enabled;
         fresh.allowed = std::mem::take(&mut blocker.allowed);
         let old = std::mem::replace(&mut *blocker, fresh);
-        // Requests wait on the lock: free the old engine after releasing it.
         drop(blocker);
         drop(old);
         true

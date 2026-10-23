@@ -1,10 +1,3 @@
-//! Runs the fixtures through the converter, standing in for the worker:
-//! a fake decoder that holds frames back the way H.264 decoders do, and
-//! fake "VP9" chunks named after their timestamps, so the fragments' timing
-//! can be checked here without `WebCodecs`. Where ffmpeg is installed, its
-//! demuxer and FLAC decoder check the output independently.
-
-// Helpers here are test code too.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,41 +11,26 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap()
 }
 
-/// What worker.js keeps per video track.
 #[derive(Default)]
 struct Decoder {
-    /// Decoded frames the decoder hasn't put out yet, in presentation
-    /// order, with the order they went in to keep equal timestamps apart.
     waiting: BTreeSet<(i64, u64)>,
     fed: u64,
-    /// Whether decoding started.
     started: bool,
     encoder_started: bool,
-    /// With a frame-rate cap, when the next frame may go to the encoder.
     next_kept: i64,
 }
 
-/// The worker: decoders that put frames out in presentation order once
-/// more than `reorder` wait, or at a keyframe or a flush; an encoder that
-/// takes them in that order and makes a keyframe where the input has one.
 struct Worker {
     reorder: usize,
     decoders: BTreeMap<u32, Decoder>,
     decode_only: usize,
     jobs: usize,
-    /// Chunks encoded.
     encoded: usize,
-    /// The coded size of each chunk, and from which timestamp on to use
-    /// another (as when the page's video gets smaller).
     size: (u16, u16),
     resize: Option<(i64, (u16, u16))>,
-    /// The decoded pictures' visible size, and from which keyframe on it's
-    /// another (as when an avc3 stream's SPS changes it).
     visible: (u16, u16),
     revisible: Option<(i64, (u16, u16))>,
-    /// A frame-rate cap: the least time between frames, in microseconds.
     cap: Option<i64>,
-    /// The page's number for appends and drains.
     seq: f64,
 }
 
@@ -91,7 +69,6 @@ impl Worker {
             d.next_kept = ts + cap - 1000;
         }
         let key = r == ENCODE_KEY || !d.encoder_started;
-        // Sizes change at keyframes only.
         if let Some((from, size)) = self.resize.filter(|&(from, _)| ts >= from && key) {
             let _ = from;
             self.size = size;
@@ -107,7 +84,6 @@ impl Worker {
         assert!(d.started || flags & KEY != 0, "decoding starts without a keyframe");
         d.started = true;
         if flags & KEY != 0 {
-            // An IDR picture: everything before it comes out first.
             let before: Vec<(i64, u64)> = d.waiting.iter().copied().collect();
             for frame in before {
                 self.put_out(c, track, frame);
@@ -137,7 +113,6 @@ impl Worker {
         c.flushed(track);
     }
 
-    /// Decodes a job's samples, flushing where it says to.
     fn run_job(&mut self, c: &mut Converter) {
         self.jobs += 1;
         let job = c.job().unwrap();
@@ -166,7 +141,6 @@ impl Worker {
         c.write().unwrap();
     }
 
-    /// One append: the bytes it gives back, `held` first.
     fn append(&mut self, c: &mut Converter, bytes: &[u8]) -> Output {
         self.seq += 1.0;
         c.begin(self.seq);
@@ -182,8 +156,6 @@ impl Worker {
         take(c)
     }
 
-    /// An append of a progressive file's bytes from `offset`: None if the
-    /// converter drops it, as one sent before the shim heard of `need`.
     fn append_at(&mut self, c: &mut Converter, bytes: &[u8], offset: u64) -> Option<Output> {
         if !c.offset(offset) {
             self.seq += 1.0;
@@ -196,7 +168,6 @@ impl Worker {
         Some(self.append(c, bytes))
     }
 
-    /// Before `endOfStream()`: everything the decoders still hold.
     fn drain(&mut self, c: &mut Converter) -> Output {
         self.seq += 1.0;
         c.begin(self.seq);
@@ -229,7 +200,6 @@ fn take(c: &mut Converter) -> Output {
         range: c.output_range,
         need: c.need,
     };
-    // The groups tile `held`.
     let mut at = 0;
     for g in &o.groups {
         assert_eq!(g.offset as usize, at);
@@ -240,8 +210,6 @@ fn take(c: &mut Converter) -> Output {
     o
 }
 
-/// Feeds `input` in `step`-byte appends and drains at the end, the way the
-/// shim does. Returns everything in append order.
 fn convert(c: &mut Converter, w: &mut Worker, input: &[u8], step: usize) -> Vec<u8> {
     let mut out = Vec::new();
     for piece in input.chunks(step) {
@@ -255,7 +223,6 @@ fn convert(c: &mut Converter, w: &mut Worker, input: &[u8], step: usize) -> Vec<
     out
 }
 
-/// The init, then each moof and its mdat, as low-latency players append.
 fn units(input: &[u8]) -> Vec<Vec<u8>> {
     let mut units: Vec<Vec<u8>> = Vec::new();
     let mut pos = 0;
@@ -281,7 +248,6 @@ fn write_temp(name: &str, data: &[u8]) -> PathBuf {
     path
 }
 
-/// Each stream's packet presentation times, as ffprobe reads them.
 fn packet_times(path: &Path) -> Vec<(String, BTreeSet<String>)> {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-show_entries", "packet=stream_index,pts", "-of", "csv=p=0"])
@@ -323,7 +289,6 @@ fn codecs(path: &Path) -> String {
     String::from_utf8_lossy(&out.stdout).trim().replace('\n', " ")
 }
 
-/// Video decode times never go back, and nothing's marked discardable.
 fn assert_decode_order(path: &Path) {
     let out = Command::new("ffprobe")
         .args(["-v", "error", "-select_streams", "v", "-show_entries", "packet=dts,flags", "-of", "csv=p=0"])
@@ -339,7 +304,6 @@ fn assert_decode_order(path: &Path) {
     }
 }
 
-/// Decodes the first audio stream to 16-bit PCM with ffmpeg.
 fn pcm(path: &Path, rate: Option<u32>) -> Vec<i16> {
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-v", "error", "-i"]).arg(path).args(["-map", "0:a:0", "-f", "s16le"]);
@@ -355,7 +319,6 @@ fn count(data: &[u8], kind: [u8; 4]) -> usize {
     data.windows(4).filter(|w| *w == kind).count()
 }
 
-/// The fake chunks' timestamps in some output, in order.
 fn chunk_times(data: &[u8]) -> Vec<i64> {
     let text = String::from_utf8_lossy(data);
     text.match_indices("vp9 ")
@@ -368,7 +331,6 @@ fn muxed_cmaf_keeps_every_frame_and_its_time() {
     let input = fixture("muxed.mp4");
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // Odd-sized appends split boxes everywhere.
     let out = convert(&mut c, &mut w, &input, 997);
     assert_eq!(w.decode_only, 0);
     assert_eq!(c.mime, "video/mp4; codecs=\"vp09.00.41.08,flac\"");
@@ -387,14 +349,11 @@ fn fragments_that_start_mid_gop_carry_on_decoding() {
     let mut c = Converter::new(false);
     let mut w = Worker::new();
     let out = convert(&mut c, &mut w, &input, input.len());
-    // The decoder carries on from one fragment to the next.
     assert_eq!(w.decode_only, 0);
     if has_ffmpeg() {
         let src = write_temp("midgop-in.mp4", &input);
         let dst = write_temp("midgop-out.mp4", &out);
         assert_eq!(packet_times(&src), packet_times(&dst));
-        // Frames whose B-frames came in the next fragment waited for them,
-        // so decode order never goes back.
         assert_decode_order(&dst);
     }
 }
@@ -404,7 +363,6 @@ fn frames_held_by_the_decoder_come_out_with_the_next_append() {
     let input = fixture("midgop.mp4");
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // A moof+mdat at a time, as low-latency players append.
     let units = units(&input);
     let mut out = Vec::new();
     let mut helds = 0;
@@ -413,9 +371,7 @@ fn frames_held_by_the_decoder_come_out_with_the_next_append() {
         let (held, own) = (chunk_times(&o.held), chunk_times(&o.bytes));
         if !held.is_empty() {
             helds += 1;
-            // What belongs to an earlier append comes before this one's.
             assert!(held.iter().max() < own.iter().min().or(Some(&i64::MAX)), "{held:?} then {own:?}");
-            // Grouped by the append they came in, with their time range.
             for g in &o.groups {
                 assert!(g.seq < w.seq, "group of append {} in append {}", g.seq, w.seq);
                 let times = chunk_times(&o.held[g.offset as usize..(g.offset + g.len) as usize]);
@@ -444,8 +400,6 @@ fn after_a_drain_a_fragment_mid_gop_replays_its_gop() {
     let input = fixture("midgop.mp4");
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // The page ends the stream after the first moof, which ends mid-GOP,
-    // and later carries on.
     let second = input.windows(4).enumerate().filter(|(_, w)| w == b"moof").nth(1).unwrap().0 - 4;
     let mut out = Vec::new();
     for part in [&input[..second], &[], &input[second..]] {
@@ -459,8 +413,6 @@ fn after_a_drain_a_fragment_mid_gop_replays_its_gop() {
     if has_ffmpeg() {
         let src = write_temp("replay-in.mp4", &input);
         let dst = write_temp("replay-out.mp4", &out);
-        // The drain put out the frame after the B-frames the next fragment
-        // brings, so those are left out rather than shown out of order.
         let (want, got) = (&packet_times(&src)[0].1, &packet_times(&dst)[0].1);
         assert!(got.is_subset(want) && got.len() + 3 >= want.len(), "{} of {} frames", got.len(), want.len());
         assert_decode_order(&dst);
@@ -478,7 +430,6 @@ fn separate_video_segments() {
     for i in 0..3 {
         let seg = fixture(&format!("video-{i}.m4s"));
         let o = w.append(&mut c, &seg);
-        // Segments start with keyframes, so each comes out whole.
         assert!(o.held.is_empty() && !o.bytes.is_empty());
         out.extend(o.bytes);
         input.extend_from_slice(&seg);
@@ -516,7 +467,6 @@ fn aac_becomes_identical_flac() {
     assert_eq!(packet_times(&src), packet_times(&dst));
     let (a, b) = (pcm(&src, None), pcm(&dst, None));
     assert_eq!(a.len(), b.len());
-    // Two AAC decoders round differently, but by a hair.
     let worst = a.iter().zip(&b).map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs()).max().unwrap();
     assert!(worst <= 8, "samples differ by up to {worst}");
 }
@@ -531,8 +481,6 @@ fn he_aac_plays_its_core_at_half_rate() {
     let dst = write_temp("heaac-out.mp4", &out);
     assert_eq!(codecs(&dst), "flac,22050,2");
     assert_eq!(packet_times(&src), packet_times(&dst));
-    // Same length in time as the full-rate decode, and a 440 Hz tone isn't
-    // lost below the SBR band.
     let full = pcm(&src, Some(22050));
     let core = pcm(&dst, None);
     assert!(full.len().abs_diff(core.len()) <= 2 * 2048, "{} vs {}", full.len(), core.len());
@@ -564,9 +512,6 @@ fn progressive_file_with_audio_in_one_append() {
         let src = write_temp("progressive-in.mp4", &input);
         let dst = write_temp("progressive-out.mp4", &out);
         assert_eq!(packet_times(&src), packet_times(&dst));
-        // ffmpeg drops the AAC priming the edit list covers through decoder
-        // side data, which FLAC doesn't get. The engine trims by timestamp,
-        // the same for both.
         let (a, b) = (pcm(&src, None), pcm(&dst, None));
         assert!(b.len() >= a.len() && b.len() - a.len() <= 2 * 1024, "{} vs {}", a.len(), b.len());
     }
@@ -578,8 +523,6 @@ fn progressive_file_with_sparse_keyframes_streams_in_short_fragments() {
     let mut c = Converter::new(true);
     let mut w = Worker::new();
     let out = convert(&mut c, &mut w, &input, 16384);
-    // One keyframe in six seconds, and still fragments of about two, with
-    // the decoder carrying on across them: nothing decoded twice.
     assert_eq!(w.jobs, 3);
     assert_eq!(w.decode_only, 0);
     if has_ffmpeg() {
@@ -611,7 +554,6 @@ fn an_init_lost_to_abort_comes_again() {
     first.extend(fixture("video-0.m4s"));
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // The page aborts this append, so the shim drops its output, init and all.
     let o = w.append(&mut c, &first);
     assert_eq!(count(&o.bytes, *b"moov"), 1);
     c.reset();
@@ -619,7 +561,6 @@ fn an_init_lost_to_abort_comes_again() {
     assert_eq!(count(&o.bytes, *b"moov"), 1, "no init again");
     let at = |kind: &[u8]| o.bytes.windows(4).position(|w| w == kind).unwrap();
     assert!(at(b"ftyp") < at(b"moov") && at(b"moov") < at(b"moof"));
-    // Only once.
     let o = w.append(&mut c, &fixture("video-2.m4s"));
     assert_eq!(count(&o.bytes, *b"moov"), 0);
 }
@@ -629,14 +570,11 @@ fn smaller_frames_get_their_own_init() {
     let input = fixture("midgop.mp4");
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // Half size from the second keyframe on (at 1 s).
     w.resize = Some((1_000_000, (160, 90)));
     let out = convert(&mut c, &mut w, &input, input.len());
     assert_eq!(count(&out, *b"moov"), 2);
     let second = out.windows(4).rposition(|w| w == b"vp09").unwrap();
-    // The entry's width and height, 24 bytes into it.
     assert_eq!(&out[second + 4 + 24..second + 4 + 28], &[0, 160, 0, 90]);
-    // The init comes right before the fragment that starts at the keyframe.
     let after = &out[second..];
     let first_chunk = chunk_times(after)[0];
     assert!((1_000_000..1_100_000).contains(&first_chunk), "{first_chunk}");
@@ -660,8 +598,6 @@ fn garbage_fails_without_wedging() {
     assert!(c.poll().is_err(), "media before init");
 }
 
-// ---------------------------------------------------------------- hostile
-
 fn make_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
     let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
     out.extend_from_slice(&kind);
@@ -669,8 +605,6 @@ fn make_box(kind: [u8; 4], body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The boxes along `path` (each the first of its type in the one before),
-/// as (start, end).
 fn find_path(data: &[u8], path: &[&[u8; 4]]) -> Vec<(usize, usize)> {
     let mut chain = Vec::new();
     let (mut from, mut to) = (0, data.len());
@@ -691,7 +625,6 @@ fn find_path(data: &[u8], path: &[&[u8; 4]]) -> Vec<(usize, usize)> {
     chain
 }
 
-/// Puts `new` at the end of the box at `path`, growing it and its parents.
 fn insert(data: &[u8], path: &[&[u8; 4]], new: &[u8]) -> Vec<u8> {
     let chain = find_path(data, path);
     let at = chain.last().unwrap().1;
@@ -707,7 +640,6 @@ fn set_u32(data: &mut [u8], at: usize, v: u32) {
     data[at..at + 4].copy_from_slice(&v.to_be_bytes());
 }
 
-/// Converts `input` and expects an error, quickly and without a panic.
 fn expect_error(c: &mut Converter, input: &[u8]) -> String {
     let started = Instant::now();
     c.push(input);
@@ -729,7 +661,6 @@ fn video_track_id() -> u32 {
     u32::from_be_bytes(init[tkhd + 20..tkhd + 24].try_into().unwrap())
 }
 
-/// A moof+mdat for the video fixture's track with one trun.
 fn fragment(trun_flags: u32, count: u32, trun_rest: &[u8], mdat: &[u8]) -> Vec<u8> {
     let tfhd = make_box(*b"tfhd", &[&0x20000u32.to_be_bytes()[..], &video_track_id().to_be_bytes()].concat());
     let tfdt = make_box(*b"tfdt", &[0, 0, 0, 0, 0, 0, 0, 0]);
@@ -745,17 +676,12 @@ fn fragment(trun_flags: u32, count: u32, trun_rest: &[u8], mdat: &[u8]) -> Vec<u
 fn a_trun_with_billions_of_empty_samples_fails() {
     let mut c = Converter::new(false);
     Worker::new().append(&mut c, &fixture("video-init.mp4"));
-    // No per-sample fields and no default size: four billion samples of
-    // nothing, at 4 bytes of input.
     let e = expect_error(&mut c, &fragment(0, u32::MAX, &[], &[0; 16]));
     assert!(e.contains("too many samples"), "{e}");
-    // The same with a default size: they'd run far past the mdat.
     let e = expect_error(&mut c, &fragment(0x200, 0x4000_0000, &[0; 8], &[0; 16]));
     assert!(e.contains("trun shorter") || e.contains("outside the mdat"), "{e}");
-    // Huge samples.
     let e = expect_error(&mut c, &fragment(0x201, 2, &[&100u32.to_be_bytes()[..], &[0xff; 8]].concat(), &[0; 16]));
     assert!(e.contains("outside the mdat"), "{e}");
-    // The converter still works.
     let o = Worker::new().append(&mut c, &fixture("video-0.m4s"));
     assert!(!o.bytes.is_empty());
 }
@@ -769,7 +695,6 @@ fn a_box_claiming_gigabytes_fails_at_once() {
     assert!(e.contains("too large"), "{e}");
 }
 
-/// The progressive fixture with one table changed.
 fn patched(name: &str, table: [u8; 4], f: impl Fn(&mut [u8], usize)) -> Vec<u8> {
     let mut input = fixture(name);
     let (start, _) = *find_path(&input, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", &table]).last().unwrap();
@@ -779,14 +704,12 @@ fn patched(name: &str, table: [u8; 4], f: impl Fn(&mut [u8], usize)) -> Vec<u8> 
 
 #[test]
 fn sample_tables_with_huge_counts_fail_or_finish() {
-    // A fixed sample size and a count of two billion.
     let input = patched("progressive.mp4", *b"stsz", |d, body| {
         set_u32(d, body + 4, 1);
         set_u32(d, body + 8, 0x7fff_ffff);
     });
     let e = expect_error(&mut Converter::new(true), &input);
     assert!(e.contains("too many samples"), "{e}");
-    // ctts runs of four billion samples, over and over.
     let input = patched("progressive.mp4", *b"ctts", |d, body| {
         let entries = u32::from_be_bytes(d[body + 4..body + 8].try_into().unwrap()) as usize;
         for i in 0..entries {
@@ -797,8 +720,6 @@ fn sample_tables_with_huge_counts_fail_or_finish() {
     let mut c = Converter::new(true);
     let out = convert(&mut c, &mut Worker::new(), &input, input.len());
     assert!(started.elapsed() < Duration::from_secs(5));
-    // The decoder puts frames out in an order the timestamps now disagree
-    // with; what's written still never goes back.
     if has_ffmpeg() {
         assert_decode_order(&write_temp("ctts-out.mp4", &out));
     }
@@ -806,7 +727,6 @@ fn sample_tables_with_huge_counts_fail_or_finish() {
 
 #[test]
 fn chunk_offsets_near_the_end_of_u64_fail() {
-    // gif.mp4 has its moov last, so it can grow without moving the media.
     let input = fixture("gif.mp4");
     let path: [&[u8; 4]; 5] = [b"moov", b"trak", b"mdia", b"minf", b"stbl"];
     let (stco, _) = *find_path(&input, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stco"]).last().unwrap();
@@ -837,8 +757,6 @@ fn boxes_nested_without_end_fail() {
 
 #[test]
 fn progressive_files_leave_out_tracks_that_wont_play() {
-    // gif.mp4's video trak again, as a timecode track, as MP3 audio, and
-    // as Opus, which plays as it is.
     let input = fixture("gif.mp4");
     let (trak_start, trak_end) = find_path(&input, &[b"moov", b"trak"])[1];
     let trak = input[trak_start..trak_end].to_vec();
@@ -859,11 +777,8 @@ fn progressive_files_leave_out_tracks_that_wont_play() {
     let mut c = Converter::new(true);
     let out = convert(&mut c, &mut Worker::new(), &file, file.len());
     assert_eq!(c.mime, "video/mp4; codecs=\"vp09.00.41.08,opus\"");
-    // Two traks in the converted moov, and a trex each.
     assert_eq!(count(&out, *b"trak"), 2);
     assert_eq!(count(&out, *b"trex"), 2);
-    // Video that can't be converted fails the file rather than playing its
-    // sound alone.
     let hevc = insert(&input, &[b"moov"], &variant(9, b"soun", b"Opus"));
     let (stsd, _) = find_path(&hevc, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stsd"])[5];
     let mut hevc = hevc.clone();
@@ -872,9 +787,6 @@ fn progressive_files_leave_out_tracks_that_wont_play() {
     assert!(e.contains("no H.264 video"), "{e}");
 }
 
-/// Real site media can't be committed. Point `MBGA_MEDIA_SAMPLES` at a
-/// folder with X's CMAF (vinit.mp4, v0.m4s…, ainit.mp4, a0.m4s…) and
-/// progressive files (v.mp4, gif.mp4) to run them through too.
 #[test]
 fn local_samples() {
     let Ok(dir) = std::env::var("MBGA_MEDIA_SAMPLES") else {
@@ -898,8 +810,6 @@ fn local_samples() {
         out.extend(o.held);
         let src = write_temp(&format!("local-{prefix}-in.mp4"), &input);
         let dst = write_temp(&format!("local-{prefix}-out.mp4"), &out);
-        // X's video uses negative composition offsets, which ffmpeg reads
-        // shifted by the largest one; compare the timelines' shapes.
         assert_eq!(relative(packet_times(&src)), relative(packet_times(&dst)), "{init}");
         assert_eq!(w.decode_only, 0);
     }
@@ -913,10 +823,6 @@ fn local_samples() {
     }
 }
 
-// ------------------------------------------------------------- round two
-
-/// What worker.js does when a module instance grew too big: a fresh one,
-/// primed with the init and given the old one's state.
 fn recycle(c: &mut Converter) -> bool {
     if !c.recyclable() {
         return false;
@@ -932,8 +838,6 @@ fn recycle(c: &mut Converter) -> bool {
     true
 }
 
-/// The midgop fixture's first half, a drain, and the rest, recycling the
-/// converter after the drain if `recycling`.
 fn drain_midway(recycling: bool) -> (Vec<u8>, usize, bool) {
     let input = fixture("midgop.mp4");
     let mut c = Converter::new(false);
@@ -959,8 +863,6 @@ fn a_recycled_converter_carries_on_mid_gop() {
     let (want, want_replayed, _) = drain_midway(false);
     let (got, replayed, recycled) = drain_midway(true);
     assert!(recycled, "not recyclable after a drain");
-    // The fresh converter replays the GOP as the old one would have, rather
-    // than dropping the fragment's frames up to the next keyframe.
     assert!(want_replayed > 0);
     assert_eq!(replayed, want_replayed);
     assert_eq!(chunk_times(&got), chunk_times(&want));
@@ -972,7 +874,6 @@ fn recycling_keeps_segments_and_sizes() {
     let mut c = Converter::new(false);
     let mut w = Worker::new();
     w.append(&mut c, &fixture("video-init.mp4"));
-    // Smaller frames from the start: the converted init says so.
     w.size = (160, 90);
     let mut times = Vec::new();
     let mut moovs = 0;
@@ -980,11 +881,8 @@ fn recycling_keeps_segments_and_sizes() {
         let o = w.append(&mut c, &fixture(&format!("video-{i}.m4s")));
         moovs += count(&o.bytes, *b"moov");
         times.extend(chunk_times(&o.bytes));
-        // Every segment starts with a keyframe and is flushed, so nothing
-        // waits.
         assert!(recycle(&mut c), "segment {i}");
     }
-    // The size carried over: no new init after recycling.
     assert_eq!(moovs, 1);
     assert_eq!(times.len(), 90);
 }
@@ -996,7 +894,6 @@ fn aac_streams_recycle_only_before_decoding() {
     w.append(&mut c, &fixture("aac-init.mp4"));
     assert!(c.recyclable());
     w.append(&mut c, &fixture("aac-0.m4s"));
-    // The AAC decoder's overlap can't move to a new one: it would click.
     assert!(!c.recyclable());
     c.reset();
     assert!(c.recyclable());
@@ -1004,9 +901,6 @@ fn aac_streams_recycle_only_before_decoding() {
 
 #[test]
 fn a_fragment_appended_again_keeps_its_frames() {
-    // hls.js switching levels at once: remove() the current fragment, then
-    // append it again, without abort(). The decoder still holds the first
-    // copy's last frames, with the same timestamps as the second's.
     let units = units(&fixture("midgop.mp4"));
     let mut c = Converter::new(false);
     let mut w = Worker::new();
@@ -1014,8 +908,6 @@ fn a_fragment_appended_again_keeps_its_frames() {
         w.append(&mut c, u);
     }
     let first_copy = w.seq;
-    // units[3] runs from the keyframe at 1 s (shown at 1.067 s) for half a
-    // second.
     let range = 1_060_000..1_560_000;
     let mut again = Vec::new();
     let mut late = Vec::new();
@@ -1040,8 +932,6 @@ fn a_fragment_appended_again_keeps_its_frames() {
     }
     let o = w.drain(&mut c);
     collect(&o, w.seq);
-    // The first copy's held frames come out for it, and the second copy
-    // has every one of its frames.
     assert!(!late.is_empty());
     assert!(late.iter().all(|t| range.contains(t)));
     again.sort_unstable();
@@ -1054,15 +944,11 @@ fn a_frame_rate_cap_stretches_the_frames_kept() {
     let input = fixture("midgop.mp4");
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // 15 fps from 30.
     w.cap = Some(66_667);
     let out = convert(&mut c, &mut w, &input, input.len());
     let times = chunk_times(&out);
     assert!((29..=32).contains(&times.len()), "{} frames", times.len());
-    // Keyframes are always kept (the first frame is shown at 1024/15360 s).
     assert!(times.contains(&66_667) && times.contains(&1_066_667), "{times:?}");
-    // The kept frames last as long as all of them did, with no holes: each
-    // fragment starts where the one before ended.
     let mut end = None;
     let mut total = 0;
     for (base, durations) in fragment_spans(&out) {
@@ -1077,8 +963,6 @@ fn a_frame_rate_cap_stretches_the_frames_kept() {
     }
 }
 
-/// Each fragment's base decode time and sample durations, as written here
-/// (one track, tfdt version 1, trun with every field).
 fn fragment_spans(data: &[u8]) -> Vec<(i64, Vec<u32>)> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -1102,7 +986,6 @@ fn natural_size_is_the_inputs_display_size() {
     let o = Worker::new().append(&mut c, &fixture("video-init.mp4"));
     assert_eq!(o.inits, 1);
     assert_eq!(c.natural(), Some((320, 180)));
-    // Wide pixels, 4:3, in the entry's pasp: wider. Narrow ones: taller.
     for (h, v, natural) in [(4, 3, (427, 180)), (3, 4, (320, 240))] {
         let mut init = fixture("video-init.mp4");
         let pasp = init.windows(4).position(|w| w == b"pasp").unwrap() + 4;
@@ -1114,14 +997,11 @@ fn natural_size_is_the_inputs_display_size() {
     }
 }
 
-/// A progressive file with one Opus track of `count` one-byte samples,
-/// `delta` ticks apart at `timescale`, the last lasting `last` ticks.
 #[allow(clippy::similar_names)]
 fn opus_file(count: u32, delta: u32, timescale: u32, last: u32) -> Vec<u8> {
     opus_file_of(count, delta, timescale, last, 1)
 }
 
-/// The same with `size`-byte samples.
 #[allow(clippy::similar_names)]
 fn opus_file_of(count: u32, delta: u32, timescale: u32, last: u32, size: u32) -> Vec<u8> {
     let full = |kind: [u8; 4], body: &[u8]| make_box(kind, &[&[0u8; 4][..], body].concat());
@@ -1129,7 +1009,6 @@ fn opus_file_of(count: u32, delta: u32, timescale: u32, last: u32, size: u32) ->
     let mdat_header = 8;
     let data_at = (ftyp.len() + mdat_header) as u32;
     let mdat = make_box(*b"mdat", &vec![0x55; (count * size) as usize]);
-    // Version 0: the track id, and the timescale, 12 bytes into the body.
     let mut tkhd = [0u8; 84];
     tkhd[12..16].copy_from_slice(&1u32.to_be_bytes());
     let mut mdhd = [0u8; 24];
@@ -1161,20 +1040,17 @@ fn opus_file_of(count: u32, delta: u32, timescale: u32, last: u32, size: u32) ->
 
 #[test]
 fn a_sample_lasting_years_doesnt_plan_billions_of_fragments() {
-    // At a timescale of 1, the last sample claims 136 years.
     let input = opus_file(100, 1, 1, u32::MAX);
     let started = Instant::now();
     let mut c = Converter::new(true);
     let out = convert(&mut c, &mut Worker::new(), &input, input.len());
     assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
     assert_eq!(c.mime, "audio/mp4; codecs=\"opus\"");
-    // Fragments of about two seconds, and the last.
     assert!((45..=55).contains(&count(&out, *b"moof")), "{} fragments", count(&out, *b"moof"));
 }
 
 #[test]
 fn long_files_stream_in_linear_time() {
-    // Half a million samples, 50 a second: 5,000 fragments.
     let input = opus_file(500_000, 1, 50, 1);
     let started = Instant::now();
     let mut c = Converter::new(true);
@@ -1185,8 +1061,6 @@ fn long_files_stream_in_linear_time() {
 
 #[test]
 fn an_init_lost_with_a_failed_append_comes_again() {
-    // A file whose timestamps run out of range a few fragments in: the
-    // append fails, and the page never gets its output, init and all.
     let mut input = fixture("progressive.mp4");
     let mdhd = find_path(&input, &[b"moov", b"trak", b"mdia", b"mdhd"]).last().unwrap().0;
     set_u32(&mut input, mdhd + 20, 1);
@@ -1206,17 +1080,12 @@ fn an_init_lost_with_a_failed_append_comes_again() {
     };
     assert!(e.contains("out of range") && w.jobs > 0, "{e} after {} jobs", w.jobs);
     c.discard_output();
-    // The frames the decoder still held come with the init before them.
     let o = w.drain(&mut c);
     assert!(!o.held.is_empty());
     let at = |kind: &[u8]| o.held.windows(4).position(|w| w == kind).unwrap();
     assert!(at(b"moov") < at(b"moof"));
 }
 
-// ----------------------------------------------------------- round three
-
-/// The frames in an output, held groups first, with the append each came
-/// for.
 fn frames_by_seq(o: &Output, seq: f64) -> Vec<(f64, i64)> {
     let mut out = Vec::new();
     for g in &o.groups {
@@ -1229,9 +1098,6 @@ fn frames_by_seq(o: &Output, seq: f64) -> Vec<(f64, i64)> {
 
 #[test]
 fn a_different_init_over_the_same_times_keeps_both_streams_frames_apart() {
-    // An ABR switch that replaces what's buffered: a new init (here only
-    // its creation time differs), then the same times again, while the
-    // decoder still holds frames of the old stream at those times.
     let units = units(&fixture("midgop.mp4"));
     let mut init = units[0].clone();
     let (mvhd, _) = *find_path(&init, &[b"moov", b"mvhd"]).last().unwrap();
@@ -1245,8 +1111,6 @@ fn a_different_init_over_the_same_times_keeps_both_streams_frames_apart() {
     }
     let old_last = w.seq;
     let o = w.append(&mut c, &init);
-    // The old stream's frames come out now, for the appends they came in,
-    // before the new init.
     assert!(!o.groups.is_empty(), "the old frames weren't finished");
     assert!(o.groups.iter().all(|g| g.seq <= old_last));
     assert_eq!(count(&o.bytes, *b"moov"), 1);
@@ -1261,8 +1125,6 @@ fn a_different_init_over_the_same_times_keeps_both_streams_frames_apart() {
     frames.extend(frames_by_seq(&o, w.seq));
     let old: BTreeSet<i64> = frames.iter().filter(|f| f.0 < first_new).map(|f| f.1).collect();
     let new: Vec<i64> = frames.iter().filter(|f| f.0 >= first_new).map(|f| f.1).collect();
-    // Every frame of the two old fragments, and every frame of the new
-    // stream, its first keyframe included, once.
     assert_eq!(old.len(), 30, "{old:?}");
     assert_eq!(new.len(), 60, "{new:?}");
     assert_eq!(new.iter().collect::<BTreeSet<_>>().len(), 60);
@@ -1274,9 +1136,7 @@ fn natural_size_comes_with_the_first_init_and_where_frames_change_it() {
     let mut c = Converter::new(false);
     let mut w = Worker::new();
     let o = w.append(&mut c, &fixture("video-init.mp4"));
-    // The first comes with the init, before any frame, and applies at once.
     assert_eq!(o.natural, Some(Natural { width: 320, height: 180, at: None, seq: 1.0 }));
-    // The SPS (avc3) doubles the size from the keyframe at 1 s.
     w.revisible = Some((1_000_000, (640, 360)));
     let mut naturals = Vec::new();
     for i in 0..3 {
@@ -1288,7 +1148,6 @@ fn natural_size_comes_with_the_first_init_and_where_frames_change_it() {
     assert_eq!((n.width, n.height, n.seq), (640, 360, seq));
     let at = n.at.unwrap();
     assert!((1.0..1.1).contains(&at), "at {at}");
-    // The page may have lost it with an aborted append: again, at once.
     c.reset();
     let o = w.append(&mut c, &fixture("video-2.m4s"));
     assert_eq!(o.natural.map(|n| (n.width, n.height, n.at)), Some((640, 360, None)));
@@ -1308,7 +1167,6 @@ fn the_output_says_what_times_it_covers() {
         assert!(last_end.is_none_or(|e: f64| (e - start).abs() < 1e-6), "{last_end:?} then {start}");
         last_end = Some(end);
     }
-    // Muxed: both tracks' times.
     let mut c = Converter::new(false);
     let o = Worker::new().append(&mut c, &fixture("muxed.mp4"));
     let (start, end) = o.range.unwrap();
@@ -1317,7 +1175,6 @@ fn the_output_says_what_times_it_covers() {
 
 #[test]
 fn a_progressive_file_starts_at_the_keyframe_before_start() {
-    // Keyframes every second; start at 1.2 s, from the one at 1 s.
     let input = fixture("progressive.mp4");
     let mut c = Converter::new(true);
     c.set_start(1.2);
@@ -1326,21 +1183,16 @@ fn a_progressive_file_starts_at_the_keyframe_before_start() {
     let times = chunk_times(&out);
     assert_eq!(times.len(), 30, "{times:?}");
     assert!(times.iter().all(|&t| t >= 1_000_000), "{times:?}");
-    // Nothing before it was decoded.
     assert_eq!(w.encoded, 30);
     if has_ffmpeg() {
         let dst = write_temp("start-out.mp4", &out);
         assert_decode_order(&dst);
-        // Audio from the keyframe on, too, with one frame before it.
         let audio = &packet_times(&dst)[1].1;
         let first: i64 = audio.iter().map(|t| t.parse::<i64>().unwrap()).min().unwrap();
         assert!((40_000..44_100).contains(&first), "audio starts at {first}");
     }
 }
 
-/// Streams `file` in `step`-byte appends that say where they start, the
-/// way the shim does: after a reply with `need` it goes on from there, and
-/// the append it had already sent is dropped.
 fn stream_file(c: &mut Converter, w: &mut Worker, file: &[u8], step: usize) -> (Vec<u8>, Vec<u64>) {
     let mut out = Vec::new();
     let mut needs = Vec::new();
@@ -1350,13 +1202,11 @@ fn stream_file(c: &mut Converter, w: &mut Worker, file: &[u8], step: usize) -> (
         let o = w.append_at(c, &file[pos..end], pos as u64).expect("dropped");
         out.extend(o.held);
         out.extend(o.bytes);
-        // Never the whole of a big mdat: at most a fragment's worth.
         assert!(c.input.len() < 1 << 20, "{} bytes waiting", c.input.len());
         match o.need {
             Some(need) => {
                 needs.push(need);
                 if end < file.len() {
-                    // Sent before the shim heard: dropped, with an empty reply.
                     assert!(w.append_at(c, &file[end..(end + step).min(file.len())], end as u64).is_none());
                 }
                 pos = usize::try_from(need).unwrap();
@@ -1380,7 +1230,6 @@ fn a_progressive_file_asks_for_the_bytes_it_needs() {
     let times = chunk_times(&out);
     assert_eq!(times.len(), 30);
     assert!(times.iter().all(|&t| t >= 1_000_000));
-    // Without a start, the bytes run on and nothing is asked for.
     let mut c = Converter::new(true);
     let (out, needs) = stream_file(&mut c, &mut Worker::new(), &input, 4096);
     assert!(needs.is_empty());
@@ -1389,16 +1238,13 @@ fn a_progressive_file_asks_for_the_bytes_it_needs() {
 
 #[test]
 fn a_big_file_with_its_moov_last_asks_for_it_then_for_its_samples() {
-    // 4 MB of samples, then the moov.
     let file = opus_file_of(1000, 1, 50, 1, 4096);
     let moov_at = find_path(&file, &[b"moov"])[0].0;
     let mut c = Converter::new(true);
     let (out, needs) = stream_file(&mut c, &mut Worker::new(), &file, 65536);
     let ftyp_and_mdat_header = 20 + 8;
     assert_eq!(needs, [moov_at as u64, ftyp_and_mdat_header], "moov at {moov_at}");
-    // Two-second fragments of 50 samples a second, all there.
     assert_eq!(count(&out, *b"moof"), 10);
-    // A small one just streams through.
     let file = opus_file_of(100, 1, 50, 1, 4096);
     let mut c = Converter::new(true);
     let (out, needs) = stream_file(&mut c, &mut Worker::new(), &file, 65536);
@@ -1411,8 +1257,6 @@ fn an_avc3_stream_whose_sps_changes_its_size() {
     let units = units(&fixture("avc3.mp4"));
     let mut c = Converter::new(false);
     let mut w = Worker::new();
-    // The decoder puts the second second out at 480x270, as its SPS says
-    // (from 16384/15360 s).
     w.revisible = Some((1_066_667, (480, 270)));
     let mut naturals = Vec::new();
     let mut out = Vec::new();

@@ -1,8 +1,5 @@
 import AppKit
 
-/// A tab popped out of the sidebar into a small window of its own, like
-/// Arc's Little Arc. The tab stays in its space; closing the window, "Open
-/// in Sidebar" or selecting the tab in the sidebar puts it back.
 @MainActor
 final class LittleWindow: NSObject, NSWindowDelegate {
     let tabID: UInt64
@@ -37,7 +34,6 @@ final class LittleWindow: NSObject, NSWindowDelegate {
             window.makeKeyAndOrderFront(nil)
             return
         }
-        // Grows out of where it was opened.
         let frame = window.frame
         window.setFrame(frame.insetBy(dx: frame.width * 0.06, dy: frame.height * 0.06), display: false)
         window.alphaValue = 0
@@ -50,7 +46,6 @@ final class LittleWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    /// Closes the window and selects the tab in the main window.
     func putBack() {
         returnToSidebar = true
         fadeOutAndClose()
@@ -58,7 +53,6 @@ final class LittleWindow: NSObject, NSWindowDelegate {
 
     private var closing = false
 
-    /// The reverse of `show`: it shrinks back a little as it fades.
     private func fadeOutAndClose() {
         guard !closing else { return }
         closing = true
@@ -77,13 +71,11 @@ final class LittleWindow: NSObject, NSWindowDelegate {
         }
     }
 
-    /// The close button fades the window out too.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         fadeOutAndClose()
         return false
     }
 
-    /// Closes the window when its tab goes away; the store has the view.
     func dismiss() {
         window.delegate = nil
         fadeOutAndClose()
@@ -93,7 +85,6 @@ final class LittleWindow: NSObject, NSWindowDelegate {
         store?.littleWindowClosed(tabID, select: returnToSidebar)
     }
 
-    /// Centered on where the tab was dropped, kept on that screen.
     private func place(near point: NSPoint?) {
         guard let point, let screen = NSScreen.screens.first(where: { $0.frame.contains(point) }) ?? NSScreen.main else {
             window.center()
@@ -107,8 +98,6 @@ final class LittleWindow: NSObject, NSWindowDelegate {
     }
 }
 
-/// The little window's content: a bar with the tab's icon, title and site
-/// and "Open in Sidebar", above the page as a card on the space's color.
 private final class LittleWindowView: FlippedView {
     private let tabID: UInt64
     private let store: BrowserStore
@@ -171,7 +160,6 @@ private final class LittleWindowView: FlippedView {
         }
         let stops = Theme.gradient(for: RGB(space?.color ?? Theme.spaceColors[0]), dark: effectiveAppearance.isDark,
                                    active: true, style: TintStyle.saved)
-        // A colour change washes in; the first one is just there.
         backdrop.setColors(stops.map(\.cgColor), curve: window?.isVisible == true ? Motion.fade : nil)
         needsLayout = true
     }
@@ -185,7 +173,6 @@ private final class LittleWindowView: FlippedView {
         super.layout()
         backdrop.frame = bounds
         bar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: 36)
-        // Room for the traffic lights.
         icon.frame = NSRect(x: 74, y: 11, width: 14, height: 14)
         let backWidth = back.intrinsicContentSize.width + 8
         back.frame = NSRect(x: bounds.width - 10 - backWidth, y: 8, width: backWidth, height: 20)

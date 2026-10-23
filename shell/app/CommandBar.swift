@@ -1,8 +1,5 @@
 import AppKit
 
-/// Arc-style command bar: type a URL or search, jump to an open tab or a
-/// space, run a command, or reopen something closed. Results come in
-/// sections, each row shows its shortcut, and ⌘↩ always searches the web.
 @MainActor
 final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private let store: BrowserStore
@@ -36,8 +33,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         case item(Item, index: Int)
     }
 
-    /// MBGA_DEBUG_COMMAND opens the bar at launch with this text, for
-    /// screenshots of the results.
     static let debugPreset = ProcessInfo.processInfo.environment["MBGA_DEBUG_COMMAND"].flatMap { $0.isEmpty ? nil : $0 }
 
     init(store: BrowserStore, mode: CommandBarMode) {
@@ -101,7 +96,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         bottomRule.backgroundColor = Theme.faint(0.08).cgColor
     }
 
-    /// Eases in fast enough to feel instant, and takes the keyboard.
     func present() {
         layoutSubtreeIfNeeded()
         window?.makeFirstResponder(field)
@@ -131,8 +125,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
 
     private var dismissing = false
 
-    /// The reverse of `present`, a little quicker: the card shrinks back and
-    /// fades with the dimming, then `completion` removes it.
     func dismiss(_ completion: @escaping @MainActor () -> Void) {
         dismissing = true
         guard !Motion.reduced, let layer = card.layer else {
@@ -161,11 +153,8 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         CATransaction.commit()
     }
 
-    // Clicks pass through to the page while it fades away.
     override func hitTest(_ point: NSPoint) -> NSView? { dismissing ? nil : super.hitTest(point) }
 
-    /// Set when results change, so the card grows or shrinks to fit them
-    /// instead of jumping.
     private var resizeAnimated = false
 
     override func layout() {
@@ -187,7 +176,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         }
         searchIcon.frame = NSRect(x: 16, y: 17, width: 20, height: 20)
         field.frame = NSRect(x: 46, y: 14, width: width - 62, height: 26)
-        // The hairlines follow the card; the list and footer fade.
         topRule.isHidden = !hasResults
         bottomRule.isHidden = !hasResults
         for part in [scroll, footer] as [NSView] {
@@ -200,8 +188,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         footer.frame = NSRect(x: 14, y: height - 22, width: width - 28, height: 14)
         CATransaction.commit()
     }
-
-    // MARK: - Results
 
     private var query: String { field.stringValue.trimmingCharacters(in: .whitespaces) }
 
@@ -243,9 +229,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
             }
         }
 
-        // A site the query starts ("git" for github.com) is the likeliest
-        // destination, so it comes first (as its open tab, if there is one),
-        // then the literal address or search.
         var top: [Item] = []
         if !isAddress, let best = history.first, best.sitePrefix {
             if let open = openTabs[best.url] {
@@ -281,7 +264,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        // A section title sits closer to its rows than to the ones above.
         if case .header = rows[row] { return 30 }
         return 34
     }
@@ -299,7 +281,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         case .header(let title):
             let cell = NSTableCellView()
             let label = Label.make(title, size: 11, weight: .semibold, color: .secondaryLabelColor)
-            // The cell isn't flipped: 3 pt from the bottom, 13 from the top.
             label.frame = NSRect(x: 10, y: 3, width: 300, height: 14)
             cell.addSubview(label)
             return cell
@@ -337,7 +318,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         }
     }
 
-    /// "https://www.example.com/a" as "example.com/a".
     private static func address(_ url: String) -> String {
         var s = url
         for prefix in ["https://", "http://", "www."] where s.hasPrefix(prefix) { s.removeFirst(prefix.count) }
@@ -351,7 +331,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         guard old != selection else { return }
         for (row, entry) in rows.enumerated() {
             guard case .item(_, let index) = entry, index == old || index == selection else { continue }
-            // The highlight moves with a quick fade rather than a jump.
             FillLayer.animated(Motion.quick) {
                 (table.rowView(atRow: row, makeIfNecessary: false) as? CommandRowView)?.highlighted = index == selection
             }
@@ -393,8 +372,6 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
         }
     }
 
-    // MARK: - Keyboard and mouse
-
     func controlTextDidChange(_ obj: Notification) { reload() }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
@@ -418,12 +395,10 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
     }
 
     override func mouseDown(with event: NSEvent) {
-        // A click outside the card closes the bar.
         if !card.frame.contains(convert(event.locationInWindow, from: nil)) { store.commandBar = nil }
     }
 }
 
-/// The bar's solid card: glass behind text this size hurts legibility.
 private final class CommandBarCard: FlippedView {
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -487,7 +462,6 @@ private final class CommandRowView: NSTableRowView {
     override func drawSelection(in dirtyRect: NSRect) {}
 }
 
-/// A result row: icon, title, quieter subtitle and a shortcut chip.
 private final class CommandItemCell: NSTableCellView {
     private let icon = NSImageView()
     private let emoji = Label.make(size: 13)
@@ -561,14 +535,12 @@ private final class CommandItemCell: NSTableCellView {
 }
 
 private extension NSTableView {
-    /// Height of all rows, for sizing the bar to its results.
     var intrinsicListHeight: CGFloat {
         guard numberOfRows > 0 else { return 0 }
         return rect(ofRow: numberOfRows - 1).maxY
     }
 }
 
-/// A command the bar can run, found by its title or other words for it.
 struct CommandAction {
     let id: String
     let title: String
@@ -583,7 +555,6 @@ struct CommandAction {
         return query.lowercased().split(separator: " ").allSatisfy { q in words.contains { $0.hasPrefix(q) } }
     }
 
-    /// The commands that make sense right now.
     @MainActor
     static func all(for store: BrowserStore) -> [Self] {
         var list: [Self] = []
@@ -726,7 +697,6 @@ struct CommandAction {
         return list
     }
 
-    /// Developer Mode's tools, and the switch to turn it on.
     @MainActor
     private static func developerActions(for store: BrowserStore) -> [Self] {
         var list = [

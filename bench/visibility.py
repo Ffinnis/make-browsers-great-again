@@ -38,7 +38,7 @@ def launch(data, spaces, **env):
         stderr=subprocess.DEVNULL,
     )
     wait_for_window(proc.pid)
-    time.sleep(6)  # the other spaces' tabs load 2.5 s after launch
+    time.sleep(6)
     return proc, socket
 
 
@@ -134,13 +134,12 @@ def main():
     mbga(socket, "focus", ids[b])
     expect("and another", proc.pid, b, [pinned, other, a, b])
     mbga(socket, "focus", ids[other])
-    time.sleep(1)  # the space switch crossfades
+    time.sleep(1)
     expect("a tab in the other space", proc.pid, other, [pinned, other, a, b])
     mbga(socket, "focus", ids[a])
     time.sleep(1)
     expect("back to the first space", proc.pid, a, [pinned, other, a, b])
     shot = mbga(socket, "screenshot", "--tab", ids[b]).split(" (")[0].strip()
-    # A page that drew nothing comes back as a small blank PNG.
     ok = os.path.exists(shot) and os.path.getsize(shot) > 50_000
     log(
         f"{'ok  ' if ok else 'FAIL'} an agent's screenshot of a hidden tab "

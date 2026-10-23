@@ -1,18 +1,10 @@
 import AppKit
-import JavaScriptCore
-
-// The commands agents run, built to keep their context small: a page is a
-// short outline of what can be read and used, each element with a ref
-// ("e12") to act on, instead of HTML or screenshots. Pages are read through
-// a JavaScript world of MBGA's own, which shares the page's DOM but not its
-// scripts, and acted on with real (trusted) input events.
 
 struct AgentError: Error {
     let message: String
     init(_ message: String) { self.message = message }
 }
 
-/// Lets only the first of a reply and a timeout through.
 @MainActor
 private final class Once {
     private var done = false
@@ -22,46 +14,22 @@ private final class Once {
     }
 }
 
-/// Parsed command line: words, and --flags with optional values.
-struct AgentArguments {
-    var words: [String] = []
-    var flags: [String: String] = [:]
-    /// Which agent is asking: each has its own current tab.
-    var session = "default"
+@MainActor
+final class DrawingHolds {
+    var releases: [UInt64: () -> Void] = [:]
 
-    init(_ argv: ArraySlice<String>) {
-        var rest = argv[...]
-        while let arg = rest.popFirst() {
-            if arg.hasPrefix("--"), arg.count > 2 {
-                let body = arg.dropFirst(2)
-                if let eq = body.firstIndex(of: "=") {
-                    flags[String(body[..<eq])] = String(body[body.index(after: eq)...])
-                } else if ["tab", "max", "out", "timeout", "body", "filter"].contains(body), let value = rest.popFirst() {
-                    flags[String(body)] = value
-                } else {
-                    flags[String(body)] = ""
-                }
-            } else if arg == "-t", let value = rest.popFirst() {
-                flags["tab"] = value
-            } else {
-                words.append(arg)
-            }
-        }
+    func releaseAll() {
+        releases.values.forEach { $0() }
+        releases = [:]
     }
-
-    func has(_ flag: String) -> Bool { flags[flag] != nil }
-    func int(_ flag: String) -> Int? { flags[flag].flatMap { Int($0) } }
-    subscript(_ i: Int) -> String? { words.indices.contains(i) ? words[i] : nil }
 }
 
 @MainActor
 final class AgentCommands {
+    @TaskLocal static var drawing: DrawingHolds?
     private let store: BrowserStore
-    /// MBGA's JavaScript world in each frame, by execution context.
     private var worlds: [WorldKey: Int] = [:]
-    /// Each agent's current tab.
     private var sessionTabs: [String: UInt64] = [:]
-    /// The cross-site frames the last snapshot of each tab numbered.
     private var frameNumbers: [UInt64: [Int: FrameRef]] = [:]
 
     private struct WorldKey: Hashable {
@@ -69,8 +37,6 @@ final class AgentCommands {
         let frame: String?
     }
 
-    /// A frame of a page: its id, and the DevTools session reaching it if
-    /// it runs in a process of its own.
     struct FrameRef {
         let id: String
         let session: String?
@@ -87,8 +53,10 @@ final class AgentCommands {
         let command = argv[0].lowercased()
         var args = AgentArguments(argv.dropFirst())
         args.session = session
+        let drawing = DrawingHolds()
+        defer { drawing.releaseAll() }
         do {
-            return .success(try await perform(command, args))
+            return try .success(await Self.$drawing.withValue(drawing) { try await perform(command, args) })
         } catch let error as AgentError {
             return .failure(error.message)
         } catch {
@@ -127,10 +95,6 @@ final class AgentCommands {
         }
     }
 
-    // MARK: Tabs
-
-    /// The tab a command is for: --tab, else the one the agent last used,
-    /// else the one on screen.
     private func target(_ args: AgentArguments) throws -> UInt64 {
         if let name = args.flags["tab"] {
             guard let id = UInt64(name.hasPrefix("t") ? String(name.dropFirst()) : name), store.core.tab(id: id) != nil else {
@@ -143,18 +107,19 @@ final class AgentCommands {
         return id
     }
 
-    /// The tab's page, loading it if it was asleep. Sites the person keeps
-    /// agents off are refused.
     private func page(_ id: UInt64) async throws -> MBWebView {
         if let url = store.core.tab(id: id)?.url { try allow(url) }
         let loaded = store.isLoaded(id)
         guard let view = store.engineView(for: id) else { throw AgentError("Tab t\(id) has no page.") }
         if !loaded { try await waitForLoad(id, timeout: 15) }
-        // From now on its requests are logged and its cross-site frames
-        // can be read.
         view.recordsNetwork = true
         view.attachToFrames()
         store.agentActed(on: id)
+        if Self.drawing?.releases[id] == nil {
+            let hold = store.holdDrawing(id)
+            if let drawing = Self.drawing { drawing.releases[id] = hold.release } else { hold.release() }
+            if hold.started { try await Task.sleep(for: .milliseconds(300)) }
+        }
         return view
     }
 
@@ -166,13 +131,13 @@ final class AgentCommands {
 
     private func line(_ id: UInt64) -> String {
         guard let tab = store.core.tab(id: id) else { return "t\(id)" }
-        var text = "t\(id) \(tab.title.isEmpty ? "Untitled" : tab.title) — \(tab.url)"
+        let untitled = tab.title.isEmpty || tab.url == tab.title || tab.url.hasSuffix("://" + tab.title)
+        var text = untitled ? "t\(id) \(tab.url)" : "t\(id) \(tab.title) — \(tab.url)"
         let report = store.devReport(of: id)
         if let status = report.statusText, (report.status ?? 0) >= 400 || (report.status ?? 0) < 0 { text += " (\(status))" }
         return text
     }
 
-    /// The agents' space and the one on screen (every space with --all).
     private func tabs(_ args: AgentArguments) -> String {
         var out: [String] = []
         let agents = store.agentPreferences.ownSpace ? store.agentPreferences.spaceID : nil
@@ -184,7 +149,6 @@ final class AgentCommands {
             if space.id == agents { title += " (agents' space)" }
             if space.id == store.activeSpace.id { title += " (on screen)" }
             out.append(title + ":")
-            // The agents' space shows the person's favourites too; they aren't the agents' tabs.
             let tabs = (space.id == agents ? [] : space.favorites) + space.pinned.compactMap(\.tab) + space.today
             if tabs.isEmpty { out.append("  (no tabs)") }
             for tab in tabs {
@@ -205,6 +169,7 @@ final class AgentCommands {
         sessionTabs[args.session] = id
         _ = try await page(id)
         try await waitForLoad(id, timeout: Double(args.int("timeout") ?? 15))
+        try await waitForQuiet(id, limit: 3)
         return line(id)
     }
 
@@ -245,8 +210,6 @@ final class AgentCommands {
         return out.joined(separator: "\n")
     }
 
-    // MARK: Reading
-
     private func snapshot(_ args: AgentArguments) async throws -> String {
         let id = try target(args)
         let view = try await page(id)
@@ -275,18 +238,21 @@ final class AgentCommands {
         guard !args.words.isEmpty else { throw AgentError("Usage: mbga eval '<expression>' (runs in the page's own world)") }
         let id = try target(args)
         let view = try await page(id)
-        // In the page's world, so its own globals and frameworks are there.
-        let result = try await cdp(view, "Runtime.evaluate", [
-            "expression": args.words.joined(separator: " "), "returnByValue": true, "awaitPromise": true,
-            "userGesture": true,
-        ])
+        let timeout = Double(args.int("timeout") ?? 60)
+        let result: [String: Any]
+        do {
+            result = try await cdp(view, "Runtime.evaluate", [
+                "expression": args.words.joined(separator: " "), "returnByValue": true, "awaitPromise": true,
+                "userGesture": true,
+            ], timeout: timeout)
+        } catch let error as AgentError where error.message.hasPrefix("The page didn't answer") {
+            throw AgentError("The code didn't finish within \(Int(timeout)) s (--timeout to allow more).")
+        }
         if let exception = result["exceptionDetails"] as? [String: Any] { throw AgentError(Self.describe(exception)) }
         let value = (result["result"] as? [String: Any])?["value"]
         return Self.json(value)
     }
 
-    /// `cdp <method> [json]`, in test copies only: a raw DevTools command,
-    /// for checking what the inspector sends.
     private func rawCommand(_ args: AgentArguments) async throws -> String {
         guard let method = args[0] else { throw AgentError("Usage: mbga cdp <method> [json]") }
         let view = try await page(try target(args))
@@ -296,8 +262,6 @@ final class AgentCommands {
         return Self.json(try await cdp(view, method, params, timeout: args.int("timeout").map(Double.init) ?? 5))
     }
 
-    /// `inspector <panel|at|eval|select|source|row> [arg]`, in test copies
-    /// only: drives the inspector sidebar on the visible tab.
     private func inspectorCommand(_ args: AgentArguments) async throws -> String {
         let action = args[0] ?? ""
         let rest = args.words.dropFirst().joined(separator: " ")
@@ -305,7 +269,6 @@ final class AgentCommands {
             store.showInspector(panel)
             return "showing \(panel.rawValue)"
         }
-        // As if "Inspect" were chosen at a point of the page, in CSS pixels.
         if action == "at" {
             let view = try await page(try target(args))
             let point = rest.split(separator: " ").compactMap { Double($0) }
@@ -353,15 +316,13 @@ final class AgentCommands {
         return out.joined(separator: "\n")
     }
 
-    /// Requests since the agent first used the tab: number, method,
-    /// status, type, path, size, time. --body N prints a response.
     private func network(_ args: AgentArguments) async throws -> String {
         let id = try target(args)
         let view = try await page(id)
         var entries = store.networkEntries(of: id)
         if let number = args.flags["body"].flatMap({ Int($0.trimmingCharacters(in: CharacterSet(charactersIn: "#"))) }) {
             guard let entry = entries.first(where: { $0.number == number }) else { throw AgentError("No request #\(number).") }
-            let body = try await cdp(view, "Network.getResponseBody", ["requestId": entry.requestID])
+            let body = try await responseBody(view, entry)
             var text = body["body"] as? String ?? ""
             if body["base64Encoded"] as? Bool == true { text = "(\(Data(base64Encoded: text)?.count ?? 0) bytes of binary data)" }
             let max = args.int("max") ?? 6000
@@ -393,30 +354,41 @@ final class AgentCommands {
         return out.joined(separator: "\n")
     }
 
-    // MARK: Acting
-
     private func click(_ args: AgentArguments) async throws -> String {
         let target = try await element(args, usage: "mbga click <ref> [--force]")
         let (id, view) = (target.id, target.view)
-        let (x, y, label, covered) = try await point(target)
-        if !covered.isEmpty, !args.has("force") {
-            throw AgentError("\(label) is covered by \(covered). Close that first, or use --force to click whatever is on top.")
+        let spot = try await point(target)
+        let label = spot.label
+        if !spot.covered.isEmpty, !args.has("force") {
+            throw AgentError("\(label) is covered by \(spot.covered). Close that first, or use --force to click whatever is on top.")
+        }
+        if spot.disabled, !args.has("force") {
+            throw AgentError("\(label) is disabled, so the page ignores clicks on it. Fill in what it asks for first, or use --force to click anyway.")
         }
         let before = store.core.tab(id: id)?.url
+        let requests = store.networkEntries(of: id).last?.number
         for type in ["mouseMoved", "mousePressed", "mouseReleased"] {
             _ = try await cdp(view, "Input.dispatchMouseEvent", [
-                "type": type, "x": x, "y": y, "button": type == "mouseMoved" ? "none" : "left",
+                "type": type, "x": spot.x, "y": spot.y, "button": type == "mouseMoved" ? "none" : "left",
                 "buttons": type == "mousePressed" ? 1 : 0, "clickCount": type == "mouseMoved" ? 0 : 1,
             ])
         }
-        return "clicked \(label)" + (try await settle(id, from: before))
+        let moved = try await settle(id, from: before, requests: requests)
+        guard moved.isEmpty else { return "clicked \(label)" + moved }
+        let now = try? await call(id, view, "state", target.ref, in: target.frame) as? [String: Any]
+        guard let now, let after = now["label"] as? String else { return "clicked \(label)" }
+        let prefix = target.frameNumber.map { "f\($0):" } ?? ""
+        if let checked = spot.checked, now["checked"] as? Bool == checked {
+            return "clicked \(prefix + after)\nIt's still \(checked ? "checked" : "unchecked"): the page didn't take the click there. Try its label (click text=<its words>)."
+        }
+        return "clicked \(prefix + after)"
     }
 
     private func hover(_ args: AgentArguments) async throws -> String {
         let target = try await element(args, usage: "mbga hover <ref>")
-        let (x, y, label, _) = try await point(target)
-        _ = try await cdp(target.view, "Input.dispatchMouseEvent", ["type": "mouseMoved", "x": x, "y": y])
-        return "hovering \(label)"
+        let spot = try await point(target)
+        _ = try await cdp(target.view, "Input.dispatchMouseEvent", ["type": "mouseMoved", "x": spot.x, "y": spot.y])
+        return "hovering \(spot.label)"
     }
 
     private func fill(_ args: AgentArguments, append: Bool) async throws -> String {
@@ -426,7 +398,6 @@ final class AgentCommands {
         let text = args.words.dropFirst().joined(separator: " ")
         let prefix = target.frameNumber.map { "f\($0):" } ?? ""
         let label = prefix + (try await call(id, view, "focus", ["ref": ref, "select": !append], in: frame) as? String ?? ref)
-        // Typing goes to the frame's own process when it has one.
         if text.isEmpty {
             try await key(view, "Backspace", session: frame?.session)
         } else {
@@ -434,10 +405,10 @@ final class AgentCommands {
         }
         let before = store.core.tab(id: id)?.url
         if args.has("enter") {
+            let requests = store.networkEntries(of: id).last?.number
             try await key(view, "Enter", session: frame?.session)
-            return "filled \(label) and pressed Enter" + (try await settle(id, from: before))
+            return "filled \(label) and pressed Enter" + (try await settle(id, from: before, requests: requests))
         }
-        // As it is now, with the text in it.
         return "filled " + ((try? await call(id, view, "label", ref, in: frame) as? String).map { prefix + $0 } ?? label)
     }
 
@@ -446,8 +417,9 @@ final class AgentCommands {
         let id = try target(args)
         let view = try await page(id)
         let before = store.core.tab(id: id)?.url
+        let requests = store.networkEntries(of: id).last?.number
         for _ in 0..<(args.int("times") ?? 1) { try await key(view, name) }
-        return "pressed \(name)" + (try await settle(id, from: before))
+        return "pressed \(name)" + (try await settle(id, from: before, requests: requests))
     }
 
     private func select(_ args: AgentArguments) async throws -> String {
@@ -455,33 +427,6 @@ final class AgentCommands {
         let target = try await element(args, usage: "")
         let value = args.words.dropFirst().joined(separator: " ")
         return try await call(target.id, target.view, "choose", ["ref": target.ref, "value": value], in: target.frame) as? String ?? ""
-    }
-
-    private func scroll(_ args: AgentArguments) async throws -> String {
-        let id = try target(args)
-        let view = try await page(id)
-        let word = args[0] ?? "down"
-        if (word.hasPrefix("e") && Int(word.dropFirst()) != nil) || word.hasPrefix("f") || word.contains("=") {
-            let target = try await element(args, usage: "")
-            if let number = target.frameNumber { _ = try await call(id, view, "frameBox", number) }
-            return try await call(id, view, "reveal", target.ref, in: target.frame) as? String ?? ""
-        }
-        let size = try await call(id, view, "viewport", nil) as? [String: Any] ?? [:]
-        let width = size["width"] as? Double ?? 800, height = size["height"] as? Double ?? 600
-        let amount = args[1].flatMap(Double.init) ?? height * 0.8
-        let (dx, dy): (Double, Double) = switch word {
-        case "up": (0, -amount)
-        case "left": (-amount, 0)
-        case "right": (amount, 0)
-        case "top": (0, -1e7)
-        case "bottom": (0, 1e7)
-        default: (0, amount)
-        }
-        _ = try await cdp(view, "Input.dispatchMouseEvent", [
-            "type": "mouseWheel", "x": width / 2, "y": height / 2, "deltaX": dx, "deltaY": dy,
-        ])
-        try await Task.sleep(for: .milliseconds(250))
-        return try await call(id, view, "position", nil) as? String ?? "scrolled"
     }
 
     private func navigate(_ command: String, _ args: AgentArguments) async throws -> String {
@@ -495,6 +440,7 @@ final class AgentCommands {
         }
         try await Task.sleep(for: .milliseconds(150))
         try await waitForLoad(id, timeout: 15)
+        try await waitForQuiet(id, limit: 3)
         return line(id)
     }
 
@@ -508,13 +454,14 @@ final class AgentCommands {
         view.loadURL(url)
         try await Task.sleep(for: .milliseconds(150))
         try await waitForLoad(id, timeout: Double(args.int("timeout") ?? 15))
+        try await waitForQuiet(id, limit: 3)
         return line(id)
     }
 
     private func wait(_ args: AgentArguments) async throws -> String {
         let id = try target(args)
         let timeout = Double(args.int("timeout") ?? 15)
-        guard let what = args[0] else { throw AgentError("Usage: mbga wait load | <ms> | text <text> | gone <text>") }
+        guard let what = args[0] else { throw AgentError("Usage: mbga wait load | idle | <ms> | text <text> | gone <text>") }
         if let ms = Int(what) {
             try await Task.sleep(for: .milliseconds(ms))
             return "waited \(ms) ms"
@@ -523,9 +470,17 @@ final class AgentCommands {
             try await waitForLoad(id, timeout: timeout)
             return line(id)
         }
+        if what == "idle" {
+            _ = try await page(id)
+            try await waitForLoad(id, timeout: timeout)
+            guard try await waitForQuiet(id, limit: timeout) else {
+                throw AgentError("t\(id) was still making requests after \(Int(timeout)) s (`mbga network` shows them).")
+            }
+            return "idle: " + line(id)
+        }
         let text = args.words.dropFirst().joined(separator: " ")
         guard what == "text" || what == "gone", !text.isEmpty else {
-            throw AgentError("Usage: mbga wait load | <ms> | text <text> | gone <text>")
+            throw AgentError("Usage: mbga wait load | idle | <ms> | text <text> | gone <text>")
         }
         let view = try await page(id)
         let deadline = Date().addingTimeInterval(timeout)
@@ -544,8 +499,6 @@ final class AgentCommands {
         let width = size["width"] as? Double ?? 800, height = size["height"] as? Double ?? 600
         let full = args.has("full")
         var params: [String: Any] = ["format": "png"]
-        // At CSS pixels, not the display's: a quarter of the size for the same
-        // detail an agent can use.
         let scale = 1 / max(size["dpr"] as? Double ?? 1, 1)
         if full {
             let page = size["page"] as? Double ?? height
@@ -555,11 +508,6 @@ final class AgentCommands {
             let scrollY = size["scrollY"] as? Double ?? 0, scrollX = size["scrollX"] as? Double ?? 0
             params["clip"] = ["x": scrollX, "y": scrollY, "width": width, "height": height, "scale": scale]
         }
-        // A tab out of sight draws nothing to capture: it draws behind the
-        // page on screen meanwhile, where the person doesn't see it.
-        let restore = store.renderBehind(id)
-        defer { restore() }
-        if id != store.visibleTabID { try await Task.sleep(for: .milliseconds(300)) }
         let result = try await cdp(view, "Page.captureScreenshot", params, timeout: 10)
         guard let base64 = result["data"] as? String, let data = Data(base64Encoded: base64) else {
             throw AgentError("The screenshot failed.")
@@ -570,23 +518,15 @@ final class AgentCommands {
         return "\(path) (\(Int(width)) × \(Int(full ? (size["page"] as? Double ?? height) : height)))"
     }
 
-    // MARK: Scripts
-
-    /// `mbga run`: a script with the commands as async functions, run here
-    /// so one call can open, act and extract across pages, and only what it
-    /// returns or logs comes back.
     private func runScript(_ args: AgentArguments) async throws -> String {
         guard let source = args.words.first, !source.isEmpty else {
             throw AgentError("Usage: mbga run <file.js | - | -e 'code'>")
         }
+        if args.has("tab") { sessionTabs[args.session] = try target(args) }
         let script = AgentScriptRunner(commands: self, session: args.session, timeout: Double(args.int("timeout") ?? 120))
         return try await script.run(source)
     }
 
-    // MARK: Helpers
-
-    /// The element a command names: a ref (in a cross-site frame for
-    /// "fN:eM"), css= or text=.
     private func element(_ args: AgentArguments, usage: String) async throws -> Target {
         guard var ref = args[0] else { throw AgentError("Usage: \(usage)") }
         let id = try target(args)
@@ -607,37 +547,6 @@ final class AgentCommands {
         let ref: String
         let frame: FrameRef?
         let frameNumber: Int?
-    }
-
-    /// Where on the page to click an element: in a frame, its point in the
-    /// frame plus the frame's place on the page.
-    private func point(_ target: Target) async throws -> (x: Double, y: Double, label: String, covered: String) {
-        var origin = (x: 0.0, y: 0.0)
-        if let number = target.frameNumber {
-            let box = try await call(target.id, target.view, "frameBox", number) as? [String: Any] ?? [:]
-            origin = (box["x"] as? Double ?? 0, box["y"] as? Double ?? 0)
-        }
-        let point = try await call(target.id, target.view, "point", target.ref, in: target.frame) as? [String: Any] ?? [:]
-        return (origin.x + (point["x"] as? Double ?? 0), origin.y + (point["y"] as? Double ?? 0),
-                (target.frameNumber.map { "f\($0):" } ?? "") + (point["label"] as? String ?? target.ref),
-                point["covered"] as? String ?? "")
-    }
-
-    /// After an action: waits for a navigation it started, and says where
-    /// the page went.
-    private func settle(_ id: UInt64, from before: String?) async throws -> String {
-        try await Task.sleep(for: .milliseconds(200))
-        if store.navState(of: id).isLoading { try await waitForLoad(id, timeout: 15) }
-        guard let after = store.core.tab(id: id)?.url, after != before else { return "" }
-        return "\n→ " + line(id)
-    }
-
-    private func waitForLoad(_ id: UInt64, timeout: Double) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while store.navState(of: id).isLoading || !store.isLoaded(id) {
-            guard Date() < deadline else { throw AgentError("t\(id) is still loading after \(Int(timeout)) s.") }
-            try await Task.sleep(for: .milliseconds(100))
-        }
     }
 
     private func key(_ view: MBWebView, _ name: String, session: String? = nil) async throws {
@@ -689,8 +598,6 @@ final class AgentCommands {
         _ = try await cdp(view, "Input.dispatchKeyEvent", up, session: session)
     }
 
-    /// A DevTools command, given up on after `timeout` so no command hangs
-    /// (a page can stop answering, or wait for a frame that never comes).
     private func cdp(_ view: MBWebView, _ method: String, _ params: [String: Any]? = nil,
                      session: String? = nil, timeout: Double = 20) async throws -> [String: Any] {
         let json = try params.map { String(decoding: try JSONSerialization.data(withJSONObject: $0), as: UTF8.self) }
@@ -710,8 +617,6 @@ final class AgentCommands {
         return (try? JSONSerialization.jsonObject(with: Data(text.utf8))) as? [String: Any] ?? [:]
     }
 
-    /// Calls one of AgentScript's functions in MBGA's world in the tab's
-    /// page, making the world first (again after a navigation).
     private func call(_ id: UInt64, _ view: MBWebView, _ function: String, _ argument: Any?,
                       in frame: FrameRef? = nil) async throws -> Any? {
         let argumentJSON = argument.map { Self.json($0) } ?? "null"
@@ -728,7 +633,6 @@ final class AgentCommands {
             }
             if let exception = result["exceptionDetails"] as? [String: Any] {
                 let message = Self.describe(exception)
-                // The world went with the page it was made in.
                 if attempt == 0, message.contains("__mbga is not defined") { continue }
                 throw AgentError(message.replacingOccurrences(of: "Error: ", with: ""))
             }
@@ -737,8 +641,6 @@ final class AgentCommands {
         throw AgentError("The page changed while reading it; try again.")
     }
 
-    /// MBGA's world in a frame (the main frame if none), made on first use
-    /// and again after the frame navigates.
     private func world(_ id: UInt64, _ view: MBWebView, frame: FrameRef?, fresh: Bool) async throws -> Int {
         let key = WorldKey(tab: id, frame: frame?.id)
         if !fresh, let context = worlds[key] { return context }
@@ -757,16 +659,12 @@ final class AgentCommands {
         return context
     }
 
-    /// Reads the cross-site frames a snapshot left markers for (they run in
-    /// processes of their own) and puts their outlines in place, with refs
-    /// "fN:eM".
     private func expandFrames(_ id: UInt64, _ view: MBWebView, _ text: String, _ options: [String: Any]) async throws -> String {
         let tree = try await cdp(view, "Page.getFrameTree")
         let children = ((tree["frameTree"] as? [String: Any])?["childFrames"] as? [[String: Any]] ?? [])
             .compactMap { ($0["frame"] as? [String: Any])?["id"] as? String }
         let main = try await world(id, view, frame: nil, fresh: false)
         var numbers: [Int: FrameRef] = [:]
-        // Which iframe element each frame is, as the snapshot numbered them.
         for frameID in children {
             guard let owner = try? await cdp(view, "DOM.getFrameOwner", ["frameId": frameID]),
                   let node = owner["backendNodeId"] as? Int,
@@ -804,7 +702,6 @@ final class AgentCommands {
             out.append("\(indent)frame \(label):")
             for innerLine in inner.components(separatedBy: "\n") where !innerLine.isEmpty {
                 var line = innerLine.replacingOccurrences(of: "[e", with: "[f\(number):e")
-                // Frames inside it stay unread.
                 if let mark = line.range(of: "\u{1}F") {
                     let after = line[mark.upperBound...].split(separator: "\u{1}", maxSplits: 1)
                     line = String(line[..<mark.lowerBound]) + "[frame]" + (after.count > 1 ? after[1] : "") + " (not read)"
@@ -833,7 +730,103 @@ final class AgentCommands {
     }
 }
 
-/// The page side, defined once in MBGA's world of each page.
+extension AgentCommands {
+    private func scroll(_ args: AgentArguments) async throws -> String {
+        let id = try target(args)
+        let view = try await page(id)
+        let word = args[0] ?? "down"
+        if (word.hasPrefix("e") && Int(word.dropFirst()) != nil) || word.hasPrefix("f") || word.contains("=") {
+            let target = try await element(args, usage: "")
+            if let number = target.frameNumber { _ = try await call(id, view, "frameBox", number) }
+            return try await call(id, view, "reveal", target.ref, in: target.frame) as? String ?? ""
+        }
+        let size = try await call(id, view, "viewport", nil) as? [String: Any] ?? [:]
+        let height = size["height"] as? Double ?? 600
+        let amount = args[1].flatMap(Double.init) ?? height * 0.8
+        let (dx, dy): (Double, Double) = switch word {
+        case "up": (0, -amount)
+        case "left": (-amount, 0)
+        case "right": (amount, 0)
+        case "top": (0, -1e7)
+        case "bottom": (0, 1e7)
+        default: (0, amount)
+        }
+        let requests = store.networkEntries(of: id).last?.number
+        let position = try await call(id, view, "scrollPage", ["dx": dx, "dy": dy]) as? String ?? "scrolled"
+        try await Task.sleep(for: .milliseconds(250))
+        if store.networkEntries(of: id).last?.number != requests { try await waitForQuiet(id, limit: 2) }
+        return position
+    }
+
+    private func responseBody(_ view: MBWebView, _ entry: NetworkEntry) async throws -> [String: Any] {
+        do {
+            return try await cdp(view, "Network.getResponseBody", ["requestId": entry.requestID])
+        } catch let error as AgentError where error.message.contains("No resource") || error.message.contains("No data") {
+            throw AgentError("The browser no longer has the body of #\(entry.number): it keeps them for the page as it is now, "
+                + "while there's room. Ask soon after the request, or `mbga reload` and ask again.")
+        }
+    }
+
+    private func point(_ target: Target) async throws -> Spot {
+        var origin = (x: 0.0, y: 0.0)
+        if let number = target.frameNumber {
+            let box = try await call(target.id, target.view, "frameBox", number) as? [String: Any] ?? [:]
+            origin = (box["x"] as? Double ?? 0, box["y"] as? Double ?? 0)
+        }
+        let point = try await call(target.id, target.view, "point", target.ref, in: target.frame) as? [String: Any] ?? [:]
+        return Spot(x: origin.x + (point["x"] as? Double ?? 0), y: origin.y + (point["y"] as? Double ?? 0),
+                    label: (target.frameNumber.map { "f\($0):" } ?? "") + (point["label"] as? String ?? target.ref),
+                    covered: point["covered"] as? String ?? "", disabled: point["disabled"] as? Bool ?? false,
+                    checked: point["checked"] as? Bool)
+    }
+
+    struct Spot {
+        let x: Double
+        let y: Double
+        let label: String
+        let covered: String
+        let disabled: Bool
+        let checked: Bool?
+    }
+
+    private func settle(_ id: UInt64, from before: String?, requests: Int?) async throws -> String {
+        try await Task.sleep(for: .milliseconds(200))
+        if store.navState(of: id).isLoading { try await waitForLoad(id, timeout: 15) }
+        if store.networkEntries(of: id).last?.number != requests { try await waitForQuiet(id, limit: 3) }
+        guard let after = store.core.tab(id: id)?.url, after != before else { return "" }
+        return "\n→ " + line(id)
+    }
+
+    private func waitForLoad(_ id: UInt64, timeout: Double) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while store.navState(of: id).isLoading || !store.isLoaded(id) {
+            guard Date() < deadline else { throw AgentError("t\(id) is still loading after \(Int(timeout)) s.") }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    private static let awaitedRequests: Set<String> = ["script", "xhr", "fetch"]
+
+    @discardableResult
+    private func waitForQuiet(_ id: UInt64, limit: Double) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(limit)
+        var last = store.networkEntries(of: id).last?.number
+        var quietSince = Date()
+        while Date() < deadline {
+            let entries = store.networkEntries(of: id)
+            let busy = entries.contains { $0.ended == nil && $0.failure == nil && Self.awaitedRequests.contains($0.type) }
+            if busy || entries.last?.number != last {
+                last = entries.last?.number
+                quietSince = Date()
+            } else if Date().timeIntervalSince(quietSince) >= 0.5 {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(100))
+        }
+        return false
+    }
+}
+
 enum AgentScript {
     static let source = #"""
     (() => {
@@ -846,7 +839,10 @@ enum AgentScript {
     const SKIP = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'META', 'LINK']);
     const clean = (s, n) => { s = (s || '').replace(/\s+/g, ' ').trim(); return n && s.length > n ? s.slice(0, n - 1) + '…' : s; };
     const ref = el => { let r = S.refOf.get(el); if (!r) { r = 'e' + S.next++; S.refOf.set(el, r); } S.byRef.set(r, el); return r; };
-    const shown = el => el.checkVisibility ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : el.getClientRects().length > 0;
+    const shown = el => el.checkVisibility
+      ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })
+        || (getComputedStyle(el).display === 'contents' && !!el.parentElement && shown(el.parentElement))
+      : el.getClientRects().length > 0;
     // A ref from a snapshot, or css=<selector> / text=<words> for code
     // that already knows the page.
     const get = r => {
@@ -1025,13 +1021,45 @@ enum AgentScript {
       for (let w = el.ownerDocument.defaultView; w && w.frameElement; w = w.parent) w.frameElement.scrollIntoView({ block: 'nearest', behavior: 'instant' });
       el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
       const win = el.ownerDocument.defaultView;
-      const b = el.getBoundingClientRect();
+      let aim = el, b = el.getBoundingClientRect();
+      const unseen = b.width < 2 || b.height < 2 || b.right <= 0 || b.bottom <= 0 || b.left >= win.innerWidth
+        || b.top >= win.innerHeight || getComputedStyle(el).opacity === '0';
+      const shownLabel = unseen && el.labels && Array.from(el.labels).find(shown);
+      if (shownLabel) {
+        aim = shownLabel;
+        aim.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        b = aim.getBoundingClientRect();
+      }
       const lx = Math.min(Math.max(b.left + b.width / 2, 1), win.innerWidth - 1), ly = Math.min(Math.max(b.top + b.height / 2, 1), win.innerHeight - 1);
       const hit = el.ownerDocument.elementFromPoint(lx, ly);
-      const covered = hit && hit !== el && !el.contains(hit) && !hit.contains(el) && !(el.labels && Array.from(el.labels).includes(hit)) ? short(hit) : '';
+      const ours = hit && (hit === aim || aim.contains(hit) || hit.contains(aim) || (el.labels && Array.from(el.labels).includes(hit)));
+      const covered = hit && !ours ? short(hit) : '';
       let x = lx, y = ly;
       for (let w = win; w && w.frameElement; w = w.parent) { const f = w.frameElement, fb = f.getBoundingClientRect(); x += fb.left + f.clientLeft; y += fb.top + f.clientTop; }
-      return { x, y, covered, label: describe(el) };
+      const disabled = !!(el.disabled || el.getAttribute('aria-disabled') === 'true');
+      return { x, y, covered, label: describe(el), disabled, checked: toggled(el) };
+    }
+    function toggled(el) {
+      const ro = role(el);
+      if (!['checkbox', 'switch', 'menuitemcheckbox'].includes(ro)) return null;
+      return !!(el.checked || el.getAttribute('aria-checked') === 'true');
+    }
+    const state = r => { const el = get(r); return { label: describe(el), checked: toggled(el) }; };
+    function scrollPage(o) {
+      const page = document.scrollingElement || document.documentElement;
+      const room = el => {
+        const s = getComputedStyle(el), y = o.dy !== 0;
+        if (!/(auto|scroll|overlay)/.test(y ? s.overflowY : s.overflowX)) return false;
+        const pos = y ? el.scrollTop : el.scrollLeft, span = y ? el.scrollHeight - el.clientHeight : el.scrollWidth - el.clientWidth;
+        return span > 1 && ((y ? o.dy : o.dx) > 0 ? pos < span - 1 : pos > 0);
+      };
+      let el = document.elementFromPoint(innerWidth / 2, innerHeight / 2);
+      while (el && el !== page && !room(el)) el = el.parentElement;
+      const box = el || page;
+      box.scrollBy({ left: o.dx, top: o.dy, behavior: 'instant' });
+      if (box === page) return where();
+      const max = box.scrollHeight - box.clientHeight;
+      return `scrolled ${Math.round(box.scrollTop)} of ${max} px in ${short(box)}`;
     }
     function focus(o) {
       const el = get(o.ref);
@@ -1067,111 +1095,9 @@ enum AgentScript {
       const b = el.getBoundingClientRect();
       return { x: b.left + el.clientLeft, y: b.top + el.clientTop };
     }
-    Object.defineProperty(window, '__mbga', { value: { snapshot, read, find, point, focus, choose, reveal, viewport, contains, position, label, frameNumber, frameBox } });
+    Object.defineProperty(window, '__mbga', { value: {
+      snapshot, read, find, point, state, scrollPage, focus, choose, reveal, viewport, contains, position, label, frameNumber, frameBox,
+    } });
     })();
     """#
-}
-
-/// Runs `mbga run` scripts in JavaScriptCore, inside MBGA: each command is
-/// an async function resolving to its text, `evaluate` runs a function in
-/// the page and returns its value, `log` collects output.
-@MainActor
-final class AgentScriptRunner {
-    private let commands: AgentCommands
-    private let session: String
-    private let timeout: Double
-    private var output: [String] = []
-
-    init(commands: AgentCommands, session: String, timeout: Double) {
-        self.commands = commands
-        self.session = session
-        self.timeout = timeout
-    }
-
-    private static let prelude = #"""
-    const __flags = (o = {}) => Object.entries(o).flatMap(([k, v]) => v === false || v == null ? [] : v === true ? ['--' + k] : ['--' + k, String(v)]);
-    const __tab = o => o && o.tab ? ['--tab', String(o.tab)] : [];
-    const mbga = (...argv) => __call(argv.map(String));
-    const tabs = (o) => mbga('tabs', ...__flags(o));
-    const open = async (url, o) => { const t = await mbga('open', url, ...__flags(o)); return t.split(' ')[0]; };
-    const use = tab => mbga('use', tab);
-    const goto = (url, o) => mbga('goto', url, ...__flags(o));
-    const back = o => mbga('back', ...__flags(o));
-    const reload = o => mbga('reload', ...__flags(o));
-    const snapshot = o => mbga('snapshot', ...__flags(o));
-    const read = o => mbga('read', ...__flags(o));
-    const find = (text, o) => mbga('find', text, ...__flags(o));
-    const click = (target, o) => mbga('click', target, ...__flags(o));
-    const fill = (target, text, o) => mbga('fill', target, text, ...__flags(o));
-    const press = (key, o) => mbga('press', key, ...__flags(o));
-    const select = (target, value, o) => mbga('select', target, value, ...__flags(o));
-    const scroll = (where, o) => mbga('scroll', where || 'down', ...__flags(o));
-    const wait = (what, o) => typeof what === 'object' ? mbga('wait', what.gone ? 'gone' : 'text', what.gone || what.text, ...__flags(o)) : mbga('wait', String(what), ...__flags(o));
-    const screenshot = o => mbga('screenshot', ...__flags(o));
-    const consoleMessages = o => mbga('console', ...__flags(o));
-    const sleep = ms => mbga('wait', String(ms));
-    const evaluate = async (fn, ...args) => {
-      const o = args.length && args[args.length - 1] && args[args.length - 1].__mbga ? args.pop() : null;
-      const code = typeof fn === 'function' ? `(${fn})(...${JSON.stringify(args)})` : String(fn);
-      return JSON.parse(await mbga('eval', code, ...__tab(o)));
-    };
-    const tab = t => ({ __mbga: true, tab: t });
-    const log = (...a) => __log(a.map(v => typeof v === 'string' ? v : JSON.stringify(v, null, 1)).join(' '));
-    const console = { log, info: log, warn: log, error: log };
-    """#
-
-    func run(_ argument: String) async throws -> String {
-        guard let context = JSContext() else { throw AgentError("Couldn't start a script.") }
-        let call: @convention(block) (JSValue) -> JSValue = { [weak self] argv in
-            let words = argv.toArray()?.compactMap { $0 as? String } ?? []
-            return JSValue(newPromiseIn: context) { resolve, reject in
-                Task { @MainActor in
-                    guard let self else { return }
-                    if words.first == "run" {
-                        reject?.call(withArguments: ["Scripts can't run scripts."])
-                        return
-                    }
-                    switch await self.commands.run(words, session: self.session) {
-                    case .success(let text): resolve?.call(withArguments: [text])
-                    case .failure(let error): reject?.call(withArguments: [JSValue(newErrorFromMessage: error, in: context) as Any])
-                    }
-                }
-            }
-        }
-        let collect: @convention(block) (String) -> Void = { [weak self] line in self?.output.append(line) }
-        context.setObject(call, forKeyedSubscript: "__call" as NSString)
-        context.setObject(collect, forKeyedSubscript: "__log" as NSString)
-        context.evaluateScript(Self.prelude)
-        let wrapped = "(async () => {\n\(argument)\n})()"
-        guard let promise = context.evaluateScript(wrapped) else { throw AgentError("The script didn't start.") }
-        if let exception = context.exception {
-            throw AgentError("Script error: \(exception.toString() ?? "")")
-        }
-        let value: JSValue = try await withCheckedThrowingContinuation { continuation in
-            var finished = false
-            let fulfil: @convention(block) (JSValue) -> Void = { value in
-                guard !finished else { return }
-                finished = true
-                continuation.resume(returning: value)
-            }
-            let fail: @convention(block) (JSValue) -> Void = { error in
-                guard !finished else { return }
-                finished = true
-                let message = error.objectForKeyedSubscript("message")?.toString()
-                continuation.resume(throwing: AgentError("Script error: \(message.flatMap { $0 == "undefined" ? nil : $0 } ?? error.toString() ?? "")"))
-            }
-            promise.invokeMethod("then", withArguments: [JSValue(object: fulfil, in: context) as Any, JSValue(object: fail, in: context) as Any])
-            DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
-                guard !finished else { return }
-                finished = true
-                continuation.resume(throwing: AgentError("The script ran out of time (\(Int(self.timeout)) s; --timeout to allow more)."))
-            }
-        }
-        var out = output
-        if !value.isUndefined, !value.isNull {
-            let json = context.objectForKeyedSubscript("JSON").invokeMethod("stringify", withArguments: [value, NSNull(), 1])
-            out.append(value.isString ? value.toString() : json?.toString() ?? "")
-        }
-        return out.isEmpty ? "done" : out.joined(separator: "\n")
-    }
 }

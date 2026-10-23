@@ -12,12 +12,11 @@ concurrency:
 jobs:
   check:
     runs-on: macos-26
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
       - name: Install tools
         run: |
-          # The image's formula index is stale and its SwiftFormat too old
-          # for .swiftformat; update first so brew bundle upgrades it.
           brew update --quiet
           brew bundle
           rustup toolchain install
@@ -33,6 +32,7 @@ jobs:
 
   build:
     runs-on: macos-26
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - run: rustup toolchain install
@@ -40,4 +40,20 @@ jobs:
         with:
           path: third_party/cef
           key: cef-${{ hashFiles('scripts/fetch-cef.sh') }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('core/Cargo.lock') }}
+      - name: Fetch Rust crates
+        run: |
+          for attempt in 1 2 3 4 5; do
+            cargo fetch --locked --manifest-path core/Cargo.toml && exit 0
+            echo "::warning::Fetching crates failed (attempt $attempt), retrying"
+            sleep $((attempt * 15))
+          done
+          exit 1
       - run: scripts/build.sh
+        env:
+          CARGO_NET_OFFLINE: "true"

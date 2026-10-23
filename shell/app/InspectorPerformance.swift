@@ -1,18 +1,10 @@
 import AppKit
 
-// Performance: the page's vital signs over the last minute, traces for a
-// closer look (saved for Perfetto or Chrome, with a summary here), heap
-// snapshots and code coverage.
-
-// MARK: - Model
-
-/// One second of the page's metrics, worked out from the counters.
 struct PerformanceSample {
     let time: Double
     let values: [String: Double]
 }
 
-/// Where the main thread's time went in a trace.
 struct TraceSummary: Sendable {
     struct Slice: Sendable {
         let category: String
@@ -29,7 +21,6 @@ struct TraceSummary: Sendable {
     var events = 0
 }
 
-/// One script or stylesheet's coverage.
 struct CoverageEntry {
     let url: String
     let isCSS: Bool
@@ -46,9 +37,7 @@ final class PerformanceModel: InspectorModel {
     }
 
     private weak var session: InspectorSession?
-    /// New metrics arrived.
     let updated = Signal<Void>()
-    /// A trace, snapshot or coverage run changed state.
     let changed = Signal<Void>()
     private(set) var samples: [PerformanceSample] = []
     private var last: [String: Double]?
@@ -85,7 +74,6 @@ final class PerformanceModel: InspectorModel {
         session.on("Page.loadEventFired", self) { [weak self] _, _ in
             guard let self, stopsAfterLoad, traceState == .recording else { return }
             stopsAfterLoad = false
-            // A few seconds after load, as Chrome stops a reload profile.
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                 guard let self, traceState == .recording else { return }
                 stopTrace()
@@ -121,9 +109,6 @@ final class PerformanceModel: InspectorModel {
         if snapshotting { session.call("HeapProfiler.disable") }
     }
 
-    // MARK: Metrics
-
-    /// Fetches the metrics once a second while a view wants them.
     func startPolling() {
         guard timer == nil, let session else { return }
         if !enabled {
@@ -179,8 +164,6 @@ final class PerformanceModel: InspectorModel {
         updated.send()
     }
 
-    // MARK: Traces
-
     private static let categories = [
         "-*", "devtools.timeline", "v8.execute", "disabled-by-default-devtools.timeline",
         "disabled-by-default-devtools.timeline.frame", "toplevel", "blink.console", "blink.user_timing", "latencyInfo",
@@ -188,8 +171,6 @@ final class PerformanceModel: InspectorModel {
         "disabled-by-default-devtools.screenshot",
     ]
 
-    /// Starts recording a trace, reloading the page first with `reload`;
-    /// a reload's trace stops by itself a few seconds after the page loads.
     func startTrace(reload: Bool) {
         guard let session, traceState == .idle else { return }
         traceState = .starting
@@ -224,8 +205,6 @@ final class PerformanceModel: InspectorModel {
         traceState = .stopping
         stopsAfterLoad = false
         changed.send()
-        // The engine never answers Tracing.end; Tracing.tracingComplete
-        // follows instead, unless something went wrong.
         session.call("Tracing.end")
         DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in
             MainActor.assumeIsolated {
@@ -279,9 +258,6 @@ final class PerformanceModel: InspectorModel {
         changed.send()
     }
 
-    // MARK: Memory
-
-    /// Takes a heap snapshot, then calls `done` with it as a file's data.
     func takeHeapSnapshot(_ done: @escaping @MainActor (Data?) -> Void) {
         guard let session, !snapshotting else { return }
         snapshotting = true
@@ -308,8 +284,6 @@ final class PerformanceModel: InspectorModel {
         session?.call("HeapProfiler.collectGarbage") { [weak self] _, _ in self?.poll() }
     }
 
-    // MARK: Coverage
-
     func startCoverage() {
         guard let session, !coverageRunning else { return }
         coverageRunning = true
@@ -322,7 +296,6 @@ final class PerformanceModel: InspectorModel {
             coverageError = error
             changed.send()
         }
-        // The CSS domain needs the DOM's; Elements may already have both on.
         session.call("DOM.enable")
         session.call("CSS.enable") { _, _ in session.call("CSS.startRuleUsageTracking") }
     }
@@ -346,8 +319,6 @@ final class PerformanceModel: InspectorModel {
         }
     }
 
-    /// Bytes run in each script: nested ranges override the ranges around
-    /// them, so they're painted outermost first.
     private static func scriptCoverage(_ scripts: [JSON]) -> [CoverageEntry] {
         var byURL: [String: CoverageEntry] = [:]
         for script in scripts {
@@ -398,7 +369,6 @@ final class PerformanceModel: InspectorModel {
     }
 }
 
-/// Reads a trace off the main thread.
 enum TraceSummarizer {
     private static let scripting: Set<String> = [
         "FunctionCall", "EvaluateScript", "TimerFire", "EventDispatch", "FireAnimationFrame", "FireIdleCallback",
@@ -436,7 +406,6 @@ enum TraceSummarizer {
         func thread(_ event: [String: Any]) -> String {
             "\((event["pid"] as? NSNumber)?.intValue ?? 0):\((event["tid"] as? NSNumber)?.intValue ?? 0)"
         }
-        // The page's main thread: the busiest renderer main thread.
         var mains = Set<String>()
         for event in events where event["ph"] as? String == "M" && event["name"] as? String == "thread_name" {
             if ((event["args"] as? [String: Any])?["name"] as? String) == "CrRendererMain" { mains.insert(thread(event)) }
@@ -465,7 +434,6 @@ enum TraceSummarizer {
                   let name = event["name"] as? String else { return nil }
             return Slice(start: ts, duration: dur, name: name)
         }.sorted { $0.start != $1.start ? $0.start < $1.start : $0.duration > $1.duration }
-        // Self time: each event's own duration less its direct children's.
         var totals: [String: Double] = [:]
         var busy = 0.0
         var stack: [(end: Double, name: String, duration: Double, children: Double)] = []
@@ -505,8 +473,6 @@ enum TraceSummarizer {
         }
     }
 }
-
-// MARK: - Panel
 
 final class PerformancePanel: InspectorPanelView {
     private let toolbar = InspectorToolbar()
@@ -641,8 +607,6 @@ final class PerformancePanel: InspectorPanelView {
         memoryView.heap = observedModel?.heapUsage
     }
 
-    // MARK: State
-
     private func update() {
         let model = observedModel
         let state = model?.traceState ?? .idle
@@ -658,7 +622,6 @@ final class PerformancePanel: InspectorPanelView {
         coverageButton.isEnabled = model != nil
         status.stringValue = statusText()
         status.textColor = model?.traceError != nil || model?.coverageError != nil ? InspectorTheme.error : .secondaryLabelColor
-        // The clock ticks while recording.
         if state == .recording, clock == nil {
             let clock = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.status.stringValue = self?.statusText() ?? "" }
@@ -699,8 +662,6 @@ final class PerformancePanel: InspectorPanelView {
         return ""
     }
 
-    // MARK: Actions
-
     private func toggleTrace(reload: Bool) {
         guard let model else { return }
         if model.traceState == .recording {
@@ -721,7 +682,6 @@ final class PerformancePanel: InspectorPanelView {
         return formatter.string(from: Date())
     }
 
-    /// Asks where to keep `data`, then writes it there.
     private func save(_ data: Data, name: String, done: @escaping @MainActor (URL) -> Void) {
         guard let window else { return }
         let panel = NSSavePanel()
@@ -762,16 +722,11 @@ final class PerformancePanel: InspectorPanelView {
     }
 }
 
-// MARK: - Metrics tiles
-
-/// One metric: its current value and the last minute and a half as a
-/// sparkline, on a quiet ground.
 private final class MetricTile: FlippedView {
     struct Spec {
         let key: String
         let title: String
         let color: NSColor
-        /// Plotted from zero rather than from the range shown.
         let fromZero: Bool
         let fixedMax: Double?
         let format: (Double) -> String
@@ -848,8 +803,6 @@ private final class MetricTile: FlippedView {
     }
 }
 
-/// A line over the last samples, newest on the right, with a hairline
-/// baseline and the top of its scale.
 private final class Sparkline: NSView {
     var values: [Double] = [] {
         didSet { needsDisplay = true }
@@ -904,15 +857,12 @@ private final class Sparkline: NSView {
         line.lineWidth = 1.5
         line.lineJoinStyle = .round
         line.stroke()
-        // The top of the scale, quietly.
         let label = format(high) as NSString
         let attributes: [NSAttributedString.Key: Any] = [.font: Theme.font(9), .foregroundColor: NSColor.tertiaryLabelColor]
         let size = label.size(withAttributes: attributes)
         label.draw(at: NSPoint(x: bounds.maxX - size.width, y: -1), withAttributes: attributes)
     }
 }
-
-// MARK: - Sections
 
 private final class SectionHeading: NSTextField {
     convenience init(_ title: String) {
@@ -922,13 +872,11 @@ private final class SectionHeading: NSTextField {
     }
 }
 
-/// A block of the panel below the metrics, sized to its content.
 @MainActor
 private class SectionView: FlippedView {
     func height(for width: CGFloat) -> CGFloat { 0 }
 }
 
-/// A small push button for sections.
 private func smallButton(_ title: String, action: @escaping () -> Void) -> NSButton {
     let button = NSButton.push(title, action: action)
     button.controlSize = .small
@@ -936,8 +884,6 @@ private func smallButton(_ title: String, action: @escaping () -> Void) -> NSBut
     return button
 }
 
-/// The last trace: how long, where the main thread's time went, the long
-/// tasks, and saving it.
 private final class TraceSectionView: SectionView {
     var save: (() -> Void)?
     var reveal: (() -> Void)?
@@ -1050,7 +996,6 @@ private final class TraceSectionView: SectionView {
     }
 }
 
-/// Proportions as one rounded bar.
 private final class StackedBar: NSView {
     var slices: [(Double, NSColor)] = [] {
         didSet { needsDisplay = true }
@@ -1071,7 +1016,6 @@ private final class StackedBar: NSView {
     }
 }
 
-/// The heap now, and snapshots.
 private final class MemorySectionView: SectionView {
     var reveal: (() -> Void)?
     var heap: (used: Double, total: Double)? {
@@ -1122,7 +1066,6 @@ private final class MemorySectionView: SectionView {
     }
 }
 
-/// Code the page loaded but didn't run, by file, most unused first.
 private final class CoverageSectionView: SectionView {
     var open: ((String) -> Void)?
     private let heading = SectionHeading("Coverage")
@@ -1171,7 +1114,6 @@ private final class CoverageSectionView: SectionView {
     }
 }
 
-/// A file's coverage: its name, type, sizes and a used/unused bar.
 private final class CoverageRow: HoverView {
     static let height: CGFloat = 36
     var click: (() -> Void)?

@@ -161,8 +161,6 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     expected = {}
     for case in json.loads((HERE / "cases.json").read_text()):
-        # Cases that change their input (aborts, damage) say what to expect
-        # themselves, if anything.
         if case.get("noExpect") or case.get("errorsOnly"):
             continue
         result = []
@@ -179,7 +177,6 @@ def main():
                 path = OUT / f"{case['name']}-input.mp4"
                 path.write_bytes(data)
                 ranges = progressive(path)
-            # Nothing buffers before 0: the engine trims it off.
             result.append([max(0.0, min(r[0] for r in ranges)), min(r[1] for r in ranges)])
         expected[case["name"]] = result
     (OUT / "expected.json").write_text(json.dumps(expected, indent=1))

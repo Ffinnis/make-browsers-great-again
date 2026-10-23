@@ -1,11 +1,4 @@
 #!/usr/bin/env bash
-# Checks that the code is formatted and passes every linter and the Rust
-# crates' tests. CI and the pre-commit hook run it; a change that fails it
-# doesn't go in. Pass --fix to format everything and apply the linters' safe
-# fixes first, then check what's left.
-#
-# Tools: `brew bundle` installs them from the Brewfile; Rust comes from
-# rust-toolchain.toml and ruff runs through uv at the version pinned below.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -32,8 +25,6 @@ if ((${#missing[@]})); then
   exit 1
 fi
 
-# An older SwiftFormat fails on rules it doesn't know before it gets to
-# .swiftformat's own --minversion, with a less helpful message.
 need="$(sed -n 's/^--minversion //p' .swiftformat)"
 have="$(swiftformat --version)"
 if [[ "$(printf '%s\n%s\n' "$need" "$have" | sort -V | head -1)" != "$need" ]]; then
@@ -56,6 +47,7 @@ OBJC=(shell/engine/MBEngine.h shell/engine/MBEngine.mm shell/helper/helper_main.
 SHELL_SCRIPTS=(scripts/*.sh .githooks/* media/tests/fixtures/make.sh)
 
 if [[ "$FIX" == 1 ]]; then
+  scripts/comments.py --fix
   cargo fmt --manifest-path core/Cargo.toml
   cargo clippy --manifest-path core/Cargo.toml --all-targets --fix --allow-dirty --allow-staged --quiet
   cargo fmt --manifest-path media/Cargo.toml
@@ -68,12 +60,12 @@ if [[ "$FIX" == 1 ]]; then
   shfmt -w "${SHELL_SCRIPTS[@]}"
 fi
 
+step "comments" scripts/comments.py
 step "rustfmt" cargo fmt --manifest-path core/Cargo.toml --check
 step "clippy" cargo clippy --manifest-path core/Cargo.toml --all-targets --quiet -- -D warnings
 step "cargo test" cargo test --manifest-path core/Cargo.toml --quiet
 step "rustfmt (media)" cargo fmt --manifest-path media/Cargo.toml --check
 step "clippy (media)" cargo clippy --manifest-path media/Cargo.toml --all-targets --quiet -- -D warnings
-# What ships is the WebAssembly build, whose code paths differ (src/ffi.rs).
 step "clippy (media, wasm)" cargo clippy --manifest-path media/Cargo.toml --target wasm32-unknown-unknown --quiet -- -D warnings
 step "cargo test (media)" cargo test --manifest-path media/Cargo.toml --quiet
 step "swiftformat" swiftformat --lint --quiet .

@@ -127,8 +127,6 @@ def main():
         results = earlier
     log(f"{results['label']} ({results['commit']}{', uncommitted changes' if dirty else ''})")
 
-    # Interleaved per scenario, so slow drift (thermals, network) hits every
-    # browser alike.
     for scenario in scenarios:
         for b in browsers:
             if scenario in MBGA_ONLY and b is not MBGA:
@@ -136,7 +134,7 @@ def main():
             r = MODULES[scenario].run(b, scenario)
             if r is not None:
                 results["results"][b.key][scenario] = r
-                with open(path, "w") as f:  # keep partial results if a later step fails
+                with open(path, "w") as f:
                     json.dump(results, f, indent=2)
     log(f"results written to {path}")
     with open(os.path.join(out_dir, "trend.html"), "w") as f:

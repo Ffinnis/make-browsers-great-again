@@ -1,8 +1,5 @@
-//! Big-endian reading and writing, and ISO BMFF box framing.
-
 use std::fmt;
 
-/// Input that doesn't parse. Carries a short reason for the page's console.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Error(pub String);
 
@@ -18,7 +15,6 @@ pub fn err<T>(msg: impl Into<String>) -> Result<T> {
     Err(Error(msg.into()))
 }
 
-/// A cursor over a byte slice whose reads fail instead of panicking.
 pub struct Reader<'a> {
     data: &'a [u8],
     pos: usize,
@@ -74,21 +70,17 @@ impl<'a> Reader<'a> {
         Ok(hi << 32 | u64::from(self.u32()?))
     }
 
-    /// The version and flags that start a full box.
     pub fn full_header(&mut self) -> Result<(u8, u32)> {
         let v = self.u32()?;
         Ok(((v >> 24) as u8, v & 0x00ff_ffff))
     }
 }
 
-/// One box: its type, and its payload after the header.
 pub struct Mp4Box<'a> {
     pub kind: [u8; 4],
     pub body: &'a [u8],
 }
 
-/// Where a box starting at `data[0]` ends, if its header is all there.
-/// `Ok(None)` means more bytes are needed to know.
 pub fn box_extent(data: &[u8]) -> Result<Option<(usize, usize)>> {
     if data.len() < 8 {
         return Ok(None);
@@ -114,7 +106,6 @@ pub fn box_extent(data: &[u8]) -> Result<Option<(usize, usize)>> {
     }
 }
 
-/// The boxes laid end to end in `data`. A box that runs past the end fails.
 pub fn boxes(data: &[u8]) -> Result<Vec<Mp4Box<'_>>> {
     let mut out = Vec::new();
     let mut pos = 0;
@@ -133,12 +124,10 @@ pub fn boxes(data: &[u8]) -> Result<Vec<Mp4Box<'_>>> {
     Ok(out)
 }
 
-/// The first child box of the given type.
 pub fn child(data: &[u8], kind: [u8; 4]) -> Result<Option<&[u8]>> {
     Ok(boxes(data)?.into_iter().find(|b| b.kind == kind).map(|b| b.body))
 }
 
-/// Follows a path of container boxes.
 pub fn path<'a>(data: &'a [u8], kinds: &[&[u8; 4]]) -> Result<Option<&'a [u8]>> {
     let mut cur = data;
     for kind in kinds {
@@ -150,7 +139,6 @@ pub fn path<'a>(data: &'a [u8], kinds: &[&[u8; 4]]) -> Result<Option<&'a [u8]>> 
     Ok(Some(cur))
 }
 
-/// Appends big-endian values and boxes whose sizes are filled in on close.
 #[derive(Default)]
 pub struct Writer {
     pub buf: Vec<u8>,
@@ -193,8 +181,6 @@ impl Writer {
         self.u32(u32::from(version) << 24 | flags);
     }
 
-    /// Closes the innermost open box. Boxes here stay far below 4 GB: the
-    /// largest is one fragment's mdat.
     pub fn end(&mut self) {
         if let Some(start) = self.open.pop() {
             let size = u32::try_from(self.buf.len() - start).unwrap_or(u32::MAX);
@@ -202,7 +188,6 @@ impl Writer {
         }
     }
 
-    /// Writes a whole box with the given payload.
     pub fn boxed(&mut self, kind: [u8; 4], body: &[u8]) {
         self.begin(kind);
         self.bytes(body);

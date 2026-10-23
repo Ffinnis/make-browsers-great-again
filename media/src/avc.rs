@@ -1,7 +1,3 @@
-//! H.264 as MP4 stores it (avcC, length-prefixed NAL units), turned into the
-//! Annex-B stream the engine's decoder takes. Configured with an avcC the
-//! engine refuses H.264; without one it decodes Annex-B through `VideoToolbox`.
-
 use crate::bytes::{err, Reader, Result};
 
 const START_CODE: [u8; 4] = [0, 0, 0, 1];
@@ -9,11 +5,8 @@ const NAL_IDR: u8 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AvcConfig {
-    /// `profile_idc`, constraint flags and `level_idc`, as in "avc1.PPCCLL".
     pub profile: [u8; 3],
     pub nal_length: usize,
-    /// SPS and PPS units in Annex-B form, put in front of every keyframe so
-    /// decoding can start at any of them.
     pub parameter_sets: Vec<u8>,
 }
 
@@ -38,13 +31,10 @@ impl AvcConfig {
         Ok(AvcConfig { profile, nal_length, parameter_sets })
     }
 
-    /// The codec string `WebCodecs` takes, such as "avc1.64001f".
     pub fn codec_word(&self) -> u32 {
         u32::from(self.profile[0]) << 16 | u32::from(self.profile[1]) << 8 | u32::from(self.profile[2])
     }
 
-    /// Rewrites one sample to Annex-B into `out`. Returns whether it holds
-    /// an IDR picture, which is what the decoder accepts as a key frame.
     pub fn to_annex_b(&self, sample: &[u8], out: &mut Vec<u8>) -> Result<bool> {
         let mut nals = Vec::new();
         let mut idr = false;

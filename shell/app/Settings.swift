@@ -24,15 +24,12 @@ enum SettingsPane: Int, CaseIterable {
     }
 }
 
-/// Settings (⌘,): every preference in one window, a pane per topic, laid
-/// out as macOS settings are (labels right-aligned against their controls).
 @MainActor
 final class SettingsWindowController: NSWindowController {
     private let tabs = SettingsTabsController()
 
     init(store: BrowserStore) {
         tabs.tabStyle = .toolbar
-        // Panes swap at once; the window's height follows quickly (below).
         tabs.transitionOptions = []
         for pane in SettingsPane.allCases {
             let controller = SettingsPaneController(pane: pane, store: store)
@@ -49,8 +46,6 @@ final class SettingsWindowController: NSWindowController {
         tabs.fitWindow(animated: false)
         window.center()
         window.setFrameAutosaveName("Settings")
-        // MBGA_DEBUG_SETTINGS_CYCLE moves to the next pane every 1.5 s, to
-        // measure the switch.
         if ProcessInfo.processInfo.environment["MBGA_DEBUG_SETTINGS_CYCLE"] != nil {
             let timer = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
@@ -72,10 +67,6 @@ final class SettingsWindowController: NSWindowController {
     }
 }
 
-/// The panes, switched as System Settings does: the new pane shows at
-/// once, pinned to the top, and the window's height follows in a fifth of
-/// a second, its top staying put. (NSTabViewController's own resize was
-/// slow and slid the panes about while crossfading them.)
 @MainActor
 private final class SettingsTabsController: NSTabViewController {
     override func tabView(_ tabView: NSTabView, didSelect item: NSTabViewItem?) {
@@ -108,14 +99,11 @@ private extension Array {
     subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
 
-/// One pane: a grid of labelled rows that reads its values when shown and
-/// whenever the preferences change elsewhere (a menu, the command bar).
 @MainActor
 private final class SettingsPaneController: NSViewController {
     private let pane: SettingsPane
     private let store: BrowserStore
     private var refreshers: [() -> Void] = []
-    /// The size the pane's rows need; the window fits it.
     private(set) var contentSize = NSSize(width: 564, height: 300)
 
     init(pane: SettingsPane, store: BrowserStore) {
@@ -142,17 +130,13 @@ private final class SettingsPaneController: NSViewController {
         grid.columnSpacing = 10
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 0).width = 150
-        // Captions wrap at this width; a narrower column would cut them off.
         grid.column(at: 1).width = 340
         grid.rowAlignment = .firstBaseline
-        // Captions sit closer under the control they explain.
         for (i, row) in rows.enumerated() where row.last?.identifier == Self.captionID {
             grid.row(at: i).topPadding = -4
         }
         let view = NSView()
         view.addSubview(grid)
-        // The rows hang from the top: while the window's height changes they
-        // stay put rather than stretch or slide.
         let bottom = grid.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -24)
         bottom.priority = .defaultLow
         NSLayoutConstraint.activate([
@@ -162,7 +146,6 @@ private final class SettingsPaneController: NSViewController {
             grid.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -32),
         ])
         self.view = view
-        // Values first: a caption filled in later would be cut off.
         refresh()
         contentSize = view.fittingSize
         NotificationCenter.default.addObserver(self, selector: #selector(refresh),
@@ -183,8 +166,6 @@ private final class SettingsPaneController: NSViewController {
     @objc private func refresh() {
         for refresher in refreshers { refresher() }
     }
-
-    // MARK: Panes
 
     private func generalRows() -> [[NSView]] {
         let layout = popUp(SidebarLayout.allCases.map(\.title)) { [store] i in store.setLayout(SidebarLayout.allCases[i]) }
@@ -217,7 +198,6 @@ private final class SettingsPaneController: NSViewController {
             if i < limits.count { store.setSleepPolicy(maxLiveTabs: limits[i].1) }
         }
         refreshers.append { [store] in
-            // A value set elsewhere (an older default, the benchmarks) shows as its own item.
             Self.select(sleep, store.sleepAfterSecs, in: delays) { "After \(Duration.seconds(Int64(clamping: $0)).formatted(.units(width: .wide)))" }
             Self.select(limit, store.maxLiveTabs, in: limits) { "\($0) Tabs" }
         }
@@ -296,8 +276,6 @@ private final class SettingsPaneController: NSViewController {
         ] + signInRows()
     }
 
-    /// Another browser's cookies into one of MBGA's profiles, e.g. for
-    /// profiles imported before sign-ins came along.
     private func signInRows() -> [[NSView]] {
         let from = NSPopUpButton(frame: .zero, pullsDown: false)
         from.addItem(withTitle: "Looking for browsers…")
@@ -319,7 +297,6 @@ private final class SettingsPaneController: NSViewController {
             }
             if let current { into.selectItem(withTag: current) }
         }
-        // The MBGA profile the chosen browser profile was imported as.
         let matchProfile = { [store] in
             guard let (source, profile) = choices[safe: from.indexOfSelectedItem] else { return }
             let id = SignIns.likelyProfile(for: profile, of: source, among: store.snapshot.profiles)?.id
@@ -366,8 +343,6 @@ private final class SettingsPaneController: NSViewController {
         ]
     }
 
-    /// Saved passwords of one profile, and bringing more from other
-    /// browsers or an exported file.
     private func passwordRows() -> [[NSView]] {
         let core = store.core
         let profile = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -404,7 +379,6 @@ private final class SettingsPaneController: NSViewController {
             for button in [copy, show, delete] { button.isEnabled = list.selected != nil }
         }
         list.onSelect?()
-        // The password itself, once the Mac's owner says so.
         let reveal = { [weak self] (login: SavedLogin, copying: Bool) in
             _ = Task {
                 let reason = "\(copying ? "copy" : "show") the password for \(login.site)"
@@ -415,7 +389,6 @@ private final class SettingsPaneController: NSViewController {
                 if copying {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(password, forType: .string)
-                    // Clipboard managers leave concealed items out of their history.
                     NSPasteboard.general.setString("", forType: .init("org.nspasteboard.ConcealedType"))
                     return say("Copied the password for \(login.username.isEmpty ? login.site : login.username).")
                 }
@@ -656,8 +629,6 @@ private final class SettingsPaneController: NSViewController {
     private static let skillNote = "Claude Code has the mbga skill (~/.claude/skills/mbga-browser) and uses the browser when a task needs it."
     private static let installedNote = "Installed at ~/.local/bin/mbga. Run \"mbga help\" in a terminal to try it."
 
-    // MARK: Controls
-
     private static let captionID = NSUserInterfaceItemIdentifier("caption")
 
     private func label(_ text: String) -> NSTextField {
@@ -682,8 +653,6 @@ private final class SettingsPaneController: NSViewController {
         return button
     }
 
-    /// Selects the item for `value`, adding one named by `title` if it isn't
-    /// among the choices.
     private static func select<T: Equatable>(_ button: NSPopUpButton, _ value: T, in choices: [(String, T)],
                                              title: (T) -> String) {
         if let i = choices.firstIndex(where: { $0.1 == value }) {
@@ -696,7 +665,6 @@ private final class SettingsPaneController: NSViewController {
         }
     }
 
-    /// A two-line field of sites separated by commas, spaces or new lines.
     private func sitesField(placeholder: String, _ action: @escaping ([String]) -> Void) -> NSTextField {
         let field = NSTextField(string: "")
         field.placeholderString = placeholder

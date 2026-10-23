@@ -1,28 +1,5 @@
-// Converts the H.264 and AAC a page appends to a SourceBuffer into VP9 and
-// FLAC, which the engine can play. shim.js starts this worker, posts the
-// converter's WebAssembly module, then forwards each SourceBuffer's
-// messages; every append and every drain gets exactly one reply, in order:
-// `output` with the converted bytes (possibly empty), or `error`. If the
-// module can't load, `fatal` says so once and every append fails.
-//
-// The module (media/, Rust) parses and writes MP4 and turns AAC into FLAC.
-// Video needs the engine's codecs, so for each fragment with H.264 the
-// module hands back a job: its samples as Annex-B, which a VideoDecoder
-// decodes through VideoToolbox and a VideoEncoder encodes to VP9. The
-// decoder carries on from one job to the next; each frame it puts out is
-// encoded, and its chunk goes back to the module, which writes fragments
-// with the original timestamps. A decoder holds its last few frames until
-// more input comes, so those come out with a later append's output, as
-// `held`, unless the module says flushing costs nothing.
-//
-// Nearly all the CPU this costs is the VP9 encoder's (libvpx, at the speed
-// the engine picks); the module and this script take about 1%. So the
-// encoder gets only the frames worth showing: at most the element's size,
-// and at most the frame rate `size` caps it to.
 'use strict';
 
-// Records of the module's JobSample and HeldGroup, the job flags, and what
-// mm_frame answers (media/src/conv.rs).
 const RECORD = 40;
 const GROUP = 32;
 const KEY = 1;
@@ -32,39 +9,18 @@ const FINISH = 8;
 const ENCODE_KEY = 2;
 const VP9 = 'vp09.00.41.08';
 
-// Settings the harness (media/harness) can change to compare: as
-// self.mbgaTune before this script, or a {type: 'tune'} message.
 const tuned = self.mbgaTune || {};
 let tune = { ...tuned };
-// Decodes and encodes waiting in the codecs' queues before feeding stops:
-// decoded 1080p frames are 3 MB each.
 const QUEUE = () => tune.queue || 4;
-// After the last decode, how long without a frame coming out means the
-// decoder is holding the rest for more input.
 const IDLE = () => tune.idle || 8;
-// How long a codec may take to flush before the append fails.
 const TIMEOUT = 20000;
-// A module instance whose memory grew past this is replaced when nothing
-// waits in it: WebAssembly memory never shrinks.
 const BIG_MEMORY = () => tune.bigMemory || 64 << 20;
-// A stream that gets nothing for this long (a paused, hidden or finished
-// player) closes its codecs: a VP9 encoder holds tens of MB. Longer than
-// the shim waits to append ahead of the playhead (10 s), and than it waits
-// between keepalives of a paused progressive download, so a player that
-// fetches a long segment at a time doesn't replay a GOP for each.
 const REST = () => tune.rest || 20000;
-// A page's element smaller than this is hidden or collapsed: its size
-// says nothing about how big the video will be shown.
 const MIN_DISPLAY = 32;
-// The displayed size has to change by more than this to re-encode at it.
 const HYSTERESIS = 0.25;
-// And the frame rate by more than this to change the encoder's between
-// keyframes: its rate control is told the frame rate it gets.
 const FPS_CHANGE = 0.1;
-// The most bits per pixel to encode at: 6 Mbps at 1080p30.
 const BPP = 0.1;
 
-// What the codecs did, for the harness ({type: 'stats'}).
 const stats = {
   decoded: 0,
   decodeOnly: 0,
@@ -80,7 +36,6 @@ const stats = {
 };
 
 let wasm = null;
-// An instance made at load, to time startup by; the first stream takes it.
 let spare = null;
 let fatal = null;
 const early = [];
@@ -95,7 +50,6 @@ self.onmessage = (event) => {
   } else if (msg.type === 'stats') {
     self.postMessage({ type: 'stats', ...stats });
   } else if (msg.type === 'tune') {
-    // The harness only.
     tune = { ...tuned, ...msg.tune };
   } else if (fatal) {
     refuse(msg);
@@ -106,8 +60,6 @@ self.onmessage = (event) => {
   }
 };
 
-// Nothing should get this far; if something does, the other streams carry
-// on, and the stream's own messages still get their replies.
 self.addEventListener('error', (event) => {
   event.preventDefault();
   console.error('MBGA media:', event.message);
@@ -119,7 +71,6 @@ self.addEventListener('unhandledrejection', (event) => {
 
 async function load(msg) {
   const module = msg.module;
-  // The bytes aren't needed once compiled.
   msg.module = null;
   try {
     const compiled = module instanceof WebAssembly.Module ? module : await WebAssembly.compile(module);
@@ -141,8 +92,6 @@ function refuse(msg) {
   }
 }
 
-// Each SourceBuffer's messages run one after another; different
-// SourceBuffers convert side by side. `size` applies at once.
 function dispatch(msg) {
   let stream = streams.get(msg.sb);
   if (!stream) {
@@ -151,13 +100,11 @@ function dispatch(msg) {
     streams.set(msg.sb, stream);
   }
   if (msg.type === 'size') {
-    // The next frame decoded is encoded to fit.
     stream.display = { width: msg.width, height: msg.height };
     stream.fps = msg.fps > 0 ? msg.fps : 0;
     return;
   }
   if (msg.type === 'keepalive') {
-    // A progressive download paused ahead of the playhead: not idle.
     stream.rest();
     return;
   }
@@ -191,7 +138,6 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Sleeps until a codec of `v` dequeues something or fails, or `ms` pass.
 function nap(v, ms) {
   return new Promise((resolve) => {
     const timer = setTimeout(done, ms);
@@ -209,21 +155,14 @@ class Stream {
     this.sb = sb;
     this.queue = Promise.resolve();
     this.progressive = false;
-    // Where a progressive file starts playing (open's `start`), seconds.
     this.startAt = 0;
     this.ex = null;
     this.h = 0;
-    // The last input init segment, to start over with if the module traps.
     this.init = null;
     this.initGeneration = 0;
     this.mime = '';
-    // The size the shim wants the video encoded at most (it decides: the
-    // element's device pixels, CSS pixels on battery, the source's size
-    // for an element sized by the video), and the most frames a second
-    // worth encoding for it (0: all).
     this.display = null;
     this.fps = 0;
-    // Per video track id: its decoder, encoder and what's in flight.
     this.video = new Map();
     this.restTimer = 0;
   }
@@ -254,10 +193,6 @@ class Stream {
     }
   }
 
-  // Closes the codecs once nothing has come for REST: a paused player's
-  // VP9 encoder holds tens of MB. Their frames come out first and go with
-  // the next reply, as `held`; the next append opens new codecs, and the
-  // module replays the GOP so far if it continues one.
   rest() {
     clearTimeout(this.restTimer);
     this.restTimer = 0;
@@ -283,12 +218,9 @@ class Stream {
       this.closeCodecs();
       if (this.h) this.ex.mm_restart(this.h);
     }
-    // A paused player's instance needn't keep what it grew to, either.
     if (this.h && this.ex.memory.buffer.byteLength > BIG_MEMORY() && this.ex.mm_recyclable(this.h)) this.recycle();
   }
 
-  // A module instance per SourceBuffer, so a trap in one (a panic on bad
-  // input) loses nothing elsewhere.
   start() {
     const instance = spare || new WebAssembly.Instance(wasm, {});
     spare = null;
@@ -304,7 +236,6 @@ class Stream {
     }
   }
 
-  // Lets the instance go (and its memory with it).
   drop() {
     if (this.h) this.ex.mm_destroy(this.h);
     this.ex = null;
@@ -328,8 +259,6 @@ class Stream {
     this.video.clear();
   }
 
-  // Codecs the engine reclaimed or that failed since the last message
-  // start over, and the module learns that frames in flight are gone.
   checkCodecs() {
     let lost = false;
     for (const v of this.video.values()) {
@@ -348,9 +277,6 @@ class Stream {
       if (!this.h) this.start();
       this.checkCodecs();
       this.ex.mm_begin(this.h, msg.seq);
-      // A progressive file's bytes say where they start: ones sent before
-      // the shim heard of `need` aren't where the converter is now, and
-      // are dropped (the reply is empty).
       const offset = this.progressive && typeof msg.offset === 'number' ? msg.offset : -1;
       if (offset < 0 || this.ex.mm_offset(this.h, offset)) this.push(bytes);
       bytes = null;
@@ -360,7 +286,6 @@ class Stream {
         if (status === 0) break;
         await this.runJob();
       }
-      // Chunks of frames the decoder put out late, since the last job.
       if (this.ex.mm_write(this.h) < 0) throw new ModuleError(this.string('error'));
       this.reply(msg);
     } catch (e) {
@@ -369,7 +294,6 @@ class Stream {
     this.rest();
   }
 
-  // Everything the decoders still hold, before the page ends the stream.
   async drain(msg) {
     try {
       if (this.h) {
@@ -396,8 +320,6 @@ class Stream {
     if (this.h) {
       const ex = this.ex;
       const h = this.h;
-      // Frames of earlier appends, a group per append, to append with that
-      // append's settings first.
       const count = ex.mm_held_count(h);
       if (count) {
         const view = new DataView(ex.memory.buffer, ex.mm_held_groups(h), count * GROUP);
@@ -418,15 +340,9 @@ class Stream {
       const bytes = this.copy(ex.mm_output_ptr(h), ex.mm_output_len(h));
       out.bytes = bytes.buffer;
       transfer.push(bytes.buffer);
-      // The times the media in `bytes` covers, so the shim can drop it if
-      // the page removes them before it's appended.
       const start = ex.mm_output_start(h);
       if (Number.isFinite(start)) out.range = { start, end: ex.mm_output_end(h) };
       if (ex.mm_natural_width(h) > 0) {
-        // The input's display size, from the first frame at it on: the
-        // converted video may be encoded smaller, and the page should see
-        // the size it would have. The first comes with the first init and
-        // applies at once.
         const natural = { width: ex.mm_natural_width(h), height: ex.mm_natural_height(h) };
         const at = ex.mm_natural_at(h);
         if (Number.isFinite(at)) natural.at = at;
@@ -434,15 +350,11 @@ class Stream {
         if (seq !== msg.seq) natural.seq = seq;
         out.natural = natural;
       }
-      // A progressive file's next bytes aren't the ones after the last:
-      // the shim goes on from this offset.
       const need = ex.mm_need(h);
       if (need >= 0) out.need = need;
       ex.mm_output_clear(h);
       const mime = this.string('mime');
       if (mime !== this.mime) {
-        // The converted init's type, for SourceBuffers made after the fact
-        // (progressive files).
         out.mime = this.mime = mime;
       }
     }
@@ -454,9 +366,6 @@ class Stream {
     }
   }
 
-  // Moves the stream to a fresh instance, primed with the init and the old
-  // one's state (where each track is, the GOP it may replay), so the
-  // memory the old one grew goes. The codecs carry on as they are.
   recycle() {
     const ex = this.ex;
     const h = this.h;
@@ -473,7 +382,6 @@ class Stream {
       ex.mm_destroy(h);
       stats.recycled++;
     } catch (e) {
-      // Keep the old one.
       console.error('MBGA media: recycling:', e);
       if (this.h) this.ex.mm_destroy(this.h);
       this.ex = ex;
@@ -483,23 +391,17 @@ class Stream {
 
   fail(msg, e) {
     if (e instanceof WebAssembly.RuntimeError) {
-      // A trap (a panic on bad input) leaves the instance unusable; the
-      // next append starts a new one from the last init.
       this.ex = null;
       this.h = 0;
       this.closeCodecs();
     } else if (this.h) {
-      // Whatever the failed job left in the output is incomplete, and the
-      // page won't get it: the converted init in it comes again.
       this.ex.mm_output_discard(this.h);
       if (!(e instanceof ModuleError)) {
-        // The codecs failed: start them over.
         this.closeCodecs();
         this.ex.mm_restart(this.h);
       }
     }
     if (msg.replied) {
-      // It failed after its reply went out; the next message starts clean.
       console.error('MBGA media:', e);
       return;
     }
@@ -507,11 +409,9 @@ class Stream {
     self.postMessage({ type: 'error', sb: this.sb, seq: msg.seq, message: describe(e) });
   }
 
-  // Writes input straight into the module's buffer.
   push(bytes) {
     const ex = this.ex;
     const ptr = ex.mm_reserve(this.h, bytes.length);
-    // Null past the module's limit, and then the next poll fails.
     if (!ptr) return;
     new Uint8Array(ex.memory.buffer, ptr, bytes.length).set(bytes);
     ex.mm_commit(this.h, bytes.length);
@@ -558,12 +458,8 @@ class Stream {
     if (ex.mm_write(this.h) < 0) throw new ModuleError(this.string('error'));
   }
 
-  // Feeds one track's samples to its decoder, as fast as the encoder keeps
-  // up. Frames come out through output() and are encoded there.
   async decode(track, samples) {
     if (samples.every((s) => s.flags & FINISH)) {
-      // Nothing to decode: a new init replaces the stream, and what the
-      // codecs hold of the old one comes out first.
       const v = this.video.get(track);
       if (v) {
         if (v.decoder.state === 'configured') await within(v.decoder.flush(), 'decoding');
@@ -577,17 +473,12 @@ class Stream {
     const codec = 'avc1.' + samples[0].codec.toString(16).padStart(6, '0');
     if (v.codec !== codec) {
       if (v.codec) {
-        // A new stream, starting at a keyframe: what the old one held
-        // comes out first.
         await within(v.decoder.flush(), 'decoding');
       }
-      // No description: the engine decodes H.264 only as Annex-B.
-      // VideoDecoder.isConfigSupported() says no, but decoding works.
       v.decoder.configure({ codec });
       v.codec = codec;
     }
     v.bitrate = samples[0].bitrate;
-    // The encoder takes 1 to 1e9; a frame claiming hours would be 0.
     v.framerate = samples[0].duration > 0 ? Math.min(240, Math.max(1, 1e6 / samples[0].duration)) : 30;
     let flush = false;
     for (const s of samples) {
@@ -596,12 +487,10 @@ class Stream {
       if (s.flags & DECODE_ONLY) {
         stats.decodeOnly++;
       } else if (s.flags & KEY) {
-        // Keyframes to come, which the frame-rate cap keeps anyway.
         v.keys.push(s.timestamp);
         if (v.keys.length > 256) v.keys.shift();
       }
       flush ||= !!(s.flags & FLUSH);
-      // Looked up each time: memory may have grown meanwhile.
       const data = new Uint8Array(this.ex.memory.buffer, this.ex.mm_job_data(this.h) + s.offset, s.len);
       v.decoder.decode(new EncodedVideoChunk({
         type: s.flags & KEY ? 'key' : 'delta',
@@ -629,15 +518,11 @@ class Stream {
       decoder: null,
       encoder: null,
       codec: '',
-      // What the encoder is configured for.
       config: null,
-      // The coded size of the chunks coming out.
       outWidth: 0,
       outHeight: 0,
       bitrate: 0,
       framerate: 30,
-      // With a frame-rate cap, which frames it keeps (see capped()), and
-      // the timestamps of keyframes fed and not out yet.
       cadence: null,
       keys: [],
       active: 0,
@@ -659,7 +544,6 @@ class Stream {
     return v;
   }
 
-  // Waits while the decoder or encoder has more than QUEUE waiting.
   async room(v) {
     const started = performance.now();
     while (v.decoder.decodeQueueSize > QUEUE() || (v.encoder && v.encoder.encodeQueueSize > QUEUE())) {
@@ -669,9 +553,6 @@ class Stream {
     }
   }
 
-  // Lets the frames being decoded come out: the decoder is idle once its
-  // queue is empty and nothing came out for a moment. What it holds for
-  // more input comes out with the next job.
   async settle(v) {
     const started = performance.now();
     while (!v.error && performance.now() - started < TIMEOUT) {
@@ -695,12 +576,6 @@ class Stream {
         stats.dropped++;
         return;
       }
-      // The module says which frames it will write, and which are
-      // keyframes, so the encoder gets exactly those, in order. Frames
-      // past the frame-rate cap are left out where the module can make the
-      // one before last longer. The visible size is what the page's
-      // videoWidth and videoHeight follow (an avc3 stream's SPS can change
-      // it at any keyframe).
       while (v.keys.length && v.keys[0] < ts) v.keys.shift();
       const slot = this.capped(v, ts);
       const skip = slot < 0;
@@ -721,16 +596,6 @@ class Stream {
     }
   }
 
-  // The frame-rate cap keeps at most one frame in each 1/fps slot of a grid
-  // that starts at the first frame kept: a steady cadence (24 fps becomes
-  // 15 as 2 of every 3 frames kept, then 1 of 2, and so on), where
-  // spacing each kept frame from the one before would keep every second
-  // frame of anything under twice the cap (12 fps of 24). A frame counts
-  // as in a slot from half a frame before it, so source timestamps that
-  // land a microsecond early don't skip one. The grid starts over at
-  // keyframes, which are always kept, and where the timeline jumps or the
-  // cap changes; a frame is also left out for a keyframe later in its
-  // slot. Returns the frame's slot, or -1 to leave it out.
   capped(v, ts) {
     const fps = this.fps;
     if (!(fps > 0)) {
@@ -751,8 +616,6 @@ class Stream {
     return slot;
   }
 
-  // A frame went to the encoder: its slot is taken, or the grid starts
-  // over at it if it's a keyframe.
   kept(v, ts, slot, key) {
     const c = v.cadence;
     if (!c) return;
@@ -797,9 +660,6 @@ class Stream {
       } else {
         options.bitrate = this.bitrate(v, config);
       }
-      // The same size keeps the encoder going (only its rate control
-      // changes, without a keyframe); another starts it over at this
-      // frame, a keyframe, which gets an init of its own.
       v.encoder.configure(options);
       if (v.config) stats[resized ? 'resized' : 'rerated']++;
       v.config = config;
@@ -807,19 +667,12 @@ class Stream {
     }
     const options = { keyFrame };
     if (tune.quantizer) options.vp9 = { quantizer: tune.quantizer };
-    // The encoder scales the frame to its configured size.
     v.encoder.encode(frame, options);
   }
 
-  // The size to encode at: the source's, or smaller to fit the size the
-  // shim gives, keeping the aspect ratio, and the frame rate the encoder
-  // gets. A new size applies at once (a video scrolled into view gets
-  // sharp at the next frame), if it differs by more than HYSTERESIS; a new
-  // frame rate too, if by more than FPS_CHANGE, and exactly at keyframes.
   target(v, width, height, key) {
     const current = v.config;
     const sameSource = current && current.sourceWidth === width && current.sourceHeight === height;
-    // Frames a second the encoder gets, for its rate control.
     const fps = this.fps > 0 ? Math.min(v.framerate, this.fps) : v.framerate;
     let scale = 1;
     const display = this.display;
@@ -843,14 +696,6 @@ class Stream {
     };
   }
 
-  // Bits per second for the encoder: the source's, for fewer pixels
-  // (pixels^0.75, so small encodes don't starve), and at most BPP bits per
-  // pixel. Measured on X's 720p in media/harness: twice the source's rate
-  // cost 10% more time for 0.8 dB PSNR more, and the quantizer mode was
-  // slower and twice as big. tune.factor, .exponent and .bpp change these.
-  // With fewer frames a second (a cap), the same bits per frame: at the
-  // source's rate, 5 of 30 frames a second took 6 times the bits each and
-  // twice the time per frame.
   bitrate(v, config) {
     const pixels = (config.width * config.height) / (config.sourceWidth * config.sourceHeight);
     let rate = (tune.factor || 1) * (v.bitrate || 1e6) * Math.pow(pixels, tune.exponent ?? 0.75);
@@ -869,7 +714,6 @@ class Stream {
         v.outWidth = config.codedWidth;
         v.outHeight = config.codedHeight;
       }
-      // Frames from before a reset or a trap have nowhere to go.
       if (!this.h || this.video.get(v.track) !== v) return;
       const ex = this.ex;
       const ptr = ex.mm_chunk_buffer(this.h, chunk.byteLength);

@@ -14,10 +14,10 @@ import time
 from browsers import MBGA
 from common import WORK, log, measure_window, sample, sleep_until, summarize, wait_for_window
 
-SETTLE = 90  # seconds between the last tab opening and "loaded"
-IDLE_WINDOW = 120  # seconds of idle CPU/energy sampling
-IDLE_MARK = 12 * 60  # "after idle" sample, counted from the last tab opening
-if os.environ.get("BENCH_QUICK"):  # smoke test of the mechanics only
+SETTLE = 90
+IDLE_WINDOW = 120
+IDLE_MARK = 12 * 60
+if os.environ.get("BENCH_QUICK"):
     SETTLE, IDLE_WINDOW, IDLE_MARK = 15, 10, 60
 
 W = "https://en.wikipedia.org/wiki/"
@@ -150,8 +150,6 @@ def run_chromium(browser):
     browser.quit(proc)
     time.sleep(3)
 
-    # Reopens each profile's last session, as a user reopening 3 windows (a
-    # plain launch shows the profile picker when several profiles exist).
     def launch():
         return browser.launch(data, profile=1, extra=["--restore-last-session"])
 

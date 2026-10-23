@@ -1,24 +1,12 @@
 import AppKit
 
-/// Chrome extensions in MBGA's tabs. Chrome's extension system runs them
-/// (content scripts, network rules, service workers) but doesn't know MBGA's
-/// tabs are tabs: they're Alloy-style browsers, outside any Chrome window.
-/// This host fills the gap. Every extension service worker gets
-/// ExtensionShim before its own script (paused at start over the browser
-/// DevTools connection, then let go, so it still sleeps when idle), and so
-/// does every extension page MBGA shows. The shim asks the host about MBGA's
-/// tabs and windows through the engine's bridge, and the host sends it
-/// MBGA's tab and window events, waking the worker when it sleeps.
 @MainActor
 final class ExtensionHost {
-    /// A profile's copy of an extension: events and state are per profile.
     struct Key: Hashable, Codable {
         let profile: String
         let extensionID: String
     }
 
-    /// What an extension's toolbar button shows, set by its action API calls
-    /// (Chrome keeps its own copy for the extensions window).
     struct ActionState {
         var badgeText: String?
         var badgeColor: [Double]?
@@ -34,80 +22,47 @@ final class ExtensionHost {
         var props: [String: JSONValue]
     }
 
-    /// The window id MBGA's main window has in extension APIs; Chrome's own
-    /// windows and tabs share a counter that starts far from it.
     static let mainWindowID = 1_000_000_000
-    /// Ids of MBGA's tabs that have no browser now (asleep, or not looked up
-    /// yet), which extensions see as discarded: counting down from far above
-    /// Chrome's own.
     static let sleepingIDBase = 2_100_000_000
-    /// MBGA's helper (shell/resources/extension), loaded in every profile.
     static let helperID = "ngnchdgcmeaekolgcekjmpncoaiepoeb"
 
     private let core: BrowserCore
     private let devTools: BrowserDevTools
-    /// The store of the window in front, which acts for extensions.
     private var store: BrowserStore { BrowserStore.front ?? BrowserStore.windows[0] }
-    /// Every loaded page, whichever window has it.
     private var views: [UInt64: MBWebView] {
         BrowserStore.windows.reduce(into: [:]) { all, window in all.merge(window.views) { first, _ in first } }
     }
-    /// Extension window ids of MBGA's windows, by store.
     private var windowIDs: [ObjectIdentifier: Int] = [:]
-    /// Little windows' ids: one each, by tab.
     static let littleWindowBase = 1_050_000_000
     private let token = (0..<4).map { _ in String(UInt32.random(in: 0...UInt32.max), radix: 16) }.joined()
     private let savePath: URL
 
-    /// Extension workers running now: DevTools target id → extension id.
     private var workers: [String: String] = [:]
-    /// Which profile each running worker belongs to, as it reported its
-    /// listeners.
     private var workerProfiles: [String: String] = [:]
-    /// Workers paused at their first script, by DevTools session.
     private var pausing: [String: String] = [:]
-    /// Targets the host is attaching to itself, and how many times.
     private var attaching: [String: Int] = [:]
-    /// Events each extension listens to. Kept across launches, so a worker
-    /// that hasn't run yet still gets woken for its events.
     private var listening: [Key: Set<String>] = [:]
     private(set) var menus: [Key: [MenuItem]] = [:]
-    /// Events waiting for a worker that's being woken.
     private var queued: [Key: [[Any]]] = [:]
     private var waking: Set<Key> = []
     private(set) var actions: [Key: ActionState] = [:]
     private(set) var tabActions: [Key: [Int: ActionState]] = [:]
-    /// Popups MBGA shows (see ExtensionPopup).
     private var popupViews = NSHashTable<MBWebView>.weakObjects()
-    /// Extension tab ids (Chrome's session ids, which CEF doesn't expose)
-    /// of MBGA's browsers, by browser id, and the DevTools target ids they
-    /// were matched by.
     private var tabIDs: [Int32: Int] = [:]
     private var targetIDs: [Int32: String] = [:]
     private var resolving: [() -> Void]?
     private var resolveRound = 0
-    /// When each browser was last looked for and how often, so one that
-    /// can't be found (a frozen page doesn't answer) doesn't hold up every
-    /// request: a second later at the soonest, three times at most.
     private var lookedFor: [Int32: (when: Date, times: Int)] = [:]
-    /// Asks waiting for the helper's worker to start.
     private var helperWaiters: [(String?) -> Void] = []
-    /// Each profile's tabs, windows and focus as last reported, to tell
-    /// extensions what changed.
     private var reported: [String: Report] = [:]
     private var syncPending = false
     private var canonical: [String: String] = [:]
     private var toldToRestart = false
-    /// activeTab: tabs where the person invoked an extension (its button,
-    /// shortcut or menu item), with the site it was on; the extension may
-    /// see them until the tab goes to another site.
     private var activeTabGrants: [Key: [UInt64: String]] = [:]
     private var wakeRounds: [Key: Int] = [:]
-    /// Called when a toolbar button or menu changes.
     var onChange: (() -> Void)?
     var onOpenPopup: ((Key) -> Void)?
 
-    /// MBGA_DEBUG_EXTENSION_HOST=1 logs what the host does.
     private static let debug = ProcessInfo.processInfo.environment["MBGA_DEBUG_EXTENSION_HOST"]?.isEmpty == false
     private func log(_ message: @autoclosure () -> String) {
         if Self.debug { NSLog("extensions: %@", message()) }
@@ -115,8 +70,6 @@ final class ExtensionHost {
 
     private struct Report {
         var tabs: [Int: [String: Any]]
-        /// MBGA's tab behind each id, to tell a tab that woke (a new id)
-        /// from one that opened.
         var owners: [Int: UInt64]
         var active: [Int: Int]
         var focused: Int
@@ -127,7 +80,6 @@ final class ExtensionHost {
         var menus: [Key: [MenuItem]]
     }
 
-    /// The app's one host, for all windows (see AppDelegate).
     static var shared: ExtensionHost!
 
     init(core: BrowserCore, devTools: BrowserDevTools, dataDirectory: URL) {
@@ -140,23 +92,16 @@ final class ExtensionHost {
         }
     }
 
-    /// Starts watching for extensions. With none installed it costs nothing
-    /// until the first one starts.
     func start(withExtensions: Bool) {
         bridge(pageScripts: false)
         guard devTools.available else { return }
         devTools.onEvent = { [weak self] method, params, session in self?.devToolsEvent(method, params, session) }
-        // Extensions' workers coming and going; the first one seen turns
-        // the rest on.
         devTools.send("Target.setDiscoverTargets", ["discover": true, "filter": [["type": "service_worker"]]])
         if withExtensions { watch(waiting: true) }
-        // Extensions' shortcuts, before the page sees the keys (Chrome's
-        // window handles its own).
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, let window = event.window, !MBEngine.isExtensionsWindow(window) else { return event }
             return handleShortcut(event) ? nil : event
         }
-        // Back from the extensions window, things may have changed there.
         NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
                 if let window = note.object as? NSWindow, MBEngine.isExtensionsWindow(window) { self?.refreshInstalled() }
@@ -164,7 +109,6 @@ final class ExtensionHost {
         }
         NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
-                // Menus, sheets and popovers don't change which window is current.
                 if let window = note.object as? NSWindow, window.level == .normal, !(window is NSPanel) {
                     self?.lastKeyWindow = window
                 }
@@ -186,17 +130,10 @@ final class ExtensionHost {
         }, pageScript: pageScripts ? { _ in ExtensionShim.source(token: token, instance: "page") } : nil)
     }
 
-    /// Gives every extension worker the shim as it starts (pausing each
-    /// service worker at its start, the web's too, a moment), and extension
-    /// pages theirs.
     private func watch(waiting: Bool) {
         guard !watching else { return }
         watching = true
         bridge(pageScripts: true)
-        // Workers that start before this takes effect miss the start of the
-        // shim: at launch, wait for it (a few milliseconds). Other profiles'
-        // extensions start with their first tab, still to come; the last
-        // used profile's started with the engine (see the late shim below).
         var attached = false
         devTools.send("Target.setAutoAttach", [
             "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true,
@@ -209,15 +146,11 @@ final class ExtensionHost {
         prepareProfiles()
     }
 
-    /// Extensions' requests reach the bridge once their profile has its
-    /// context: set them all up rather than waiting for their first tab.
     private func prepareProfiles() {
         for profile in store.snapshot.profiles {
             MBEngine.prepareProfilePath(core.profileDir(profileId: profile.id))
         }
     }
-
-    // MARK: - Workers
 
     private func devToolsEvent(_ method: String, _ params: [String: Any], _ session: String?) {
         switch method {
@@ -227,24 +160,15 @@ final class ExtensionHost {
             let url = info["url"] as? String ?? ""
             let waiting = params["waitingForDebugger"] as? Bool ?? false
             let target = info["targetId"] as? String ?? ""
-            // Our own attachments (to send events or ask the helper) never
-            // wait; one that waits is the worker starting, even if we're
-            // attaching to it too.
             if !waiting, (attaching[target] ?? 0) > 0 { return }
             if url.hasPrefix("chrome-extension://"), waiting {
-                // Paused before its first script, where the shim goes.
                 pausing[sessionID] = target
                 devTools.send("Debugger.enable", session: sessionID)
                 devTools.send("Debugger.setInstrumentationBreakpoint", ["instrumentation": "beforeScriptExecution"], session: sessionID)
                 devTools.send("Runtime.runIfWaitingForDebugger", session: sessionID)
             } else if url.hasPrefix("chrome-extension://") {
-                // Already running when MBGA connected (Chrome starts the
-                // last used profile's extensions with the engine): the shim
-                // comes late, after the listeners it should know about.
                 devTools.send("Runtime.evaluate", ["expression": ExtensionShim.source(token: token, instance: target)], session: sessionID)
                 devTools.send("Target.detachFromTarget", ["sessionId": sessionID])
-                // Stopped once its startup work is done, it starts again
-                // at its next event, shim first.
                 if !url.hasPrefix("chrome-extension://\(Self.helperID)/") {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
                         guard let self, workers[target] != nil else { return }
@@ -253,7 +177,6 @@ final class ExtensionHost {
                     }
                 }
             } else {
-                // The web's own service workers: let go at once.
                 if waiting { devTools.send("Runtime.runIfWaitingForDebugger", session: sessionID) }
                 devTools.send("Target.detachFromTarget", ["sessionId": sessionID])
             }
@@ -263,7 +186,6 @@ final class ExtensionHost {
             devTools.send("Runtime.evaluate", ["expression": ExtensionShim.source(token: token, instance: target)], session: session)
             devTools.send("Debugger.disable", session: session)
             devTools.send("Debugger.resume", session: session)
-            // Attached, a worker would never be stopped when idle.
             devTools.send("Target.detachFromTarget", ["sessionId": session])
         case "Target.targetCreated", "Target.targetInfoChanged":
             guard let info = params["targetInfo"] as? [String: Any], info["type"] as? String == "service_worker",
@@ -272,10 +194,8 @@ final class ExtensionHost {
             if id != Self.helperID { watch(waiting: false) }
             if workers[target] == nil, id != Self.helperID,
                !store.snapshot.profiles.contains(where: { extensions(in: profilePath($0.id)).contains { $0.id == id } }) {
-                // Just installed (or enabled).
                 refreshInstalled()
                 if !loadsExtensionHelper, !toldToRestart {
-                    // The first extension: the helper comes with the next launch.
                     toldToRestart = true
                     store.showToast(Toast(message: "Quit and reopen MBGA to let extensions see your tabs",
                                           symbol: "puzzlepiece.extension"), duration: 8)
@@ -296,7 +216,6 @@ final class ExtensionHost {
         }
     }
 
-    /// Sends events to an extension's worker, waking it if it sleeps.
     private func dispatch(_ events: [[Any]], to key: Key) {
         let events = redact(events: events, for: key)
         guard !events.isEmpty else { return }
@@ -311,7 +230,6 @@ final class ExtensionHost {
         attach(target) { [weak self] session in
             guard let self else { return }
             guard let session else {
-                // It stopped meanwhile.
                 queued[key, default: []].append(contentsOf: events)
                 wake(key)
                 return
@@ -321,8 +239,6 @@ final class ExtensionHost {
         }
     }
 
-    /// Starts a sleeping worker; as it reports its listeners, it gets the
-    /// queued events.
     private func wake(_ key: Key) {
         guard !waking.contains(key) else { return }
         guard let view = liveView(in: key.profile) else {
@@ -341,15 +257,12 @@ final class ExtensionHost {
             }
             startWorker(key.extensionID, from: page)
         }
-        // Don't keep events forever for a worker that never reports.
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self, wakeRounds[key] == round, waking.remove(key) != nil else { return }
             queued[key] = nil
         }
     }
 
-    /// A page's DevTools target id (its main frame's id): the tab's own
-    /// DevTools connection doesn't answer the Target domain.
     private func pageTarget(of view: MBWebView, _ done: @escaping (String?) -> Void) {
         let browser = view.browserIdentifier
         if let known = targetIDs[browser] { return done(known) }
@@ -365,8 +278,6 @@ final class ExtensionHost {
         }
     }
 
-    /// Attaches to a target for a few commands; `body` gets the session, or
-    /// nil if the target is gone, and must detach when done.
     private func attach(_ target: String, _ body: @escaping (String?) -> Void) {
         attaching[target, default: 0] += 1
         devTools.send("Target.attachToTarget", ["targetId": target, "flatten": true]) { [weak self] result, _ in
@@ -377,8 +288,6 @@ final class ExtensionHost {
         }
     }
 
-    /// Starts an extension's service worker, through a page of the same
-    /// profile (DevTools starts workers from a page's session).
     private func startWorker(_ extensionID: String, from page: String) {
         attach(page) { [weak self] session in
             guard let self, let session else { return }
@@ -388,8 +297,6 @@ final class ExtensionHost {
             }
         }
     }
-
-    // MARK: - Bridge
 
     private func handle(profile rawProfile: String, extensionID: String, browserID: Int32, path: String,
                         body: String, reply: @escaping (String) -> Void) {
@@ -420,7 +327,6 @@ final class ExtensionHost {
         case "state":
             answer(nil)
         case "self":
-            // Only a page of this extension, in one of MBGA's tabs, for itself.
             let page = views.first { $0.value.browserIdentifier == browserID }?.key
             if browserID != 0, let page, core.tab(id: page)?.url.hasPrefix("chrome-extension://\(extensionID)/") == true,
                let id = (args["id"] as? NSNumber)?.intValue, tabIDs[browserID] != id, !tabIDs.values.contains(id) {
@@ -429,8 +335,6 @@ final class ExtensionHost {
             }
             answer(nil)
         case "listeners":
-            // A worker's listeners are added as it starts: the moment to
-            // hand it the events it was woken for.
             guard browserID == 0 else { return answer(nil) }
             if let instance = args["instance"] as? String, workers[instance] == extensionID { workerProfiles[instance] = profile }
             setListeners(args["listeners"], for: key)
@@ -448,7 +352,6 @@ final class ExtensionHost {
             answer(nil)
         case "tabs.update":
             if let id = (args["id"] as? NSNumber)?.intValue, let tab = tab(extensionTabID: id, in: profile) {
-                // An asleep tab loads the address when it wakes.
                 if let url = args["url"] as? String, views[tab] == nil { core.updateTab(id: tab, url: url, title: nil) }
                 if let pinned = args["pinned"] as? Bool, pinned != isPinned(tab) { store.togglePin(tab, in: space(of: tab)) }
                 if args["active"] as? Bool == true { store.select(tab, in: space(of: tab)?.id) }
@@ -460,8 +363,6 @@ final class ExtensionHost {
             }
             answer(nil)
         case "tabs.capture":
-            // As in Chrome: with <all_urls>, or activeTab where invoked, of a
-            // tab of the extension's profile.
             guard let tab = store.visibleTabID, let owner = core.profileOfTab(tabId: tab), profilePath(owner) == profile,
                   installedExtension(key)?.hosts.contains("<all_urls>") == true
                   || activeTabGrants[key]?[tab] == core.tab(id: tab).flatMap({ URL(string: $0.url)?.host }) else { return answer(nil) }
@@ -501,16 +402,12 @@ final class ExtensionHost {
         if let data = try? JSONEncoder().encode(saved) { try? data.write(to: savePath, options: .atomic) }
     }
 
-    // MARK: - Installed extensions
-
     private var installed: [String: [InstalledExtension]] = [:]
 
-    /// The profile's extensions, as Chrome last recorded them.
     func extensions(in profile: String) -> [InstalledExtension] {
         if let known = installed[profile] { return known }
         let list = InstalledExtension.all(in: profile)
         installed[profile] = list
-        // Forget what removed extensions listened to and added to menus.
         let present = Set(list.map(\.id))
         let gone = Set(listening.keys).union(menus.keys).filter { $0.profile == profile && !present.contains($0.extensionID) }
         if !gone.isEmpty, FileManager.default.fileExists(atPath: URL(fileURLWithPath: profile).appendingPathComponent("Preferences").path) {
@@ -523,8 +420,6 @@ final class ExtensionHost {
         return list
     }
 
-    /// Reads the installed extensions again (Chrome writes its records a few
-    /// seconds after a change, so again a little later too).
     func refreshInstalled() {
         installed = [:]
         shortcuts = [:]
@@ -540,8 +435,6 @@ final class ExtensionHost {
 
     private var shortcuts: [String: [String: (key: Key, command: String)]] = [:]
 
-    /// The profile's extension shortcuts, as Chrome assigned them ("Alt+Shift+P"
-    /// in Chrome's terms, "Command" being ⌘ and "MacCtrl" ⌃) → command.
     func shortcuts(in profile: String) -> [String: (key: Key, command: String)] {
         if let known = shortcuts[profile] { return known }
         var result: [String: (key: Key, command: String)] = [:]
@@ -561,7 +454,6 @@ final class ExtensionHost {
         return result
     }
 
-    /// Runs the extension shortcut `event` is, if it is one.
     func handleShortcut(_ event: NSEvent) -> Bool {
         guard let accelerator = Self.accelerator(event),
               let (key, command) = shortcuts(in: profilePath(store.activeSpace.profileId))[accelerator] else { return false }
@@ -573,7 +465,6 @@ final class ExtensionHost {
         return true
     }
 
-    /// A key press in Chrome's accelerator syntax: "Command+Shift+Y".
     private static func accelerator(_ event: NSEvent) -> String? {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         var parts: [String] = []
@@ -581,13 +472,11 @@ final class ExtensionHost {
         if flags.contains(.control) { parts.append("MacCtrl") }
         if flags.contains(.option) { parts.append("Alt") }
         if flags.contains(.shift) { parts.append("Shift") }
-        // A shortcut needs Command, Control or Option.
         guard !parts.isEmpty, parts != ["Shift"] else { return nil }
         let named: [UInt16: String] = [
             49: "Space", 43: "Comma", 47: "Period", 115: "Home", 119: "End", 116: "PageUp", 121: "PageDown",
             114: "Insert", 117: "Delete", 126: "Up", 125: "Down", 123: "Left", 124: "Right",
         ]
-        // By physical key, as the menu does, so other layouts work too.
         let letters: [UInt16: String] = [
             0: "A", 11: "B", 8: "C", 2: "D", 14: "E", 3: "F", 5: "G", 4: "H", 34: "I", 38: "J", 40: "K", 37: "L", 46: "M",
             45: "N", 31: "O", 35: "P", 12: "Q", 15: "R", 1: "S", 17: "T", 32: "U", 9: "V", 13: "W", 7: "X", 16: "Y", 6: "Z",
@@ -597,8 +486,6 @@ final class ExtensionHost {
         return (parts + [name]).joined(separator: "+")
     }
 
-    /// Shows the extension's options in a tab: the one already showing
-    /// them, as Chrome does, or a new one.
     func openOptions(_ key: Key) {
         guard let page = extensions(in: key.profile).first(where: { $0.id == key.extensionID })?.optionsPage else { return }
         for space in spaces(in: key.profile) {
@@ -608,8 +495,6 @@ final class ExtensionHost {
         }
         openTab(["url": page, "active": true], profile: key.profile) { _ in }
     }
-
-    // MARK: - Toolbar buttons and menus
 
     private func updateAction(_ key: Key, what: String, details: [String: Any]) {
         let tab = (details["tabId"] as? NSNumber)?.intValue
@@ -637,8 +522,6 @@ final class ExtensionHost {
         return [Double(n >> 16 & 0xFF), Double(n >> 8 & 0xFF), Double(n & 0xFF), 255]
     }
 
-    /// The toolbar button for `key` as it shows on `tab` (an extension tab
-    /// id).
     func action(_ key: Key, tab: Int?) -> ActionState {
         var state = actions[key] ?? ActionState()
         if let tab, let own = tabActions[key]?[tab] {
@@ -666,7 +549,6 @@ final class ExtensionHost {
             guard let id, let index = items.firstIndex(where: { $0.id == id }) else { return }
             items[index].props.merge(props) { $1 }
         case "remove":
-            // Removing an item removes its submenu too.
             var gone: Set<String> = [id].compactMap(\.self).reduce(into: []) { $0.insert($1) }
             var grew = true
             while grew {
@@ -685,15 +567,10 @@ final class ExtensionHost {
         onChange?()
     }
 
-    // MARK: - What extensions may see
-
     private func installedExtension(_ key: Key) -> InstalledExtension? {
         extensions(in: key.profile).first { $0.id == key.extensionID }
     }
 
-    /// Whether the extension may see a tab's address and title, as Chrome
-    /// decides: with the tabs permission, a host permission for its address,
-    /// or activeTab where the person invoked it.
     private func canSee(_ key: Key, url: String, tab: UInt64?) -> Bool {
         guard let ext = installedExtension(key) else { return false }
         if ext.permissions.contains("tabs") { return true }
@@ -701,7 +578,6 @@ final class ExtensionHost {
         return ext.hosts.contains { matches($0, url) }
     }
 
-    /// The person invoked the extension on `tab`.
     private func grantActiveTab(_ key: Key, tab: UInt64) {
         guard installedExtension(key)?.permissions.contains("activeTab") == true,
               let host = core.tab(id: tab).flatMap({ URL(string: $0.url)?.host }) else { return }
@@ -729,7 +605,6 @@ final class ExtensionHost {
         return state
     }
 
-    /// Events as the extension may see them; changes it may not see dropped.
     private func redact(events: [[Any]], for key: Key) -> [[Any]] {
         events.compactMap { event in
             var event = event
@@ -750,14 +625,11 @@ final class ExtensionHost {
         }
     }
 
-    /// Runs a toolbar button: shows its popup, or tells the extension it was
-    /// clicked. Returns the popup page to show, if any.
     func clickAction(_ key: Key, tab: UInt64) -> String? {
         grantActiveTab(key, tab: tab)
         let button = action(key, tab: extensionTabID(of: tab))
         let popup = button.popup ?? extensions(in: key.profile).first { $0.id == key.extensionID }?.popup
         if let popup, !popup.isEmpty {
-            // Its own pages only.
             let own = "chrome-extension://\(key.extensionID)/"
             return popup.hasPrefix("chrome-extension://") ? (popup.hasPrefix(own) ? popup : nil)
                 : own + popup.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -768,9 +640,6 @@ final class ExtensionHost {
         return nil
     }
 
-    /// The page menu's items from the profile's extensions, for a menu
-    /// opened on `context` (see MBWebViewDelegate): an extension's items
-    /// directly if it has one, else under its name, as Chrome does.
     func pageMenuItems(profile: String, context: [String: Any]) -> [[String: Any]] {
         let contexts = Set(context["contexts"] as? [String] ?? [])
         let selection = context["selectionText"] as? String ?? ""
@@ -818,8 +687,6 @@ final class ExtensionHost {
         return result
     }
 
-    /// The extension's items for its toolbar button's menu (the "action"
-    /// context), with ids for `choosePageMenuItem`.
     func actionMenuItems(_ key: Key) -> [(id: String, title: String, checked: Bool?)] {
         (menus[key] ?? []).compactMap { item in
             guard case .array(let contexts) = item.props["contexts"],
@@ -831,7 +698,6 @@ final class ExtensionHost {
         }
     }
 
-    /// A page menu item from `pageMenuItems` was chosen on `tab`.
     func choosePageMenuItem(_ id: String, context: [String: Any], profile: String, tab: UInt64) {
         let parts = id.split(separator: "\u{1}", maxSplits: 1).map(String.init)
         guard parts.count == 2 else { return }
@@ -841,7 +707,6 @@ final class ExtensionHost {
         for field in ["pageUrl", "frameUrl", "linkUrl", "srcUrl", "mediaType", "selectionText"] {
             if let value = context[field] as? String, !value.isEmpty { info[field] = value }
         }
-        // Checkboxes and radio items change as they're chosen.
         switch item.props["type"]?.string {
         case "checkbox":
             let was: Bool = if case .bool(let b) = item.props["checked"] { b } else { false }
@@ -866,7 +731,6 @@ final class ExtensionHost {
         return url.range(of: "^" + scheme + "$", options: .regularExpression) != nil
     }
 
-    /// Tells the extension one of its menu items was chosen on a page.
     func clickMenu(_ key: Key, item: MenuItem, info: [String: Any], tab: UInt64) {
         grantActiveTab(key, tab: tab)
         guard let subject = tabObject(for: tab, profile: key.profile) else { return }
@@ -876,14 +740,12 @@ final class ExtensionHost {
         dispatch([["contextMenus.onClicked", [info, subject], state(profile: key.profile, requester: 0)]], to: key)
     }
 
-    /// Tells the extension one of its keyboard shortcuts was pressed.
     func runCommand(_ key: Key, command: String, tab: UInt64?) {
         if let tab { grantActiveTab(key, tab: tab) }
         let subject = tab.flatMap { tabObject(for: $0, profile: key.profile) }
         dispatch([["commands.onCommand", [command, subject.map { $0 as Any } ?? NSNull()], state(profile: key.profile, requester: 0)]], to: key)
     }
 
-    /// Records a popup view, which counts as in MBGA's focused window.
     func registerPopup(_ view: MBWebView) {
         popupViews.add(view)
     }
@@ -891,8 +753,6 @@ final class ExtensionHost {
     private func isPopup(_ browserID: Int32) -> Bool {
         browserID != 0 && popupViews.allObjects.contains { $0.browserIdentifier == browserID }
     }
-
-    // MARK: - MBGA's tabs and windows, as extensions see them
 
     private func canonicalPath(_ path: String) -> String {
         if let known = canonical[path] { return known }
@@ -932,15 +792,12 @@ final class ExtensionHost {
         return nil
     }
 
-    /// MBGA's tab with this extension tab id, only if it's one of
-    /// `profile`'s tabs.
     func tab(extensionTabID id: Int, in profile: String) -> UInt64? {
         guard let tab = tab(extensionTabID: id), let owner = core.profileOfTab(tabId: tab),
               profilePath(owner) == profile else { return nil }
         return tab
     }
 
-    /// MBGA's tab with this extension tab id.
     func tab(extensionTabID id: Int) -> UInt64? {
         if let live = views.first(where: { tabIDs[$0.value.browserIdentifier] == id })?.key { return live }
         guard id <= Self.sleepingIDBase, id > Self.sleepingIDBase - 100_000_000 else { return nil }
@@ -948,14 +805,10 @@ final class ExtensionHost {
         return core.tab(id: tab) != nil && extensionTabID(of: tab) == nil ? tab : nil
     }
 
-    /// The extension tab id of MBGA's tab, once known.
     func extensionTabID(of tab: UInt64) -> Int? {
         views[tab].flatMap { tabIDs[$0.browserIdentifier] }
     }
 
-    /// Learns the extension tab ids of browsers that don't have one yet,
-    /// then calls `done`. Each browser's DevTools target id is matched with
-    /// the helper's chrome.debugger.getTargets(), which lists both.
     private func resolveTabIDs(_ done: @escaping () -> Void) {
         let views = views
         let live = views.values.map(\.browserIdentifier).filter { $0 != 0 }
@@ -981,8 +834,6 @@ final class ExtensionHost {
             guard let self, round == resolveRound, let waiting = resolving else { return }
             resolving = nil
             waiting.forEach { $0() }
-            // Tabs found now are news to extensions; ones not yet found are
-            // looked for again soon.
             if missing.contains(where: { self.tabIDs[$0] != nil }) { setNeedsSync() }
             if missing.contains(where: { self.tabIDs[$0] == nil && (self.lookedFor[$0]?.times ?? 3) < 3 }) {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { [weak self] in self?.setNeedsSync() }
@@ -1006,12 +857,9 @@ final class ExtensionHost {
                 finish()
             }
         }
-        // Never hold extensions up for long.
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { finish() }
     }
 
-    /// chrome.debugger.getTargets() in the helper, starting its worker if
-    /// it sleeps.
     private func helperTargets(_ done: @escaping ([[String: Any]]) -> Void) {
         let evaluate = { [weak self] (target: String?) in
             guard let self, let target else { return done([]) }
@@ -1025,7 +873,6 @@ final class ExtensionHost {
                     self?.devTools.send("Target.detachFromTarget", ["sessionId": session])
                     done(((result?["result"] as? [String: Any])?["value"] as? [[String: Any]]) ?? [])
                 }
-                // Never left attached: that would keep the helper running.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                     guard !answered else { return }
                     answered = true
@@ -1046,7 +893,6 @@ final class ExtensionHost {
         }
     }
 
-    /// The extension window id of an MBGA window, kept while it's open.
     private func windowID(of store: BrowserStore) -> Int {
         if let known = windowIDs[ObjectIdentifier(store)] { return known }
         let id = Self.mainWindowID + windowIDs.count
@@ -1054,26 +900,17 @@ final class ExtensionHost {
         return id
     }
 
-    /// The window a tab is in: the one with its page (or its little
-    /// window), else the front one.
     private func windowID(of tab: UInt64) -> Int {
         guard let holder = BrowserStore.windows.first(where: { $0.views[tab] != nil }) else { return windowID(of: store) }
         return holder.isInLittleWindow(tab) ? Self.littleWindowBase + Int(tab) : windowID(of: holder)
     }
 
-    /// The tab active in a window for `profile`: the one it shows when its
-    /// space uses that profile, else the current tab of the first of its
-    /// spaces that does.
     private func activeTab(in profile: String, of store: BrowserStore) -> UInt64? {
         let active = store.activeSpace
         if profilePath(active.profileId) == profile, let tab = active.activeTab { return tab }
         return store.snapshot.spaces.lazy.filter { self.profilePath($0.profileId) == profile }.compactMap(\.activeTab).first
     }
 
-    /// The window that counts as focused: the last one with the keyboard,
-    /// as in Chrome even while another app is in front. Popups, menus and
-    /// Settings leave it as it was; Chrome's extensions window is none of
-    /// MBGA's.
     private var focusedWindow: Int? {
         guard let key = lastKeyWindow else { return windowID(of: store) }
         if MBEngine.isExtensionsWindow(key) { return nil }
@@ -1092,8 +929,6 @@ final class ExtensionHost {
         var windows: [Int: [String: Any]] = [:]
         let views = views
         let focused = focusedWindow
-        // Every MBGA window, a tab of any profile can be in it; focused if
-        // it shows a space of this profile.
         var active: [Int: UInt64] = [:]
         for window in BrowserStore.windows {
             let id = windowID(of: window)
@@ -1108,9 +943,6 @@ final class ExtensionHost {
                 let known = views[tab.id].flatMap { tabIDs[$0.browserIdentifier] }
                 let sleeping = Self.sleepingIDBase - Int(tab.id)
                 var view = views[tab.id]
-                // While its id is looked up, a tab waking stays the tab asleep
-                // it was (replaced once its id is known); one just opened shows
-                // up then, as Chrome's do.
                 if let live = view, known == nil, live.browserIdentifier == 0 || (lookedFor[live.browserIdentifier]?.times ?? 0) < 3 {
                     guard reported[profile]?.tabs[sleeping] != nil else { continue }
                     view = nil
@@ -1135,7 +967,6 @@ final class ExtensionHost {
         ]
     }
 
-    /// A tab as extensions see it; without `view` (asleep), discarded.
     private func tabObject(_ tab: TabInfo, id: Int, view: MBWebView?, window: Int, index: Int, active: Bool,
                            pinned: Bool) -> [String: Any] {
         let loading = BrowserStore.windows.lazy.compactMap { $0.navStates[tab.id] }.first?.isLoading == true
@@ -1170,15 +1001,12 @@ final class ExtensionHost {
         ]
     }
 
-    // MARK: - Acting on MBGA's tabs
-
     private func openTab(_ args: [String: Any], profile: String, done: @escaping (UInt64?) -> Void) {
         let candidates = spaces(in: profile)
         let space = candidates.first { $0.id == store.activeSpace.id } ?? candidates.first
         guard let space else { return done(nil) }
         var url = args["url"] as? String ?? ""
         if !url.isEmpty, !url.contains(":") {
-            // Relative to the extension, as Chrome resolves them.
             url = URL(string: url, relativeTo: URL(string: "chrome-extension://\(args["extension"] as? String ?? "")/"))?.absoluteString ?? url
         }
         let active = args["active"] as? Bool ?? true
@@ -1186,7 +1014,6 @@ final class ExtensionHost {
         if args["pinned"] as? Bool == true { store.togglePin(tab, in: space) }
         store.refresh()
         store.warmTab(tab)
-        // The browser, and its id, come a moment later.
         func poll(_ tries: Int) {
             if let id = views[tab]?.browserIdentifier, id != 0 {
                 return resolveTabIDs { done(tab) }
@@ -1197,8 +1024,6 @@ final class ExtensionHost {
         poll(150)
     }
 
-    /// A tab just opened whose id isn't known yet: it goes by its id asleep
-    /// meanwhile (which the bridge accepts), then by its own.
     private func provisionalTab(_ tab: UInt64, active: Bool) -> [String: Any]? {
         guard let info = core.tab(id: tab) else { return nil }
         return [
@@ -1224,20 +1049,14 @@ final class ExtensionHost {
         }
     }
 
-    // MARK: - Events
-
     func setNeedsSync() {
         guard !syncPending else { return }
         syncPending = true
         DispatchQueue.main.async { [weak self] in self?.sync() }
     }
 
-    /// Tells each profile's extensions what changed about its tabs and
-    /// windows since last time.
     private func sync() {
         syncPending = false
-        // Nothing to tell, and no reason to wake the helper, with no
-        // extension listening to tab or window events.
         guard listening.values.contains(where: { $0.contains { $0.hasPrefix("tabs.") || $0.hasPrefix("windows.") } }) else {
             reported = [:]
             return
@@ -1261,8 +1080,6 @@ final class ExtensionHost {
             defer { reported[profile] = current }
             guard let before = reported[profile] else { continue }
             var events: [[Any]] = []
-            // A tab that woke or went to sleep has a new id, as a discarded
-            // tab in Chrome that's replaced.
             var replaced: [Int: Int] = [:]
             for (old, owner) in before.owners where tabs[old] == nil {
                 if let new = owners.first(where: { $0.value == owner && before.tabs[$0.key] == nil })?.key { replaced[old] = new }
@@ -1306,20 +1123,17 @@ final class ExtensionHost {
         }
     }
 
-    /// Sends each extension of `profile` the events it listens to.
     private func send(_ events: [[Any]], in profile: String) {
         for (key, names) in listening where key.profile == profile {
             let wanted = events.filter { names.contains($0[0] as? String ?? "") }
             guard !wanted.isEmpty else { continue }
             var batch = wanted
-            // Every batch ends with the state it leads to.
             if batch[batch.count - 1].count < 3, let state = events.last?.last { batch[batch.count - 1].append(state) }
             dispatch(batch, to: key)
         }
     }
 }
 
-/// A JSON value that can be saved, for extensions' menu items.
 enum JSONValue: Codable {
     case string(String), number(Double), bool(Bool), array([Self]), object([String: Self])
 
@@ -1374,14 +1188,12 @@ enum JSONValue: Codable {
     }
 }
 
-/// An extension installed in a profile, as Chrome recorded it.
 struct InstalledExtension {
     let id: String
     let name: String
     let directory: URL
     let enabled: Bool
     let manifest: [String: Any]
-    /// Granted API permissions ("tabs", "activeTab"...) and host patterns.
     var permissions: Set<String> = []
     var hosts: [String] = []
 
@@ -1396,8 +1208,6 @@ struct InstalledExtension {
         return page.map { "chrome-extension://\(id)/\($0.trimmingCharacters(in: CharacterSet(charactersIn: "/")))" }
     }
 
-    /// The icon closest to `size` points (at 2x), from the action's own
-    /// icons or the extension's.
     func iconFile(size: Int) -> URL? {
         let action = (manifest["action"] as? [String: Any])?["default_icon"]
         let sets: [Any?] = [action, manifest["icons"]]
@@ -1411,8 +1221,6 @@ struct InstalledExtension {
         return nil
     }
 
-    /// Commands (keyboard shortcuts) from the manifest: name → suggested key
-    /// for the Mac.
     var commands: [String: String] {
         var result: [String: String] = [:]
         for (name, value) in manifest["commands"] as? [String: Any] ?? [:] {
@@ -1426,7 +1234,6 @@ struct InstalledExtension {
         all(in: profile).first { $0.id == id }
     }
 
-    /// The profile's extensions, without Chrome's built-in ones.
     static func all(in profile: String) -> [Self] {
         let base = URL(fileURLWithPath: profile)
         var settings: [String: Any] = [:]
@@ -1438,11 +1245,8 @@ struct InstalledExtension {
         }
         return settings.compactMap { id, value -> Self? in
             guard let entry = value as? [String: Any], let path = entry["path"] as? String else { return nil }
-            // 5 and 10 are Chrome's own (the PDF viewer and such).
             let location = entry["location"] as? Int ?? 0
             guard location != 5, location != 10, id != ExtensionHost.helperID else { return nil }
-            // 8 was loaded from the command line, which Chrome remembers after
-            // it's gone: only those loaded this time count.
             if location == 8, !commandLinePaths.contains(URL(fileURLWithPath: path).resolvingSymlinksInPath().path) { return nil }
             let directory = path.hasPrefix("/") ? URL(fileURLWithPath: path)
                 : base.appendingPathComponent("Extensions").appendingPathComponent(path)
@@ -1461,8 +1265,6 @@ struct InstalledExtension {
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    /// Unpacked extensions loaded for development, with
-    /// MBGA_ENGINE_SWITCHES="--load-extension=<dir>[,<dir>...]".
     private static let commandLinePaths: Set<String> = {
         let switches = ProcessInfo.processInfo.environment["MBGA_ENGINE_SWITCHES"] ?? ""
         return Set(switches.split(separator: " ").filter { $0.hasPrefix("--load-extension=") }.flatMap {
@@ -1472,7 +1274,6 @@ struct InstalledExtension {
         })
     }()
 
-    /// Resolves "__MSG_name__" from the extension's messages.
     private static func localized(_ text: String, directory: URL, manifest: [String: Any]) -> String {
         guard text.hasPrefix("__MSG_"), text.hasSuffix("__") else { return text }
         let key = String(text.dropFirst(6).dropLast(2)).lowercased()

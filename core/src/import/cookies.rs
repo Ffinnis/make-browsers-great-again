@@ -1,42 +1,25 @@
-//! Other browsers' cookies, so imported profiles stay signed in.
-//!
-//! Chromium-based browsers (Arc too) encrypt each value with AES-128-CBC,
-//! under a key derived (PBKDF2-SHA1, "saltysalt", 1003 rounds) from a
-//! password they keep in the keychain, e.g. "Chrome Safe Storage". The shell
-//! reads that password, with the person's permission, and passes it in.
-//! Since version 24 of their database the plaintext starts with a SHA-256
-//! of the cookie's domain. Firefox keeps values in the clear.
-
 use super::{firefox, Kind, Source};
 use crate::crypto::{self, Cipher, Hash};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-/// Microseconds from 1601 (Chromium's and the engine's clock) to 1970.
 const UNIX_EPOCH_US: i64 = 11_644_473_600_000_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cookie {
-    /// ".example.com" for the domain and its subdomains, "example.com" for
-    /// that host alone.
     pub domain: String,
     pub name: String,
     pub value: String,
     pub path: String,
     pub secure: bool,
     pub http_only: bool,
-    /// Microseconds since 1601; 0 for a session cookie.
     pub expires: i64,
     pub created: i64,
     pub last_used: i64,
-    /// Chromium's values: -1 unspecified, 0 none, 1 lax, 2 strict.
     pub same_site: i32,
-    /// 0 low, 1 medium, 2 high.
     pub priority: i32,
 }
 
-/// The keychain item holding the password a Chromium-based browser
-/// encrypts its cookies with.
 pub fn keychain_service(source: &Source) -> Option<String> {
     let name = match source.kind {
         Kind::Arc => "Arc",
@@ -49,7 +32,6 @@ pub fn keychain_service(source: &Source) -> Option<String> {
     Some(format!("{name} Safe Storage"))
 }
 
-/// Where one profile of `source` keeps its cookies, if it has any.
 pub fn database(source: &Source, profile_id: &str) -> Option<PathBuf> {
     let data_dir = Path::new(&source.id);
     let candidates = match source.kind {
@@ -64,8 +46,6 @@ pub fn database(source: &Source, profile_id: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-/// The cookies of one profile of `source` that haven't expired by `now_ms`.
-/// Chromium-based browsers need their keychain `password`.
 pub fn read(source: &Source, profile_id: &str, password: Option<&[u8]>, now_ms: u64) -> Result<Vec<Cookie>, String> {
     if source.kind == Kind::Safari {
         return Err("Safari's cookies can't be imported.".into());
@@ -89,13 +69,11 @@ fn read_chromium(db: &Connection, key: &[u8]) -> rusqlite::Result<Vec<Cookie>> {
         .unwrap_or(0);
     let columns = columns(db, "cookies")?;
     let has = |c: &str| columns.iter().any(|n| n == c);
-    // Older databases name some columns differently or lack them.
     let secure = if has("is_secure") { "is_secure" } else { "secure" };
     let http_only = if has("is_httponly") { "is_httponly" } else { "httponly" };
     let persistent = if has("is_persistent") { "is_persistent" } else { "persistent" };
     let same_site = if has("samesite") { "samesite" } else { "-1" };
     let priority = if has("priority") { "priority" } else { "1" };
-    // Cookies partitioned by a top-level site can't be recreated as they were.
     let partitioned = if has("top_frame_site_key") { "top_frame_site_key = ''" } else { "1" };
     let sql = format!(
         "SELECT host_key, name, value, encrypted_value, path, {secure}, {http_only}, expires_utc, {persistent},
@@ -126,15 +104,12 @@ fn read_chromium(db: &Connection, key: &[u8]) -> rusqlite::Result<Vec<Cookie>> {
             priority: r.get(12).unwrap_or(1),
         }))
     })?;
-    // A value that won't decrypt (another key, a newer format) is left out.
     Ok(rows.filter_map(|r| r.ok().flatten()).map(sane).collect())
 }
 
 fn read_firefox(db: &Connection) -> rusqlite::Result<Vec<Cookie>> {
     let columns = columns(db, "moz_cookies")?;
     let same_site = if columns.iter().any(|c| c == "sameSite") { "sameSite" } else { "256" };
-    // Containers and partitioned cookies carry origin attributes; only the
-    // default jar is the person's everyday sign-ins.
     let sql = format!(
         "SELECT host, name, value, path, isSecure, isHttpOnly, expiry, creationTime, lastAccessed, {same_site}
          FROM moz_cookies WHERE originAttributes = ''"
@@ -142,7 +117,6 @@ fn read_firefox(db: &Connection) -> rusqlite::Result<Vec<Cookie>> {
     let mut stmt = db.prepare(&sql)?;
     let rows = stmt.query_map([], |r| {
         let expiry: i64 = r.get(6)?;
-        // Seconds until Firefox 136ish, milliseconds since.
         let expires_ms = if expiry > 100_000_000_000 { expiry } else { expiry.saturating_mul(1000) };
         Ok(Cookie {
             domain: r.get(0)?,
@@ -166,7 +140,6 @@ fn read_firefox(db: &Connection) -> rusqlite::Result<Vec<Cookie>> {
     Ok(rows.filter_map(Result::ok).map(sane).collect())
 }
 
-/// SameSite=None needs Secure, or Chromium refuses the cookie.
 fn sane(mut cookie: Cookie) -> Cookie {
     if cookie.same_site == 0 && !cookie.secure {
         cookie.same_site = -1;
@@ -191,15 +164,12 @@ fn decrypt(key: &[u8], encrypted: &[u8], hashed_domain: bool) -> Option<String> 
     String::from_utf8(plain).ok()
 }
 
-/// The key Chromium-based browsers encrypt cookies and passwords with.
 pub(super) fn derive_key(password: &[u8]) -> Option<Vec<u8>> {
     crypto::pbkdf2(Hash::Sha1, password, b"saltysalt", 1003, 16)
 }
 
-/// Chromium's IV: 16 spaces.
 const IV: [u8; 16] = [b' '; 16];
 
-/// A "v10" value: AES-128-CBC under `key`.
 pub(super) fn decrypt_value(key: &[u8], encrypted: &[u8]) -> Option<Vec<u8>> {
     let data = encrypted.strip_prefix(b"v10")?;
     crypto::cbc(false, Cipher::Aes, key, &IV, data)

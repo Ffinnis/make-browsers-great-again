@@ -1,14 +1,6 @@
 import AppKit
 import CryptoKit
 
-/// Keeps MBGA up to date, as Arc does: it checks the releases on GitHub now
-/// and then, downloads a new version in the background, and offers to
-/// restart into it from the foot of the sidebar. Quitting installs it too.
-///
-/// A release carries update.json, naming its archive with the archive's
-/// SHA-256 signed by the release key (Ed25519). The archive is checked
-/// against the key built into this copy before anything is unpacked, and
-/// the app inside must be MBGA and newer than this one.
 @MainActor
 final class Updater {
     static let shared = Updater()
@@ -21,16 +13,12 @@ final class Updater {
         case failed(String)
     }
 
-    /// What the updater is doing, or found last.
     private(set) var state = State.idle {
         didSet { if state != oldValue { BrowserStore.updateChanged() } }
     }
-    /// The version unpacked and waiting: restarting, or quitting, installs
-    /// it. It stays while MBGA looks for a newer one.
     private(set) var readyVersion: String? {
         didSet { if readyVersion != oldValue { BrowserStore.updateChanged() } }
     }
-    /// Checks and installs on its own. Off, it only checks when asked.
     var automatic: Bool {
         get { UserDefaults.standard.object(forKey: Self.automaticKey) as? Bool ?? true }
         set {
@@ -38,22 +26,17 @@ final class Updater {
             schedule()
         }
     }
-    /// The card in the sidebar was hidden: the update still installs on quit.
     private(set) var cardHidden = false
 
     let currentVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0"
-    /// Where releases are announced. Builds from source have none, unless
-    /// MBGA_UPDATE_FEED names one (a file:// URL works, for trying updates).
     private let feed: URL?
     private let publicKey: Curve25519.Signing.PublicKey?
     private var scheduler: NSBackgroundActivityScheduler?
-    /// Set by Restart to Update: MBGA opens again once it's replaced.
     private var relaunch = false
 
     private static let automaticKey = "AutomaticUpdates"
     private static let lastCheckKey = "LastUpdateCheck"
     private static let lastVersionKey = "LastRunVersion"
-    /// Arc looks a few times a day; so does MBGA, when the Mac isn't busy.
     private static let interval: TimeInterval = 4 * 3600
     private nonisolated static let staging = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("dev.mbga.browser/Update", isDirectory: true)
@@ -71,11 +54,8 @@ final class Updater {
         if case .downloading = state { true } else { false }
     }
 
-    /// Whether this copy can update itself at all.
     var available: Bool { feed != nil && publicKey != nil }
 
-    /// At launch: picks up an update downloaded earlier, says what just
-    /// got installed, and starts checking.
     func start(store: BrowserStore) {
         let defaults = UserDefaults.standard
         if let last = defaults.string(forKey: Self.lastVersionKey), last != currentVersion,
@@ -96,7 +76,6 @@ final class Updater {
         scheduler?.invalidate()
         scheduler = nil
         guard available, automatic else { return }
-        // Not while the first pages load.
         DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in self?.check(userInitiated: false) }
         let scheduler = NSBackgroundActivityScheduler(identifier: "dev.mbga.browser.update-check")
         scheduler.repeats = true
@@ -109,10 +88,6 @@ final class Updater {
         self.scheduler = scheduler
     }
 
-    // MARK: Checking and downloading
-
-    /// Looks for a newer version and downloads it. Asked from the menu, the
-    /// answer shows in a toast.
     func check(userInitiated: Bool) {
         let store = BrowserStore.front
         guard let feed, let publicKey else {
@@ -132,7 +107,6 @@ final class Updater {
             store?.showToast(Toast(message: "MBGA \(version) is ready: restart to update", symbol: "arrow.down.circle"))
             return
         }
-        // Background checks: a few times a day is plenty.
         let lastCheck = UserDefaults.standard.object(forKey: Self.lastCheckKey) as? Date ?? .distantPast
         if !userInitiated, Date().timeIntervalSince(lastCheck) < Self.interval / 2 { return }
         if let problem = installProblem {
@@ -175,10 +149,8 @@ final class Updater {
         }
     }
 
-    /// Why MBGA couldn't replace itself where it is, if it couldn't.
     private var installProblem: String? {
         let app = Bundle.main.bundleURL
-        // Opened straight from Downloads, macOS runs a read-only copy.
         if app.path.contains("/AppTranslocation/") {
             return "Move MBGA to Applications to get updates"
         }
@@ -194,7 +166,6 @@ final class Updater {
         let url: URL
         let size: Int?
         let sha256: String
-        /// Base64 Ed25519 signature of the archive's SHA-256.
         let signature: String
         let minimumSystemVersion: String?
     }
@@ -222,7 +193,6 @@ final class Updater {
         return release
     }
 
-    /// Downloads, verifies and unpacks the release into the staging folder.
     private nonisolated static func download(_ release: Release, publicKey: Curve25519.Signing.PublicKey,
                                              current: String) async throws {
         let (file, response) = try await URLSession.shared.download(from: release.url)
@@ -278,13 +248,11 @@ final class Updater {
         info(of: staging.appendingPathComponent("MBGA.app"))?["CFBundleShortVersionString"] as? String
     }
 
-    /// Read afresh: Bundle remembers what it read at a path.
     private nonisolated static func info(of app: URL) -> [String: Any]? {
         (try? Data(contentsOf: app.appendingPathComponent("Contents/Info.plist")))
             .flatMap { try? PropertyListSerialization.propertyList(from: $0, format: nil) as? [String: Any] }
     }
 
-    /// Whether `a` is a later version than `b` ("0.0.10" is after "0.0.9").
     nonisolated static func isNewer(_ a: String, than b: String) -> Bool {
         let x = a.split(separator: ".").map { Int($0) ?? 0 }
         let y = b.split(separator: ".").map { Int($0) ?? 0 }
@@ -300,10 +268,6 @@ final class Updater {
         return !isNewer(minimum, than: "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)")
     }
 
-    // MARK: Installing
-
-    /// Quits, puts the new version in place and opens it again, where you
-    /// left off.
     func restartToUpdate() {
         guard readyVersion != nil else { return }
         relaunch = true
@@ -315,9 +279,6 @@ final class Updater {
         BrowserStore.updateChanged()
     }
 
-    /// Called as MBGA exits, once the engine has shut down. A downloaded
-    /// update replaces this copy as soon as the process is gone; a script
-    /// does it, since nothing can replace an app while it runs.
     func installOnExit() {
         guard readyVersion != nil else { return }
         let staged = Self.staging.appendingPathComponent("MBGA.app")
@@ -332,8 +293,6 @@ final class Updater {
         [ "$again" = 1 ] && open "$@" "$app"
         exit 0
         """
-        // Opened again with the same MBGA_ settings, such as another data
-        // folder: `open` doesn't pass on the environment.
         let environment = ProcessInfo.processInfo.environment
             .filter { $0.key.hasPrefix("MBGA_") }
             .flatMap { ["--env", "\($0.key)=\($0.value)"] }
@@ -353,7 +312,6 @@ private extension SHA256.Digest {
 }
 
 extension Updater {
-    /// Where updating stands, for Settings.
     var statusText: String {
         let version = "This is MBGA \(currentVersion)."
         guard available else { return "\(version) Built from source, it doesn't update itself." }

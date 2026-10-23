@@ -2,30 +2,17 @@ import AppKit
 import LocalAuthentication
 import Security
 
-/// Saved passwords: filling them into sign-in forms, offering to save the
-/// ones people type, and bringing them from other browsers. The core keeps
-/// them, sealed with a key that lives in the keychain; this side fetches the
-/// key the first time a password is needed.
 enum PasswordSettings {
     static let offersToSaveKey = "offersToSavePasswords"
 
     static var offersToSave: Bool { UserDefaults.standard.object(forKey: offersToSaveKey) as? Bool ?? true }
 }
 
-// MARK: - Key
-
-/// The secret the core seals passwords with: 32 random bytes in MBGA's own
-/// keychain item, made on first use. Development builds, whose signature
-/// changes with every build, would make macOS ask for it at each launch, so
-/// with the mock keychain it sits in a file in the data folder instead, as
-/// unprotected as their cookies.
 @MainActor
 enum PasswordKey {
     private nonisolated static let service = "MBGA Passwords"
     private static var unlocking: Task<Bool, Never>?
 
-    /// Unlocks the core's passwords, if they aren't already. False when the
-    /// key couldn't be read or isn't the one they were sealed with.
     static func unlock(_ core: BrowserCore) async -> Bool {
         if core.passwordsUnlocked() { return true }
         if let unlocking { return await unlocking.value }
@@ -58,8 +45,6 @@ enum PasswordKey {
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
         if status == errSecSuccess { return result as? Data }
-        // Only a missing key may be replaced: any other failure (the person
-        // said no) would leave the saved passwords sealed for good.
         guard status == errSecItemNotFound, let data = random() else { return nil }
         let item: [CFString: Any] = [
             kSecClass: kSecClassGenericPassword,
@@ -79,8 +64,6 @@ enum PasswordKey {
 
     private static var trustedUntil = Date.distantPast
 
-    /// Asks for the Mac's password or Touch ID before a password is shown
-    /// or copied; once given, it holds for a minute.
     static func confirmOwner(_ reason: String) async -> Bool {
         if Date() < trustedUntil { return true }
         let context = LAContext()
@@ -92,18 +75,12 @@ enum PasswordKey {
     }
 }
 
-// MARK: - Filling and saving
-
-/// Watches sign-in forms through the form script: shows the logins saved
-/// for a site under its username or password field, fills the one picked,
-/// and once a sign-in goes through, offers to save the password typed.
 @MainActor
 final class PasswordFiller {
     private unowned let store: BrowserStore
     private let suggestions = SuggestionPanel()
     private let offer = SaveOfferPanel()
 
-    /// The field suggestions are showing under.
     private struct Field {
         weak var view: MBWebView?
         let tab: UInt64
@@ -112,8 +89,6 @@ final class PasswordFiller {
     private var field: Field?
     private var hideTimer: Timer?
 
-    /// A password sent from a page, saved once the sign-in proves to work:
-    /// the page moves on, or its form goes away.
     private struct Sent {
         let url: String
         let username: String
@@ -121,7 +96,6 @@ final class PasswordFiller {
         var navigated = false
     }
     private var sent: [UInt64: Sent] = [:]
-    /// Usernames entered on the first step of two-step sign-ins, by tab.
     private var usernames: [UInt64: (origin: String, name: String)] = [:]
 
     init(store: BrowserStore) {
@@ -141,8 +115,6 @@ final class PasswordFiller {
         case "focus":
             showSuggestions(m, url: url, in: view)
         case "blur":
-            // Clicking a suggestion doesn't take focus from the page, but
-            // focus moving between two fields reports blur, then focus.
             hideTimer?.invalidate()
             hideTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
                 MainActor.assumeIsolated { self?.hideSuggestions() }
@@ -169,15 +141,12 @@ final class PasswordFiller {
         case "gone":
             confirm(tab, view: view)
         case "page":
-            // A page that asks for a password again means the sign-in failed.
             if m["login"] as? Bool == true { sent[tab] = nil } else { confirm(tab, view: view) }
         default:
             break
         }
     }
 
-    /// The tab's page changed address: a sign-in that was sent may have
-    /// worked. Its new page is checked once it has loaded.
     func pageChanged(_ view: MBWebView, url: String) {
         let tab = view.tabID
         if field?.tab == tab { hideSuggestions() }
@@ -185,7 +154,6 @@ final class PasswordFiller {
         guard var pending = sent[tab], pending.url != url else { return }
         pending.navigated = true
         sent[tab] = pending
-        // A single-page app changes address without loading.
         Timer.scheduledTimer(withTimeInterval: 1.5, repeats: false) { [weak self, weak view] _ in
             MainActor.assumeIsolated {
                 guard let view, self?.sent[tab]?.navigated == true, self?.store.isLoading(tab) == false else { return }
@@ -199,7 +167,6 @@ final class PasswordFiller {
         view.runScript("window.__mbgaForms && __mbgaForms.check()")
     }
 
-    /// Another tab came to the front, or the window went away.
     func hide() {
         hideSuggestions()
         offer.dismiss()
@@ -211,8 +178,6 @@ final class PasswordFiller {
         if field?.tab == tab { hideSuggestions() }
         if offer.tabID == tab { offer.dismiss() }
     }
-
-    // MARK: Suggestions
 
     private func showSuggestions(_ m: JSON, url: String, in view: MBWebView) {
         hideTimer?.invalidate()
@@ -243,14 +208,11 @@ final class PasswordFiller {
                 store.showToast(Toast(message: "Couldn't unlock your passwords", symbol: "exclamationmark.triangle"), duration: 2.5)
                 return
             }
-            // The script fills only if the page is still on that site.
             let args = [origin, login.username, password].map(FormScript.literal).joined(separator: ",")
             view.runScript("window.__mbgaForms && __mbgaForms.fill(\(args))")
             core.markLoginUsed(id: login.id)
         }
     }
-
-    // MARK: Saving
 
     private func confirm(_ tab: UInt64, view: MBWebView) {
         guard let pending = sent.removeValue(forKey: tab),
@@ -285,9 +247,6 @@ final class PasswordFiller {
         }
     }
 
-    // MARK: Helpers
-
-    /// "https://example.com", as the page's location.origin says it.
     static func origin(_ url: String) -> String? {
         guard let parts = URLComponents(string: url), let scheme = parts.scheme, let host = parts.host,
               scheme == "https" || scheme == "http" else { return nil }
@@ -299,12 +258,10 @@ final class PasswordFiller {
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
-    /// The field's frame on screen, from its CSS pixels in the page.
     private static func screenRect(_ m: JSON, in view: MBWebView) -> NSRect? {
         guard let window = view.window,
               let x = m["x"] as? Double, let y = m["y"] as? Double, let w = m["w"] as? Double, let h = m["h"] as? Double
         else { return nil }
-        // Page zoom shows in devicePixelRatio, on top of the display's scale.
         let k = (m["dpr"] as? Double ?? window.backingScaleFactor) / window.backingScaleFactor
         var rect = NSRect(x: x * k, y: y * k, width: w * k, height: h * k)
         if !view.isFlipped { rect.origin.y = view.bounds.height - rect.maxY }
@@ -313,14 +270,8 @@ final class PasswordFiller {
     }
 }
 
-// MARK: - Bringing passwords from other browsers
-
-/// Passwords of another browser's profile, or of an exported file, into
-/// one of MBGA's profiles.
 @MainActor
 enum PasswordImport {
-    /// Whether `source` has passwords MBGA can read (Safari's come from a
-    /// file the Passwords app exports).
     static func available(_ source: ImportSourceInfo) -> Bool {
         source.error == nil && source.kind != .safari && source.profiles.contains { $0.passwords > 0 }
     }
@@ -340,7 +291,6 @@ enum PasswordImport {
         }.value
     }
 
-    /// Asks for an exported CSV file and imports it into `profile`.
     static func bringFile(into profile: UInt64, store: BrowserStore, window: NSWindow?) async -> PasswordImportOutcome? {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.commaSeparatedText]
@@ -360,7 +310,6 @@ enum PasswordImport {
         return result
     }
 
-    /// "312 passwords" ("Chrome: 312 passwords." when `named`), or why not.
     static func describe(_ r: PasswordImportOutcome, from browser: String, named: Bool = false) -> String {
         if let error = r.error { return "Couldn't bring \(browser)'s passwords: \(error)" }
         var parts: [String] = []
@@ -379,14 +328,7 @@ extension PasswordImportOutcome {
     }
 }
 
-// MARK: - Form script
-
-/// The page side: runs in every web page from the moment it starts loading,
-/// reporting focus in sign-in fields and passwords sent, and filling in a
-/// login when asked. Reports are signed with the page's token, so frames of
-/// other sites can't make them up.
 enum FormScript {
-    /// `value` as a JavaScript string literal.
     static func literal(_ value: String) -> String {
         let data = try? JSONSerialization.data(withJSONObject: [value])
         return data.map { String(decoding: $0, as: UTF8.self).dropFirst().dropLast() }.map(String.init) ?? "\"\""

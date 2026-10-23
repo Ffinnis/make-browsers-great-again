@@ -1,35 +1,3 @@
-// Plays H.264 and AAC video, which this engine has no decoders for, by
-// converting it in the page. The engine runs this in every frame and
-// dedicated worker before the page's own scripts (MBEngine.mm, "media
-// shim").
-//
-// Pages ask whether they can play H.264 (MediaSource.isTypeSupported,
-// canPlayType, mediaCapabilities) and hear yes when a conversion would play.
-// A SourceBuffer made for H.264 or AAC is a real one made for VP9 and FLAC;
-// the bytes the page appends go to a worker (worker.js and mbga_media.wasm,
-// from media/) and what comes back is appended instead, with the settings
-// (timestampOffset, append window, mode) the page had when it appended. The
-// page sees the SourceBuffer it expects: its updating flag, settings and
-// events follow the page's appends, not the converted ones. A plain MP4 the
-// engine refuses (X's GIFs) is fetched, converted the same way and played
-// through a MediaSource on the same element.
-//
-// Conversion stays ahead of playback, but not too far: while the video
-// plays, an append made when the element holds plenty past the playhead
-// waits, still updating, until the playhead gets closer, or ten seconds at
-// most. Paused or never played, nothing waits. The worker also learns how
-// big each video is shown, so it doesn't encode more pixels (or, for small
-// videos and ones out of view, frames) than that; the page still sees the
-// source's size in videoWidth and videoHeight.
-//
-// Players that use MediaSource in a dedicated worker (Twitch's) get it there
-// too. Such a worker asks the page that started it for the converter, over
-// one channel per worker, and hears how big the element showing each of its
-// MediaSources is.
-//
-// Everything here runs in every frame of every page, so until a converted
-// SourceBuffer or video appears it only answers questions: the worker, the
-// converter and the SourceBuffer hooks come with the first one.
 (function () {
   'use strict';
   var G = globalThis;
@@ -43,13 +11,10 @@
   Object.defineProperty(MS, mark, { value: true });
 
   var isWindow = typeof G.Window === 'function' && G instanceof G.Window;
-  // The page may replace any of these later.
   var debug = console.debug.bind(console);
   var NativeEvent = G.Event;
   var NativeWorker = G.Worker;
   var Handle = G.MediaSourceHandle;
-  // A worker's global scope gets its timers and postMessage() after this
-  // runs, so those are looked up when used.
   var Channel = G.MessageChannel;
   var setTimer = function (f, delay) {
     return G.setTimeout(f, delay);
@@ -66,44 +31,22 @@
   var SB = G.SourceBuffer.prototype;
   var VP9 = 'vp09.00.41.08';
   var FLAC = 'flac';
-  // Seconds converted ahead of the playhead while the video plays; more
-  // each time playback runs dry. A video out of view or shown tiny, whose
-  // frames are encoded fewer a second, gets only LOOKAHEAD_SHORT, so those
-  // frames are soon behind it once it's back in view.
   var LOOKAHEAD = 20;
   var LOOKAHEAD_MAX = 60;
   var LOOKAHEAD_SHORT = 5;
-  // The longest an append waits for the playhead, in milliseconds. The
-  // converter closes a stream's codecs after 20 seconds without a message,
-  // so a download that waits longer than KEEPALIVE says it's still there.
   var DEFER_MAX = 10000;
   var KEEPALIVE = 10000;
-  // A full SourceBuffer is tried again this often while the video plays
-  // (and five times less often paused); the page's append ends after
-  // QUOTA_WAIT, and a stream the page ended, without what doesn't fit.
   var RETRY = 1000;
   var QUOTA_WAIT = 5000;
-  // How long the converter's worker may take to start, and an append to
-  // convert.
   var START_TIMEOUT = 10000;
   var APPEND_TIMEOUT = 60000;
-  // How long to wait for the engine to send the converter, asking again
-  // after each: it serves a tab's documents a few at a time.
   var CODEC_WAITS = [10000, 20000, 30000];
-  // Videos out of view (NEAR counts as in), shown smaller than TINY (CSS
-  // pixels of the picture), or on battery power smaller than SMALL tall are
-  // encoded at SLOW_FPS frames a second at most. X's feed videos, about
-  // 516×290, aren't.
   var NEAR = '200px';
   var TINY = [320, 180];
   var SMALL = 360;
   var SLOW_FPS = 15;
   var RELAY = '__mbga_media_relay__';
 
-  // ------------------------------------------------------------- patching
-
-  // Replaces a method with |make(original)|, called as (self, args). A
-  // proxy keeps the original's name, length and native-looking source.
   function hook(target, key, make) {
     var d = getDescriptor(target, key);
     if (!d || typeof d.value !== 'function') {
@@ -120,8 +63,6 @@
     return original;
   }
 
-  // Replaces an accessor's getter or setter the same way; |make| gets the
-  // original getter and setter.
   function hookAccessor(target, key, getter, setter) {
     var d = getDescriptor(target, key);
     if (!d || !d.get) {
@@ -160,8 +101,6 @@
                             'MediaSource\'s readyState is not \'open\'.', 'InvalidStateError');
   }
 
-  // Runs |f| in a task of its own, as the events MSE queues do. A message
-  // port's tasks aren't throttled in background tabs, unlike timers.
   var tasks = null;
   var taskPort = null;
   function task(f) {
@@ -180,9 +119,6 @@
     taskPort.postMessage(0);
   }
 
-  // --------------------------------------------------------------- types
-
-  // "video/mp4; codecs=..." split into its container and codecs, or null.
   function parse(type) {
     if (typeof type !== 'string') {
       return null;
@@ -206,7 +142,6 @@
     return /^mp4a(\.|$)/i.test(codec);
   }
 
-  // The type of the converted stream, or null when nothing needs converting.
   function mapType(type) {
     var t = parse(type);
     if (!t || !t.codecs.some(function (c) { return isAvc(c) || isAac(c); })) {
@@ -217,8 +152,6 @@
     }).join(',') + '"';
   }
 
-  // Conversion keeps up with H.264 up to level 4.1 (1080p at 30 frames a
-  // second) and AAC; above that players should pick a smaller rendition.
   function withinLimits(type) {
     return parse(type).codecs.every(function (c) {
       if (isAvc(c)) {
@@ -234,9 +167,7 @@
     return nativeIsTypeSupported.call(MS, type);
   }
 
-  // Whether |type| plays once converted and doesn't play without.
   function convertible(type) {
-    // Looked up each time: a worker gets WebCodecs after this script runs.
     if (broken || typeof NativeWorker !== 'function' || typeof G.WebAssembly !== 'object' ||
         typeof G.VideoDecoder !== 'function') {
       return false;
@@ -250,8 +181,6 @@
     }
   }
 
-  // Whether the Content-Security-Policy here, which the converter's worker
-  // inherits, lets WebAssembly compile. Checked once, with an empty module.
   var compiles = null;
   function canCompile() {
     if (compiles === null) {
@@ -280,8 +209,6 @@
     };
   });
 
-  // A copy of a mediaCapabilities configuration with converted types, or
-  // null when there's nothing to convert or it can't be.
   function mapConfig(config) {
     if (!config || typeof config !== 'object' || config.keySystemConfiguration ||
         (config.type !== 'media-source' && config.type !== 'file')) {
@@ -339,10 +266,6 @@
     });
   }
 
-  // ------------------------------------------------------------ converter
-
-  // The converter's worker source and module (base64), kept a little while
-  // for workers this frame starts that ask for it too.
   var codec = null;
   var codecDrop = 0;
   var codecWaiters = null;
@@ -371,9 +294,6 @@
       }
     }, CODEC_WAITS[attempt]);
     if (isWindow) {
-      // The engine asks every frame of the tab who sent this, each with a
-      // word of its own; this document answers through who() with it and
-      // gets the converter.
       token = token || Math.random().toString(36).slice(2);
       var answer = function (source, wasm) {
         gotCodec(source, wasm);
@@ -416,11 +336,6 @@
     });
   }
 
-  // ------------------------------------------------- workers and handles
-
-  // The context that started this worker, over one channel for its whole
-  // life: the converter comes that way, and how big the elements showing
-  // this worker's MediaSources are.
   var parentLink = null;
   function parentPort() {
     if (!parentLink) {
@@ -444,35 +359,22 @@
     return parentLink.port;
   }
 
-  // Workers this context started that convert or post MediaSourceHandles,
-  // each with its channel once it asks, the handles it posted (numbered in
-  // order) and what's known about them. A record is made when the worker
-  // first says so, and goes with the worker: terminate(), its end of the
-  // channel closing, or the Worker being collected.
   var links = new Set();
   var linkOf = new WeakMap();
   var linkIds = 0;
   var linkGone = G.FinalizationRegistry ? new FinalizationRegistry(function (link) {
     unlink(link);
   }) : null;
-  // Where each MediaSourceHandle seen here comes from: {link, n} for one a
-  // worker posted, {ms: WeakRef} for this worker's own.
   var origins = new WeakMap();
-  // In a worker, the handles it posted to its parent, numbered the same way
-  // the parent numbers them: n -> origin, and back. |unposted| counts the
-  // handles seen here and not posted yet: only then are messages to the
-  // parent looked through.
   var posted = 0;
   var unposted = 0;
   var slots = new Map();
   var ownSlot = new WeakMap();
   var linkSlot = new Map();
-  // Sizes the parent sent, per MediaSource and for any.
   var msSizes = new WeakMap();
   var anySize = null;
   var msNaturals = new WeakMap();
 
-  // The MediaSourceHandles in a message, in an order both ends agree on.
   function findHandles(data) {
     var found = [];
     var budget = 64;
@@ -518,9 +420,6 @@
     return link;
   }
 
-  // A worker's own messages come first: the shim there opens the channel
-  // with one, and says with another that the next carries handles. Nothing
-  // else is looked at.
   function childMessage(worker, event) {
     var data = event.data;
     var kind = data && typeof data === 'object' ? data[RELAY] : 0;
@@ -564,7 +463,6 @@
         childNatural(link, data.n, data.clear ? null : { width: data.width, height: data.height }, data.time);
       }
     };
-    // The worker closed itself or went away.
     port.onclose = function () {
       if (link.port === port) {
         unlink(link);
@@ -588,8 +486,6 @@
     link.naturals.clear();
   }
 
-  // How big the element showing handle |n| of |link| (undefined: any of
-  // its handles) is, now or once it asks.
   function sendLink(link, n, size) {
     if (!links.has(link)) {
       return;
@@ -600,7 +496,6 @@
     }
   }
 
-  // A size from the parent, for the MediaSource behind handle |n|.
   function routeSize(n, size) {
     if (n === undefined || n === null) {
       anySize = size;
@@ -629,8 +524,6 @@
     }
   }
 
-  // The source's size of what a child worker converts, for handle |n|
-  // (null: it no longer converts), from |time| on.
   function childNatural(link, n, size, time) {
     if (size) {
       link.naturals.set(n, { width: size.width, height: size.height, time: time });
@@ -653,10 +546,6 @@
     }
   }
 
-  // In a worker: numbers the handles it posts to its parent, as the parent
-  // numbers what it receives, so sizes and natural sizes can name them. A
-  // message with handles goes right after one that says so, on the same
-  // channel, so the parent looks through that one only.
   var postHooked = false;
   function hookPost() {
     if (postHooked || isWindow || !Handle) {
@@ -672,7 +561,6 @@
     postHooked = true;
     hook(owner, 'postMessage', function (original) {
       return function (self, args) {
-        // Called bare, as postMessage(...), it has no this.
         var toParent = self === G || self === undefined || self === null;
         var found = toParent && unposted > 0 && args[0] && typeof args[0] === 'object' ? findHandles(args[0]) : [];
         if (!found.length) {
@@ -755,8 +643,6 @@
     });
   }
 
-  // One converter worker per frame or worker, started with the first
-  // conversion and shared.
   var worker = null;
   var starting = false;
   var broken = false;
@@ -765,10 +651,6 @@
   var silence = 0;
   var outbox = [];
   var nextId = 0;
-  // Conversions by id: {reply(data), fail(message)}. They hold what they
-  // convert for weakly: a stream the page let go of without closing it
-  // (an element removed from a feed) is collected, and its converter
-  // stream closed then.
   var conversions = {};
   var conversionGone = G.FinalizationRegistry ? new FinalizationRegistry(function (id) {
     if (conversions[id]) {
@@ -780,7 +662,6 @@
 
   function post(message, transfer) {
     if (broken) {
-      // Appends and drains still get their answer, an error.
       if (message.type === 'append' || message.type === 'drain') {
         task(function () {
           var conversion = conversions[message.sb];
@@ -836,15 +717,12 @@
       }
     };
     try {
-      // The page's Content-Security-Policy may forbid blob: workers. The
-      // engine knows this worker by its name and leaves it alone.
       worker = new NativeWorker(url, { name: 'MBGA video converter' });
     } catch (e) {
       revoke();
       fail('this site does not allow the converter to start', true);
       return;
     }
-    // It says it's ready once the module is compiled.
     heard = false;
     silence = setTimer(function () {
       fail('the converter did not start', false);
@@ -882,9 +760,6 @@
     });
   }
 
-  // Without a converter every conversion fails as a decode error would,
-  // and players can pick something else. Unless the site doesn't allow it,
-  // later conversions try again, after a while.
   function fail(message, permanent) {
     if (broken) {
       return;
@@ -912,10 +787,6 @@
     }
   }
 
-  // Registers what converts for |owner| (a SourceBuffer's state or a
-  // file's job), held weakly: |onReply| and |onFail| (top-level functions:
-  // a closure would hold the owner through its scope) get (owner, data or
-  // message, id).
   function register(owner, onReply, onFail) {
     var id = ++nextId;
     conversions[id] = conversion(id, new WeakRef(owner), onReply, onFail);
@@ -942,7 +813,6 @@
     };
   }
 
-  // Done with conversion |id| of |owner|: the converter's stream closes.
   function unregister(id, owner) {
     if (conversions[id]) {
       delete conversions[id];
@@ -953,21 +823,9 @@
     }
   }
 
-  // --------------------------------------------------------- display size
-
-  // How big each converted video is shown, so the worker encodes no more
-  // than that: the picture's size (object-fit and letterboxing counted) in
-  // device pixels, or CSS pixels on battery power, with at most SLOW_FPS
-  // frames a second for videos out of view, tiny ones, and on battery small
-  // ones. An element whose size comes from the video's (width and height
-  // auto) is laid out at the encoded size, whatever videoWidth says, so it
-  // gets the source's size. Elements are found through the blob: URL of
-  // their MediaSource, or the handle of one in a worker.
   var msUrls = new WeakMap();
-  // blob: URL -> WeakRef of the <video>, <audio> or <source> it was given.
   var urlElements = new Map();
   var sized = new WeakMap();
-  // Entries of the elements observed now: those in the document.
   var watched = new Set();
   var resizer = null;
   var seer = null;
@@ -975,7 +833,6 @@
   var batteryAsked = false;
   var pageHidden = false;
   var pageAsked = false;
-  // Per element showing a worker's MediaSource: {handle, origin, stop}.
   var shown = new WeakMap();
   var SourceElement = G.HTMLSourceElement;
   var attributesHooked = false;
@@ -1003,10 +860,6 @@
     });
   }
 
-  // A MediaSource's URL reaches an element through its src property (see
-  // playPlainFiles), and also through setAttribute(), which elementOf()
-  // can't see inside shadow roots, and <source>. Hooked once the page
-  // makes a MediaSource URL.
   function hookAttributes() {
     if (attributesHooked || !G.Element) {
       return;
@@ -1055,11 +908,6 @@
     return null;
   }
 
-  // Calls |update({width, height, fps})| soon and whenever |el| is shown
-  // otherwise: at once when the video is shown bigger or faster, at most
-  // every half second when smaller or slower. Returns what stops it. An
-  // element out of the document isn't observed (observers keep what they
-  // observe) until it's back and plays.
   function watchSize(el, update) {
     if (!G.ResizeObserver || !el) {
       return function () {};
@@ -1074,7 +922,6 @@
       watchBattery();
       watchPage();
       var signal = entry.events.signal;
-      // Picture in picture shows it in a window of its own.
       el.addEventListener('enterpictureinpicture', function (event) {
         var pip = event.pictureInPictureWindow;
         entry.pip = pip || null;
@@ -1137,7 +984,6 @@
     entry.timer = 0;
   }
 
-  // Out of the document: observed again once it's back and plays.
   function awaitReturn(entry) {
     unobserve(entry);
     if (entry.back) {
@@ -1173,8 +1019,6 @@
     sized.delete(entry.el);
   }
 
-  // Elements taken out of the document that the observers didn't report
-  // (one without a size has none to lose).
   function sweep() {
     watched.forEach(function (entry) {
       if (!entry.el.isConnected) {
@@ -1233,7 +1077,6 @@
     } catch (e) {}
   }
 
-  // A hidden page shows no video.
   function watchPage() {
     if (pageAsked || !isWindow) {
       return;
@@ -1250,8 +1093,6 @@
     update();
   }
 
-  // Whether the element's size comes from the video's: width and height
-  // both auto (or content-sized), as with max-width: 100%; height: auto.
   function autoSized(el) {
     try {
       var map = el.computedStyleMap();
@@ -1263,8 +1104,6 @@
     }
   }
 
-  // The size of the video's picture in an element |box| big (CSS pixels):
-  // it may be letterboxed (contain) or cropped (cover).
   function painted(el, box, video) {
     if (!video) {
       return box;
@@ -1280,7 +1119,6 @@
     return [video[0] * scale, video[1] * scale];
   }
 
-  // The size the page sees for the video, or null before it has one.
   function videoSize(el) {
     var nat = naturals.get(el);
     if (nat) {
@@ -1290,7 +1128,6 @@
     return real[0] > 0 && real[1] > 0 ? real : null;
   }
 
-  // What to tell the worker about |entry|'s element, or null for nothing.
   function measure(entry) {
     var el = entry.el;
     var css = entry.css;
@@ -1304,11 +1141,9 @@
       size = [entry.pip.width * scale, entry.pip.height * scale];
       visible = [entry.pip.width, entry.pip.height];
     } else if (!(css[0] > 0) || !(css[1] > 0)) {
-      // Not shown (display: none): keep the size, drop the frames.
       var last = entry.pending || entry.last;
       return last ? { width: last.width, height: last.height, fps: SLOW_FPS } : null;
     } else if (autoSized(el)) {
-      // Before the first frame it's the poster's size or the default.
       var nat = naturals.get(el);
       if (!nat || !(realSize(el)[0] > 0)) {
         return null;
@@ -1375,7 +1210,6 @@
     });
   }
 
-  // Whether |el|'s frames are encoded fewer a second: out of view or tiny.
   function capped(el) {
     var entry = el && sized.get(el);
     var size = entry && (entry.pending || entry.last);
@@ -1394,9 +1228,6 @@
     post({ type: 'size', sb: st.id, width: size.width, height: size.height, fps: size.fps || 0 });
   }
 
-  // An element now shows a worker's MediaSource: sizes go to that worker,
-  // for that handle. One whose worker isn't known goes to the only worker
-  // that converts, if there's one.
   function showHandle(el, handle) {
     unshow(el);
     var origin = origins.get(handle) || null;
@@ -1428,19 +1259,7 @@
     }
   }
 
-  // -------------------------------------------------------- natural size
-
-  // The engine takes videoWidth and videoHeight from the frames, which the
-  // worker may encode smaller than the source: a page that sizes the
-  // element from them would shrink it at every keyframe. An element playing
-  // converted video reports the source's size (the worker says what it is,
-  // and from when on the stream's timeline), and fires resize when that
-  // changes as it plays, not when the encoded size does. Canvas drawing
-  // and createImageBitmap() take the source's coordinates too.
   var naturals = new WeakMap();
-  // Per element: [{time, width, height}], the source's size from |time| on
-  // (seconds on the element's timeline), in time order; width 0 where what
-  // plays from then on isn't converted.
   var naturalTimes = new WeakMap();
   var resizeSeen = new WeakMap();
   var resizeHandled = new WeakSet();
@@ -1490,9 +1309,6 @@
     hookCanvas();
   }
 
-  // A resize the page should see is one where the source's size changed.
-  // Heard on the window and on the element itself, for one out of the
-  // document or in a shadow root.
   function onResize(event) {
     var el = event.target;
     if (!(el instanceof Video) || resizeHandled.has(event)) {
@@ -1502,8 +1318,6 @@
     if (!naturalTimes.has(el)) {
       return;
     }
-    // The engine fires it when a frame of a new encoded size shows, which
-    // may be where the source's size changes too.
     syncNatural(el, true);
     var nat = naturals.get(el);
     if (!nat) {
@@ -1525,7 +1339,6 @@
     clearNatural(event.target);
   }
 
-  // The source's size for where |el| plays now.
   function syncNatural(el, quiet) {
     var list = naturalTimes.get(el);
     if (!list || !list.length) {
@@ -1558,9 +1371,6 @@
     }
   }
 
-  // The source's size is |size| from |time| on (undefined: from now; null
-  // size: what plays from then on isn't converted). The first one counts
-  // at once: the page reads it at loadedmetadata.
   function addNatural(el, size, time) {
     if (!size) {
       if (typeof time === 'number' && time > 0 && naturals.has(el)) {
@@ -1584,7 +1394,6 @@
       });
     }
     var at = typeof time === 'number' && isFinite(time) && naturals.has(el) ? time : -Infinity;
-    // Appended from |at| on, it replaces what was there.
     list = list.filter(function (item) {
       return item.time < at;
     });
@@ -1593,7 +1402,6 @@
     syncNatural(el, false);
   }
 
-  // |el| plays no converted video any more: its size is the engine's.
   function clearNatural(el) {
     if (!el || !naturalTimes.has(el)) {
       return;
@@ -1619,8 +1427,6 @@
     }
   }
 
-  // How much smaller converted |el|'s frames are than the source: [x, y,
-  // source size], or null.
   function shrunk(el) {
     var nat = naturals.get(el);
     if (!nat) {
@@ -1633,9 +1439,6 @@
     return [real[0] / nat.width, real[1] / nat.height, nat];
   }
 
-  // drawImage(video, ...) and createImageBitmap(video, ...) with the
-  // source's coordinates mapped to the frame's. Never throws: anything odd
-  // goes to the engine as it was.
   function hookCanvas() {
     [G.CanvasRenderingContext2D, G.OffscreenCanvasRenderingContext2D].forEach(function (Context) {
       if (!Context) {
@@ -1710,9 +1513,6 @@
     }
   }
 
-  // The source's size of what |st| converts, from where |natural.at| is on
-  // the timeline of the append |snap| had: for its element here, or the
-  // parent's for the handle it was posted as.
   function naturalFor(st, natural, snap) {
     if (!st.video || !natural || !(natural.width > 0) || !(natural.height > 0)) {
       return;
@@ -1736,9 +1536,6 @@
     }
   }
 
-  // |st| no longer converts video: if nothing else on its MediaSource
-  // does, the element's sizes are the engine's again, from |time| on
-  // (undefined: now).
   function naturalGone(st, time) {
     if (!st.video) {
       return;
@@ -1763,37 +1560,9 @@
     }
   }
 
-  // ------------------------------------------------------- SourceBuffers
-
-  // State of each converted SourceBuffer:
-  //   op: the page's append in progress: {seq, snap, bytes, sent,
-  //       received, started, raw}; snap is the settings it was made with.
-  //   drain: {seq, received, changes}: frames the worker holds, asked for
-  //       before endOfStream() and changeType(), and the type changes that
-  //       go in after them.
-  //   chunks: what the real SourceBuffer is still to get: converted bytes
-  //       {bytes, snap, seq, range}, a type change {change, raw}, or a
-  //       remove() to do again {remove: [start, end]}; current: the one it's
-  //       appending or removing now.
-  //   page: the settings the page sees, which the real SourceBuffer has
-  //       whenever it isn't appending.
-  //   snaps: the settings of recent appends by seq, for their frames the
-  //       worker hands back late (held); last: the latest one's.
-  //   removals: what the page removed since, so late frames of what it
-  //       removed don't come back.
-  //   carry: chunks of appends the page saw finish didn't fit; the page
-  //       hears QuotaExceededError at its next append until they do.
-  //       What the page removes afterwards is removed again once they're
-  //       in, and abort() leaves them be: the page was told they went in.
-  //   raw: the page changed to a type the engine plays: its appends go in
-  //       as they are, after what was converted, and then the shim lets go.
   var states = new WeakMap();
-  // Per MediaSource: {ms, list: its converted SourceBuffers, el, eos,
-  // watching, lookahead}.
   var sources = new WeakMap();
-  // The MediaSource of every SourceBuffer made since this frame started.
   var owners = new WeakMap();
-  // Converted SourceBuffers by id, held weakly.
   var live = new Map();
 
   function eachLive(f) {
@@ -1823,8 +1592,6 @@
     };
   });
 
-  // A SourceBuffer switching to H.264 starts converting; one switching to
-  // something the engine plays stops, once what was converted is in.
   native.changeType = hook(SB, 'changeType', function (original) {
     return function (self, args) {
       var st = states.get(self);
@@ -1854,8 +1621,6 @@
       reopen(st);
       var change = { change: raw ? String(type) : mapType(type), raw: raw };
       if (st.raw || st.held || st.drain || st.chunks.length || busy(st)) {
-        // The frames the worker holds and the bytes still to go in go in
-        // first, as the old type, then the real SourceBuffer changes.
         if (st.drain && !st.drain.received) {
           st.drain.changes.push(change);
         } else if (st.held && !st.raw) {
@@ -1885,7 +1650,6 @@
     };
   });
 
-  // Throws what changeType() would for a type the engine plays or doesn't.
   function checkType(type) {
     var text = String(type);
     if (!text) {
@@ -1932,8 +1696,6 @@
       });
     }
     source.list.push(st);
-    // Ahead of the page's listeners: the real SourceBuffer's events while
-    // converted bytes go in are the shim's, and the page gets its own.
     EVENTS.forEach(function (name) {
       sb.addEventListener(name, function (event) {
         guard(st, event);
@@ -1943,15 +1705,12 @@
     sizeFor(st);
   }
 
-  // Top-level, as conversions' handlers must be: a closure made in adopt()
-  // would share its scope, and hold the SourceBuffer and element strongly.
   function failConversion(st, message) {
     if (st.convert && !st.raw && !st.dead) {
       failAppend(st, message);
     }
   }
 
-  // Converting again, after the page changed to a type the engine plays.
   function resume(st, type) {
     st.convert = true;
     st.raw = false;
@@ -1965,8 +1724,6 @@
     sizeFor(st);
   }
 
-  // Everything converted is in and the type is one the engine plays: the
-  // SourceBuffer is the engine's again.
   function finishRaw(st) {
     st.raw = false;
     st.convert = false;
@@ -1974,12 +1731,9 @@
     restore(st);
     live.delete(st.id);
     stopSizing(st);
-    // What the page appends now plays after what was converted.
     naturalGone(st, st.reach);
   }
 
-  // The element showing |source|'s MediaSource, looked for again if it
-  // wasn't found when the SourceBuffer was made.
   function elementFor(source) {
     if (!source.el && isWindow) {
       source.el = elementOf(source.ms);
@@ -2048,7 +1802,6 @@
     st.held = false;
   }
 
-  // Takes the page's append off |st|, with its timers; returns it.
   function endOp(st) {
     var op = st.op;
     st.op = null;
@@ -2072,12 +1825,10 @@
     return native.updating.get.call(st.sb);
   }
 
-  // What the page sees as updating.
   function updating(st) {
     return !!(st.op || st.queuedRemove || st.removing);
   }
 
-  // Whether any SourceBuffer of |ms| is updating, as the page sees it.
   function anyUpdating(ms) {
     var list = ms.sourceBuffers;
     for (var i = 0; i < list.length; i++) {
@@ -2089,13 +1840,10 @@
     return false;
   }
 
-  // Whether the real SourceBuffer is busy with the shim's own appends.
   function busy(st) {
     return !!(st.current || st.reopening) || realUpdating(st);
   }
 
-  // Sets the real SourceBuffer's settings to |snap|'s. Only what differs:
-  // setting mode or timestampOffset has side effects in sequence mode.
   function apply(st, snap) {
     var sb = st.sb;
     if (native.mode.get.call(sb) !== snap.mode) {
@@ -2131,7 +1879,6 @@
       return;
     }
     if (st.removing) {
-      // The page's own remove(): its events are the page's.
       if (event.type === 'updateend') {
         st.removing = false;
         task(function () {
@@ -2150,8 +1897,6 @@
       }
       return;
     }
-    // An updateend left over from an abort() comes while the real
-    // SourceBuffer is busy again; only a real end counts.
     if (event.type !== 'updateend' || realUpdating(st)) {
       return;
     }
@@ -2170,7 +1915,6 @@
       return;
     }
     if (chunk.snap && chunk.snap.mode === 'sequence') {
-      // Sequence mode moves timestampOffset along with what went in.
       chunk.snap.timestampOffset = native.timestampOffset.get.call(st.sb);
     }
     pump(st);
@@ -2186,7 +1930,6 @@
       if (op && !op.raw && data.seq === op.seq) {
         failAppend(st, String(data.message));
       } else if (drain && data.seq === drain.seq) {
-        // The stream goes on without the frames the worker held.
         debug('MBGA could not convert video: ' + data.message);
         drained(st, drain);
       }
@@ -2194,7 +1937,6 @@
     }
     var mine = op && !op.raw && data.seq === op.seq;
     if (!mine && !(drain && data.seq === drain.seq)) {
-      // For an append the page aborted.
       return;
     }
     var snap = mine ? op.snap : st.last;
@@ -2222,9 +1964,6 @@
     pump(st);
   }
 
-  // Frames of earlier appends the decoder put out only now, each group
-  // with the settings of the append it came from; frames of what the page
-  // has removed since stay out.
   function takeHeld(st, held) {
     if (!held) {
       return;
@@ -2252,9 +1991,6 @@
     });
   }
 
-  // The page removed |from| to |to|: converted bytes of its earlier appends
-  // that haven't gone in yet (they didn't fit, or wait their turn) would
-  // bring some of it back, so it's removed again after them.
   function removeAgain(st, from, to) {
     var after = -1;
     st.chunks.forEach(function (chunk, i) {
@@ -2276,14 +2012,11 @@
     return range.start + offset < to && from < range.end + offset;
   }
 
-  // No frames of earlier appends can come any more.
   function forget(st) {
     st.snaps.clear();
     st.removals = [];
   }
 
-  // Moves things along: the page's remove() once the shim's appends are
-  // done, converted bytes in, then the end of the page's append or drain.
   function pump(st) {
     if (st.dead || !st.convert || busy(st) || st.removing) {
       return;
@@ -2310,7 +2043,6 @@
           st.current = next;
           return;
         } catch (e) {
-          // Nothing there to remove (past the duration).
           continue;
         }
       }
@@ -2357,14 +2089,6 @@
     endIfDone(sources.get(st.ms));
   }
 
-  // The real SourceBuffer is full. While the video plays, room is made as
-  // the playhead moves on (the engine evicts what's behind it at each
-  // append), so the page's append waits, and it's tried again every second
-  // and as the playhead moves. Paused, or after QUOTA_WAIT, the append ends
-  // as the page expects and the bytes wait: the page hears
-  // QuotaExceededError at its next append, as it would have at this one,
-  // and makes room. A stream the page ended doesn't wait for room forever:
-  // it ends without what doesn't fit.
   function noRoom(st) {
     restore(st);
     var time = now();
@@ -2397,7 +2121,6 @@
     }
   }
 
-  // How far on the timeline the converted bytes that went in reach.
   function reached(st, chunk) {
     var range = chunk.range;
     if (range && range.end > range.start && chunk.snap.mode !== 'sequence' && !st.raw) {
@@ -2405,8 +2128,6 @@
     }
   }
 
-  // The page's append is done: update and updateend, each a task of its
-  // own, as MSE queues them.
   function complete(st, op) {
     if (st.op !== op) {
       return;
@@ -2431,8 +2152,6 @@
     }
   }
 
-  // An append that can't be converted ends as one the engine can't decode:
-  // error, updateend, then the stream ends with a decode error.
   function failAppend(st, message) {
     debug('MBGA could not convert video: ' + message);
     var op = endOp(st);
@@ -2461,7 +2180,6 @@
     endWithError(st.ms, 0);
   }
 
-  // endOfStream('decode'), once no other SourceBuffer is busy.
   function endWithError(ms, tries) {
     try {
       native.endOfStream.call(ms, 'decode');
@@ -2474,8 +2192,6 @@
     }
   }
 
-  // How far the element can play from the playhead with what all its
-  // SourceBuffers hold.
   function ahead(el) {
     try {
       var ranges = el.buffered;
@@ -2489,8 +2205,6 @@
     return 0;
   }
 
-  // Whether appends to |source| should wait for the playhead: only while
-  // the video plays on, with plenty ahead of it.
   function shouldWait(source) {
     var el = source && source.el;
     if (!el || broken || el.paused || el.seeking || el.ended || !el.played.length ||
@@ -2500,9 +2214,6 @@
     return ahead(el) > (capped(el) ? LOOKAHEAD_SHORT : source.lookahead);
   }
 
-  // Sends the page's append to the worker, unless the video plays with
-  // plenty converted ahead: then it waits, still updating, until the
-  // playhead gets closer, the video stops, or DEFER_MAX passes.
   function dispatch(st) {
     var op = st.op;
     if (!op || op.sent || op.raw || st.dead) {
@@ -2531,8 +2242,6 @@
     }, APPEND_TIMEOUT);
   }
 
-  // Follows the element while appends wait for the playhead or for room.
-  // Playback running dry means the player wants more ahead.
   function watch(source) {
     if (source.watching || !source.el) {
       return;
@@ -2556,8 +2265,6 @@
       });
   }
 
-  // A MediaSource the page sees as ended opens again when the page appends,
-  // removes or changes settings, as MSE does.
   function reopen(st) {
     reopenSource(sources.get(st.ms));
   }
@@ -2571,14 +2278,11 @@
     }
   }
 
-  // Asks the worker for the frames it holds (before endOfStream() and
-  // changeType()); |change| goes in after them.
   function drainNow(st, change) {
     var drain = { seq: ++st.seq, received: false, changes: change ? [change] : [], timer: 0 };
     st.held = false;
     st.drain = drain;
     post({ type: 'drain', sb: st.id, seq: drain.seq });
-    // Without an answer, things go on without those frames.
     drain.timer = setTimer(function () {
       if (st.drain === drain && !drain.received) {
         drained(st, drain);
@@ -2594,7 +2298,6 @@
     pump(st);
   }
 
-  // endOfStream() once the converted SourceBuffers have everything.
   function endIfDone(source) {
     var eos = source && source.eos;
     if (!eos || source.list.some(function (st) {
@@ -2648,7 +2351,6 @@
             reopen(st);
           }
           if (busy(st)) {
-            // The shim's own bytes are going in: the setting waits for them.
             st.page[key] = check(key, value, st.page);
             return;
           }
@@ -2664,8 +2366,6 @@
         var data = args[0];
         if (!st || !st.convert || st.dead ||
             !(data instanceof ArrayBuffer || ArrayBuffer.isView(data))) {
-          // Not converted, or the native call throws the right error. An
-          // append opens a MediaSource the page sees as ended.
           var result = original.apply(self, args);
           var ms = owners.get(self);
           reopenSource(ms && sources.get(ms));
@@ -2676,14 +2376,10 @@
         }
         reopen(st);
         if (readyState(st.ms) === 'ended' && !busy(st)) {
-          // Ended for real: an empty append opens the MediaSource again
-          // now, as the page's own would.
           original.call(self, new ArrayBuffer(0));
           st.reopening = true;
         }
         if (st.carry && st.chunks.length && st.chunks[0].bytes && !busy(st)) {
-          // What didn't fit goes first; until it does, the page hears
-          // QuotaExceededError and nothing is lost.
           var chunk = st.chunks[0];
           try {
             apply(st, chunk.snap);
@@ -2737,10 +2433,6 @@
                                  'Aborting asynchronous remove() operation is disallowed.',
                                  'InvalidStateError');
         }
-        // abort() drops the append it interrupts. What earlier appends
-        // converted and type changes the page made stay and still go in:
-        // the page was told they did. The real SourceBuffer's own append
-        // is aborted only if it's the interrupted one's.
         var had = st.op;
         var aborted = had ? had.seq : NaN;
         var current = st.current;
@@ -2753,7 +2445,6 @@
           return chunk.change || chunk.remove || chunk.seq !== aborted;
         }).concat(st.drain && !st.drain.received ? st.drain.changes : []);
         var carry = st.carry;
-        // The worker starts over; frames it held are dropped.
         dropOutput(st);
         forget(st);
         st.reopening = false;
@@ -2816,9 +2507,6 @@
       };
     });
 
-    // endOfStream() waits for the frames the worker still holds and the
-    // converted bytes still going in, or the stream would end short. The
-    // page sees "ended" at once, and sourceended when it really is.
     native.endOfStream = hook(MS.prototype, 'endOfStream', function (original) {
       return function (self, args) {
         var source = sources.get(self);
@@ -2841,7 +2529,6 @@
           if (error !== 'network' && error !== 'decode') {
             return original.apply(self, args);
           }
-          // An error: nothing more is coming.
           source.list.forEach(function (st) {
             dropOutput(st);
             if (st.convert && realUpdating(st)) {
@@ -2919,8 +2606,6 @@
     return native.readyState ? native.readyState.get.call(ms) : ms.readyState;
   }
 
-  // A setting checked as the native setter would, for when it can't be
-  // set yet.
   function check(key, value, page) {
     if (key === 'mode') {
       return value === 'segments' || value === 'sequence' ? value : page.mode;
@@ -2936,32 +2621,22 @@
     return number;
   }
 
-  // ------------------------------------------------------ plain MP4 files
-  // Workers get the shim without this last section (WorkerShimParams() in
-  // MBEngine.mm cuts it at the line above).
-
   if (Media && isWindow) {
     playPlainFiles();
   }
 
   function playPlainFiles() {
 
-    // Elements whose MP4 is being converted, with the job doing it.
     var jobs = new WeakMap();
     var anyJob = false;
     var mediaHooked = false;
     var element = {};
-    // pause() calls per element, so a play() the shim retries isn't one the
-    // page took back.
     var pauses = new WeakMap();
-    // Per element: the converted stream's blob: URL and the file's.
     var blobs = new WeakMap();
     var proto = Media.prototype;
     element.error = getDescriptor(proto, 'error');
     element.currentSrc = getDescriptor(proto, 'currentSrc');
 
-    // The element's src setter tells which element a MediaSource plays on;
-    // set by the page, it also ends a conversion.
     element.src = hookAccessor(proto, 'src', function (original) {
       return function (self) {
         var job = anyJob && active(self);
@@ -2983,8 +2658,6 @@
           cancel(jobs.get(self));
         }
         if (Handle && value instanceof Handle) {
-          // A MediaSource in a worker: the worker that posted the handle
-          // hears how big it's shown.
           showHandle(self, value);
         } else {
           unshow(self);
@@ -2993,9 +2666,6 @@
       };
     });
 
-    // A play() that failed because the file couldn't play, or because the
-    // shim swapped in the converted stream, is tried again once that's
-    // ready. One the page paused stays paused.
     hook(proto, 'play', function (original) {
       return function (self, args) {
         var promise = original.apply(self, args);
@@ -3008,8 +2678,6 @@
           if (name !== 'NotSupportedError' && name !== 'AbortError') {
             throw error;
           }
-          // The job starts with the element's error event, which may come
-          // after this.
           return new Promise(function (resolve) {
             task(resolve);
           }).then(function () {
@@ -3055,13 +2723,10 @@
           !isCandidate(url)) {
         return;
       }
-      // Hidden while the file is converted; it comes back if that fails.
       event.stopImmediatePropagation();
       convertFile(target, url, null);
     }, true);
 
-    // The last <source> failing leaves the element waiting for another
-    // rather than in error.
     function sourceFailed(source) {
       var media = source.parentElement;
       var url = source.src;
@@ -3100,7 +2765,6 @@
           if (job) {
             return job.url;
           }
-          // Left over after the page dropped the source, as the engine's is.
           var value = original.get.call(self);
           var last = blobs.get(self);
           return last && last[0] === value ? last[1] : value;
@@ -3125,7 +2789,6 @@
         return function (self, args) {
           var job = jobs.get(self);
           if (job && job.ms && active(self)) {
-            // The MediaSource can't be opened twice: start from the file.
             cancel(job);
             if (job.attribute === null) {
               self.removeAttribute('src');
@@ -3140,9 +2803,6 @@
       });
     }
 
-    // Whether the element still plays what the job converts: the page may
-    // change its source in ways the shim doesn't see (setAttribute, a
-    // <source>, srcObject).
     function stillOurs(job) {
       var el = job.el;
       if (el.srcObject) {
@@ -3158,7 +2818,6 @@
       return !job.source || (job.source.parentNode === el && job.source.src === job.url);
     }
 
-    // The element's job, while it's still the element's.
     function active(el) {
       var job = jobs.get(el);
       if (!job) {
@@ -3180,7 +2839,6 @@
       if (jobs.get(job.el) === job && !job.failed) {
         jobs.delete(job.el);
       }
-      // Stops the download and removes the job's listeners.
       job.abort.abort();
       if (job.fetch) {
         job.fetch.abort();
@@ -3198,7 +2856,6 @@
       job.resolve(false);
     }
 
-    // The conversion didn't work: the page gets the error it would have.
     function giveUp(job) {
       if (job.done) {
         return;
@@ -3216,7 +2873,6 @@
       job.el.dispatchEvent(new NativeEvent('error'));
     }
 
-    // What the converted stream holds, from its init segment.
     function convertedType(init) {
       var text = String.fromCharCode.apply(null, new Uint8Array(init, 0, Math.min(init.byteLength, 4096)));
       var codecs = [];
@@ -3245,7 +2901,6 @@
         job.resolve = resolve;
       });
       jobs.set(el, job);
-      // The page loading something else ends the job.
       ['loadstart', 'emptied'].forEach(function (name) {
         el.addEventListener(name, function () {
           if (!stillOurs(job)) {
@@ -3270,9 +2925,6 @@
       post({ type: 'size', sb: job.id, width: size.width, height: size.height, fps: size.fps || 0 });
     }
 
-    // Converts the file from |start| seconds on: from its start first, and
-    // again after a seek back into what was dropped to make room, or far
-    // ahead of what's converted.
     function startStream(job, start) {
       if (job.id) {
         unregister(job.id, job);
@@ -3289,7 +2941,6 @@
       download(job, id, 0);
     }
 
-    // Handlers of a job's conversion: only the job's current id is its own.
     function streamFailed(job, message, id) {
       if (job.id === id) {
         debug('MBGA could not convert ' + job.url + ': ' + message);
@@ -3322,8 +2973,6 @@
           addNatural(job.el, data.natural, data.natural.at);
         }
       }
-      // The converter wants the file from elsewhere: the moov at the end
-      // of a big file, or where the samples from |start| on are.
       if (typeof data.need === 'number' && data.need >= 0 && data.need !== job.offset) {
         download(job, id, data.need);
       }
@@ -3334,10 +2983,6 @@
       wake(job);
     }
 
-    // Downloads the file from byte |from| on, with a Range request; a
-    // server that ignores it sends the whole file, and what comes before
-    // |from| is skipped. The converter takes appends that go on from where
-    // it wants, and drops (and answers) ones sent before it said otherwise.
     function download(job, id, from) {
       if (job.fetch) {
         job.fetch.abort();
@@ -3346,7 +2991,6 @@
       job.offset = from;
       job.read = false;
       job.drained = false;
-      // An earlier download waiting for room ends now.
       wake(job);
       var init = {
         credentials: job.el.crossOrigin === 'use-credentials' ? 'include' : 'same-origin',
@@ -3361,7 +3005,6 @@
         }
         var skip = 0;
         if (response.status === 206) {
-          // Content-Range isn't readable cross-origin without CORS saying so.
           var m = /^bytes (\d+)-/.exec(response.headers.get('Content-Range') || '');
           if (m && +m[1] !== from) {
             throw new Error('the server sent another range');
@@ -3406,16 +3049,12 @@
           });
         })();
       }).catch(function () {
-        // A site that doesn't allow reading the file (CORS) keeps its error.
         if (job.id === id && job.fetch === fetching && !fetching.signal.aborted) {
           giveUp(job);
         }
       });
     }
 
-    // Waits while plenty is converted ahead of the playhead: less for a
-    // video out of view, whose frames are fewer. The converter hears that
-    // the stream is still wanted while the video plays.
     function room(job) {
       return new Promise(function check(resolve) {
         var buffered = 0;
@@ -3446,7 +3085,6 @@
       if (job.keepalive) {
         return;
       }
-      // Weakly: a job whose element is gone isn't kept for this.
       var ref = new WeakRef(job);
       var timer = job.keepalive = G.setInterval(function () {
         var it = ref.deref();
@@ -3469,9 +3107,6 @@
       }
     }
 
-    // A seek back into what was dropped to make room, or well past what's
-    // converted, converts the file again from there: with Range requests,
-    // only the bytes from there on are fetched.
     function seeked(job) {
       var sb = job.sb;
       if (!sb || job.done) {
@@ -3485,14 +3120,12 @@
         }
       }
       if (time >= job.reached - 1 && !(job.ranges !== false && time > job.reached + 30)) {
-        // Just ahead of what's converted: it's on its way.
         return;
       }
       job.reached = time;
       startStream(job, time);
     }
 
-    // Plays the converted stream on the element, which keeps its settings.
     function attach(job) {
       var type = job.mime || convertedType(job.out[0]);
       if (!type) {
@@ -3559,8 +3192,6 @@
       job.resolve(true);
     }
 
-    // Appends what's converted, and ends the stream after the last of it
-    // and of the frames the worker held.
     function feed(job) {
       var sb = job.sb;
       var ms = job.ms;
@@ -3578,7 +3209,6 @@
           if (e.name !== 'QuotaExceededError') {
             giveUp(job);
           } else if (job.el.currentTime > 10) {
-            // Full: drop what's well behind the playhead, then try again.
             sb.remove(0, job.el.currentTime - 5);
           }
         }

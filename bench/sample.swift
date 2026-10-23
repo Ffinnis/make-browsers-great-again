@@ -1,6 +1,3 @@
-// Samples a browser's whole process tree: physical footprint (what Activity
-// Monitor reports as "Memory"), CPU time, energy and wakeups.
-// Usage: sample <root-pid>   -> one JSON object on stdout.
 import Darwin
 import Foundation
 
@@ -29,8 +26,6 @@ func name(of pid: pid_t) -> String {
     return String(cString: buf)
 }
 
-/// Chromium's process type from the command line ("renderer", "gpu-process",
-/// "utility:network.mojom.NetworkService", ...); "browser" for the main process.
 func processType(of pid: pid_t) -> String {
     var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
     var size = 0
@@ -46,7 +41,6 @@ func processType(of pid: pid_t) -> String {
     return type
 }
 
-// Root plus every descendant.
 var children: [pid_t: [pid_t]] = [:]
 for pid in allPIDs() where pid > 0 {
     if let p = parent(of: pid) { children[p, default: []].append(pid) }

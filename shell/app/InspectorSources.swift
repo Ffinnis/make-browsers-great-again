@@ -1,12 +1,5 @@
 import AppKit
 
-// Sources: the page's scripts and stylesheets, and the debugger. Files are
-// listed by where they came from; breakpoints are kept by URL and line, so
-// they hold across reloads; pausing shows the call stack and each scope's
-// variables. Minified files are pretty-printed, with breakpoints and the
-// paused line mapped onto the formatted text.
-
-/// A file in Sources: by URL, or a script without one (eval, injected).
 enum SourceKey: Hashable {
     case url(String)
     case script(String)
@@ -20,13 +13,10 @@ final class SourcesModel: InspectorModel {
         let startLine: Int
         let startColumn: Int
         let frameID: String?
-        /// Run in the page's own world, not an isolated one.
         let isDefault: Bool
         let hasSourceURL: Bool
-        /// Parsed after the others with the same URL.
         let order: Int
 
-        /// A <script> inside an HTML document, positioned in its lines.
         var isInline: Bool { !hasSourceURL && (startLine > 0 || startColumn > 0) }
     }
 
@@ -40,13 +30,11 @@ final class SourcesModel: InspectorModel {
 
     struct Breakpoint {
         var url: String
-        /// Zero-based, as the protocol counts.
         var line: Int
         var column: Int?
         var condition = ""
         var enabled = true
         var id: String?
-        /// Where the engine put it: the first statement at or after `line`.
         var resolvedLine: Int?
     }
 
@@ -55,14 +43,12 @@ final class SourcesModel: InspectorModel {
         let reason: String
         let data: JSON?
         let hitBreakpoints: [String]
-        /// What scheduled the paused code (a timer, a promise), with its frames.
         let asyncTrace: JSON?
     }
 
     struct Content {
         var text = ""
         var language = CodeLanguage.plain
-        /// The zero-based line of the document the text starts at.
         var firstLine = 0
         var error: String?
     }
@@ -73,24 +59,18 @@ final class SourcesModel: InspectorModel {
     private(set) var breakpoints: [Breakpoint] = []
     private(set) var pause: Pause?
     var paused: Bool { pause != nil }
-    /// The call frame the scope and the console look at.
     var selectedFrame = 0
     var selectedCallFrameID: String? {
         guard let frames = pause?.frames, frames.indices.contains(selectedFrame) else { return nil }
         return frames[selectedFrame].str("callFrameId")
     }
-    /// "none", "uncaught" or "all".
     private(set) var pauseOnExceptions = "none"
     private(set) var breakpointsActive = true
-    /// The file last open and its line, to come back to.
     var lastOpened: (key: SourceKey, line: Int)?
-    /// Files shown formatted, and minified ones the person asked to see as is.
     var prettyPrinted: Set<SourceKey> = []
     var keptPlain: Set<SourceKey> = []
 
-    /// Scripts or stylesheets came or went.
     let sourcesChanged = Signal<Void>()
-    /// Paused, resumed, or another frame selected.
     let pauseChanged = Signal<Void>()
     let breakpointsChanged = Signal<Void>()
 
@@ -105,18 +85,14 @@ final class SourcesModel: InspectorModel {
         session.on("CSS.styleSheet", self) { [weak self] method, params in self?.sheetEvent(method, params) }
         session.call("Debugger.enable", ["maxScriptsCacheSize": 100_000_000])
         session.call("Debugger.setAsyncCallStackDepth", ["maxDepth": 32])
-        // Stylesheets are reported once CSS is on, which needs DOM.
         session.call("DOM.enable") { _, _ in session.call("CSS.enable") }
         session.call("Overlay.enable")
     }
 
     func stop() {
-        // DOM and CSS stay for Elements; the debugger lets the page go.
         session?.call("Overlay.setPausedInDebuggerMessage")
         session?.call("Debugger.disable")
     }
-
-    // MARK: Events
 
     private func debuggerEvent(_ method: String, _ params: JSON) {
         switch method {
@@ -172,16 +148,12 @@ final class SourcesModel: InspectorModel {
             guard let id = params.str("styleSheetId"), sheets.removeValue(forKey: id) != nil else { return }
             sourcesChanged.send()
         case "CSS.styleSheetChanged":
-            // Edited in Elements: show the new text next time.
             if let id = params.str("styleSheetId"), let url = sheets[id]?.url { contents[.url(url)] = nil }
         default:
             break
         }
     }
 
-    // MARK: Files
-
-    /// URLs worth listing: the document, its scripts and stylesheets.
     var fileURLs: [String] {
         var urls = Set<String>()
         if let page = session?.url, !page.isEmpty, !page.hasPrefix("about:") { urls.insert(page) }
@@ -194,7 +166,6 @@ final class SourcesModel: InspectorModel {
         !url.isEmpty && !["chrome-extension:", "chrome:", "devtools:", "extensions::", "debugger:", "about:"].contains { url.hasPrefix($0) }
     }
 
-    /// What a URL holds, for its icon and colours.
     func language(of key: SourceKey) -> CodeLanguage {
         guard case .url(let url) = key else { return .javascript }
         if latestScript(url: url) != nil { return .javascript }
@@ -209,7 +180,6 @@ final class SourcesModel: InspectorModel {
         return .url(script.url)
     }
 
-    /// The URL's newest script that is the whole file (not inline in HTML).
     private func latestScript(url: String) -> Script? {
         scripts.values.filter { $0.url == url && !$0.isInline }.max { $0.order < $1.order }
     }
@@ -218,7 +188,6 @@ final class SourcesModel: InspectorModel {
         sheets.values.filter { $0.url == url && !$0.isInline }.max { $0.order < $1.order }
     }
 
-    /// The text of a file, fetched once per page load.
     func content(_ key: SourceKey) async -> Content {
         if let cached = contents[key] { return cached }
         guard let session else { return Content(error: "The page is closed.") }
@@ -258,7 +227,6 @@ final class SourcesModel: InspectorModel {
         }
     }
 
-    /// A document or another resource of the page, as the browser has it.
     private func resourceContent(_ url: String, _ session: InspectorSession) async -> Content {
         let inline = scripts.values.filter { $0.url == url && $0.isInline }.sorted { $0.startLine < $1.startLine }
         let frame = inline.first?.frameID ?? sheets.values.first { $0.url == url }?.frameID ?? session.mainFrameID
@@ -275,7 +243,6 @@ final class SourcesModel: InspectorModel {
             return Content(text: text, language: language)
         } catch {
             guard !inline.isEmpty else { return Content(error: "\(error)") }
-            // Rebuild what can be: the inline scripts at their own lines.
             var lines: [String] = []
             for script in inline {
                 guard let source = try? await session.send("Debugger.getScriptSource", ["scriptId": script.id]).str("scriptSource") else { continue }
@@ -291,7 +258,6 @@ final class SourcesModel: InspectorModel {
         }
     }
 
-    /// The line's text, if the file was fetched.
     func cachedLine(_ url: String, _ line: Int) -> String? {
         guard let content = contents[.url(url)] else { return nil }
         let index = line - content.firstLine
@@ -299,9 +265,6 @@ final class SourcesModel: InspectorModel {
         return lines.indices.contains(index) ? lines[index].trimmingCharacters(in: .whitespaces) : nil
     }
 
-    // MARK: Breakpoints
-
-    /// Sets a breakpoint at `line`, or removes the one there.
     func toggleBreakpoint(url: String, line: Int, column: Int? = nil) {
         if let index = breakpoints.firstIndex(where: { $0.url == url && ($0.line == line || $0.resolvedLine == line) }) {
             remove(at: index)
@@ -365,8 +328,6 @@ final class SourcesModel: InspectorModel {
         breakpointsChanged.send()
     }
 
-    // MARK: Stepping
-
     func resume() { session?.call("Debugger.resume") }
     func pauseNow() { session?.call("Debugger.pause") }
     func stepOver() { session?.call("Debugger.stepOver") }
@@ -395,8 +356,6 @@ final class SourcesModel: InspectorModel {
         pauseChanged.send()
     }
 
-    /// The script a URL's breakpoints and pauses happen in, for "Continue
-    /// to here".
     func scriptID(at key: SourceKey, line: Int) -> String? {
         switch key {
         case .script(let id): return id
@@ -407,15 +366,10 @@ final class SourcesModel: InspectorModel {
     }
 }
 
-// MARK: - Pretty printing
-
-/// Formatted text with, for each of its lines, where it started in the
-/// original: breakpoints set on the formatted text land where they should.
 private struct PrettyText {
     let text: String
     let starts: [(line: Int, column: Int)]
 
-    /// The formatted line holding an original position.
     func line(forOriginal line: Int, column: Int) -> Int {
         var low = 0, high = starts.count - 1, found = 0
         while low <= high {
@@ -432,15 +386,12 @@ private struct PrettyText {
     }
 }
 
-/// A token-level formatter for minified scripts and stylesheets: enough to
-/// read and step through, not a full beautifier.
 private enum PrettyPrinter {
     private enum Kind { case word, string, comment, lineComment, punct }
     private struct Token {
         let kind: Kind
         let start: Int
         let end: Int
-        /// Original whitespace before it held a line break.
         let newlineBefore: Bool
     }
 
@@ -537,8 +488,6 @@ private enum PrettyPrinter {
             return PrettyText(text: out, starts: starts.isEmpty ? [(0, 0)] : starts)
         }
 
-        // Whether each open brace is an object literal, and the bracket
-        // depth it opened at.
         var braces: [(object: Bool, depth: Int)] = []
         var depth = 0
         var previous: (kind: Kind, text: String)?
@@ -549,7 +498,6 @@ private enum PrettyPrinter {
             let next = i + 1 < tokens.count ? text(tokens[i + 1]) : nil
             let wordLike = token.kind == .word || token.kind == .string
             let prevWordLike = previous.map { $0.kind == .word || $0.kind == .string || [")", "]"].contains($0.text) } ?? false
-            // A line break the original relied on (no semicolons).
             if token.newlineBefore, wordLike, prevWordLike, depth == (braces.last?.depth ?? 0) { newline() }
             var space = false
             if let previous {
@@ -643,7 +591,7 @@ private enum PrettyPrinter {
             guard let last = tokens.last(where: { $0.kind != .comment && $0.kind != .lineComment }) else { return true }
             if last.kind == .punct {
                 let c = u[last.start]
-                return !(last.end - last.start == 1 && (c == 41 || c == 93)) // ) ]
+                return !(last.end - last.start == 1 && (c == 41 || c == 93))
             }
             if last.kind == .word {
                 return keywordsBeforeExpression.contains(String(decoding: u[last.start..<last.end], as: UTF16.self))
@@ -736,8 +684,6 @@ private enum PrettyPrinter {
                 i += 1
                 tokens.append(Token(kind: .punct, start: start, end: i, newlineBefore: false))
             } else {
-                // A run up to the next brace or semicolon outside brackets
-                // and strings: a selector, or a declaration.
                 var parens = 0
                 while i < n {
                     let d = u[i]
@@ -760,8 +706,6 @@ private enum PrettyPrinter {
         return tokens
     }
 }
-
-// MARK: - Panel
 
 final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
     private var model: SourcesModel?
@@ -796,18 +740,14 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
     private lazy var split = InspectorSplitView(navigatorPane, codeSplit, vertical: true, key: "sources.navigator",
                                                 fraction: 0.3, minimum: 120)
 
-    /// The file shown, its text as fetched, and its formatting if any.
     private var openKey: SourceKey?
-    /// The file whose text is in the view (it lags `openKey` while loading).
     private var loadedKey: SourceKey?
     private var content = SourcesModel.Content()
     private var prettyText: PrettyText?
     private var openToken = 0
     private var history: [SourceKey] = []
     private lazy var navigatorReload = Coalescer(delay: 0.2) { [weak self] in self?.reloadNavigator() }
-    /// Whether the file list shows, when chosen by hand.
     private static let navigatorKey = "inspector.sources.navigator"
-    /// The same, chosen while the panel was too narrow to remember it.
     private var navigatorChoice: Bool?
 
     override init(frame: NSRect) {
@@ -903,7 +843,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         toolbar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: InspectorToolbar.height)
         split.frame = NSRect(x: 0, y: InspectorToolbar.height, width: bounds.width,
                              height: max(bounds.height - InspectorToolbar.height, 0))
-        // The panes take their sizes first; what's in them follows.
         split.layoutSubtreeIfNeeded()
         filter.frame = NSRect(x: 6, y: 5, width: max(navigatorPane.bounds.width - 12, 0), height: 22)
         navigatorScroll.frame = NSRect(x: 0, y: 32, width: navigatorPane.bounds.width, height: max(navigatorPane.bounds.height - 32, 0))
@@ -913,7 +852,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         banner.frame = NSRect(x: 0, y: 0, width: debuggerPane.bounds.width, height: bannerHeight)
         debuggerScroll.frame = NSRect(x: 0, y: bannerHeight, width: debuggerPane.bounds.width,
                                       height: max(debuggerPane.bounds.height - bannerHeight, 0))
-        // The split moves its dividers after this; they follow their panes.
         for view in [navigatorScroll, code, codeEmpty, debuggerScroll] as [NSView] { view.autoresizingMask = [.width, .height] }
         filter.autoresizingMask = [.width]
         banner.autoresizingMask = [.width]
@@ -921,8 +859,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         navigator.sizeLastColumnToFit()
         applyNavigatorVisibility()
     }
-
-    // MARK: Binding
 
     override func sessionChanged() {
         detachModel()
@@ -983,13 +919,10 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         open(.url(request.url), line: request.line, column: request.column, select: true)
     }
 
-    // MARK: Navigator
-
     private var navigatorShownState: Bool? {
         UserDefaults.standard.object(forKey: Self.navigatorKey) as? Bool
     }
 
-    /// Narrow, the file list hides itself once a file is chosen.
     private var navigatorAutoHides: Bool { bounds.width < 560 }
 
     private func applyNavigatorVisibility() {
@@ -1026,7 +959,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         navigatorSource.build(urls: urls, query: query, pageHost: pageHost, language: { model.language(of: .url($0)) })
         navigator.reloadData()
         if query.isEmpty {
-            // Open the page's own origin; the rest stay folded.
             for root in navigatorSource.roots where root.isPage || navigatorSource.roots.count == 1 {
                 expandDown(root)
             }
@@ -1036,7 +968,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
 
     private func expandDown(_ node: SourceTreeNode) {
         navigator.expandItem(node)
-        // Single folders open on through.
         if node.children.count == 1, let only = node.children.first, only.url == nil { expandDown(only) }
     }
 
@@ -1054,8 +985,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         navigator.scrollRowToVisible(row)
     }
 
-    // MARK: Files
-
     private func clearFile() {
         openKey = nil
         loadedKey = nil
@@ -1070,7 +999,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         updateControls()
     }
 
-    /// Opens a file, scrolled to zero-based original `line` if given.
     func open(_ key: SourceKey, line: Int? = nil, column: Int = 0, select: Bool = false) {
         guard let model else { return }
         if openKey == key, loadedKey == key {
@@ -1148,19 +1076,15 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         return Self.line(at: layout.characterIndexForGlyph(at: glyph), in: code.textView.string)
     }
 
-    /// The zero-based line holding a UTF-16 offset.
     private static func line(at offset: Int, in text: String) -> Int {
         text.utf16.prefix(offset).reduce(0) { $1 == 10 ? $0 + 1 : $0 }
     }
 
-    /// The zero-based line of the text shown for an original position.
     private func displayLine(forOriginal line: Int, column: Int) -> Int {
         if let prettyText { return prettyText.line(forOriginal: line, column: column) }
         return line - content.firstLine
     }
 
-    /// Where a shown line starts in the original; with a column only when
-    /// formatted, where one original line holds many shown ones.
     private func originalLocation(forDisplayLine line: Int) -> (line: Int, column: Int?) {
         if let prettyText, prettyText.starts.indices.contains(line) {
             let start = prettyText.starts[line]
@@ -1197,8 +1121,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         }
         title.popUp(menu)
     }
-
-    // MARK: Breakpoints
 
     private var openURL: String? {
         if case .url(let url) = openKey { return url }
@@ -1297,8 +1219,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         return menu
     }
 
-    // MARK: Pausing
-
     private func pauseChanged() {
         updateControls()
         debuggerSource.reload()
@@ -1362,8 +1282,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         navigatorToggle.isOn = !navigatorPane.isHidden
     }
 
-    // MARK: Keys
-
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         guard isShown, let model, window?.isKeyWindow == true else { return super.performKeyEquivalent(with: event) }
         let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
@@ -1388,8 +1306,6 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
         if navigatorPane.isHidden { setNavigatorShown(true) }
         window?.makeFirstResponder(filter)
     }
-
-    // MARK: From the debugger pane
 
     fileprivate func selectFrame(_ index: Int) {
         model?.selectFrame(index)
@@ -1426,20 +1342,14 @@ final class SourcesPanel: InspectorPanelView, NSTextViewDelegate {
     }
 }
 
-// MARK: - Navigator
-
-/// A row of the file list: an origin, a folder or a file.
 private final class SourceTreeNode {
     let name: String
     var children: [SourceTreeNode] = []
     weak var parent: SourceTreeNode?
-    /// Set for files.
     var url: String?
     var language = CodeLanguage.plain
-    /// The page's own origin, listed first.
     var isPage = false
     var isOrigin = false
-    /// The path, shown dimmed in a filtered list.
     var detail: String?
 
     init(name: String) { self.name = name }
@@ -1579,7 +1489,6 @@ private final class NavigatorSource: NSObject, NSOutlineViewDataSource, NSOutlin
     }
 }
 
-/// A one-line cell with a small symbol before its text.
 private final class IconCell: NSTableCellView {
     private let icon = NSImageView()
     private let label = NSTextField(labelWithString: "")
@@ -1612,7 +1521,6 @@ private final class IconCell: NSTableCellView {
     }
 }
 
-/// The open file's name; clicking it lists the files opened before.
 private final class SourceTitleView: HoverView {
     var onClick: (() -> Void)?
     private let label = NSTextField(labelWithString: "")
@@ -1655,7 +1563,6 @@ private final class SourceTitleView: HoverView {
     }
 }
 
-/// Why the debugger paused, across the top of its pane.
 private final class PausedBanner: FlippedView {
     private let icon = NSImageView()
     private let label = NSTextField(wrappingLabelWithString: "")
@@ -1714,9 +1621,6 @@ private final class PausedBanner: FlippedView {
     }
 }
 
-// MARK: - Debugger pane
-
-/// Watch expressions, kept for every page.
 @MainActor
 private enum Watches {
     static let key = "inspector.watches"
@@ -1750,7 +1654,6 @@ private final class FrameRow {
     init(index: Int, frame: JSON) { self.index = index; self.frame = frame }
 }
 
-/// A frame of the code that scheduled the paused code, shown for context.
 private final class AsyncRow {
     let text: String
     let heading: Bool
@@ -1762,14 +1665,12 @@ private final class BreakpointRow {
     init(_ index: Int) { self.index = index }
 }
 
-/// A quiet line ("Not paused"), or one that does something when clicked.
 private final class InfoRow {
     let text: String
     let action: (() -> Void)?
     init(_ text: String, action: (() -> Void)? = nil) { self.text = text; self.action = action }
 }
 
-/// A watch expression and its value.
 private final class WatchNode: ValueNode {
     let index: Int
     var result: RemoteValueNode?
@@ -1845,7 +1746,6 @@ private final class DebuggerSource: NSObject, NSOutlineViewDataSource, NSOutline
         for section in sections where !collapsed.contains(ObjectIdentifier(section)) {
             outline.expandItem(section)
         }
-        // Local opens by itself; the global scope stays folded.
         if let local = scopes.first, !collapsed.contains(ObjectIdentifier(sections[2])) { expand(local) }
     }
 
@@ -1927,8 +1827,6 @@ private final class DebuggerSource: NSObject, NSOutlineViewDataSource, NSOutline
             }
         }
     }
-
-    // MARK: Data source
 
     private func children(of item: Any?) -> [Any] {
         guard let item else { return sections }
@@ -2049,8 +1947,6 @@ private final class DebuggerSource: NSObject, NSOutlineViewDataSource, NSOutline
         return cell
     }
 
-    // MARK: Actions
-
     @objc func clicked(_ sender: Any?) {
         guard let outline, outline.clickedRow >= 0 else { return }
         switch outline.item(atRow: outline.clickedRow) {
@@ -2120,7 +2016,6 @@ private final class DebuggerSource: NSObject, NSOutlineViewDataSource, NSOutline
     }
 }
 
-/// A breakpoint row: a checkbox to turn it off, and where it is.
 private final class BreakpointCell: NSTableCellView {
     private let checkbox = NSButton(checkboxWithTitle: "", target: nil, action: nil)
     private let label = NSTextField(labelWithString: "")

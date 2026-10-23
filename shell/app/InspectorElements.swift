@@ -1,10 +1,5 @@
 import AppKit
 
-// Elements: the page's DOM as a live tree, and the selected element's
-// styles, computed values and box model, event listeners, properties and
-// accessibility, all editable where DevTools allows.
-
-/// A node of the page's DOM as DevTools reports it.
 @MainActor
 final class DOMNode {
     let id: Int
@@ -15,7 +10,6 @@ final class DOMNode {
     var value: String
     var attributes: [(name: String, value: String)]
     var childCount: Int
-    /// Nil until fetched.
     var children: [DOMNode]?
     weak var parent: DOMNode?
     var shadowRoots: [DOMNode] = []
@@ -47,8 +41,6 @@ final class DOMNode {
 
     func attribute(_ name: String) -> String? { attributes.first { $0.name == name }?.value }
 
-    /// What the tree shows under it: shadow roots, a frame's document,
-    /// ::before, the children (without blank text) and ::after.
     var shownChildren: [DOMNode] {
         var nodes = shadowRoots
         if let templateContent { nodes.append(templateContent) }
@@ -59,13 +51,11 @@ final class DOMNode {
         return nodes
     }
 
-    /// Whether it has children to show or fetch.
     var hasChildren: Bool {
         if let inline = inlineText, !inline.isEmpty { return false }
         return !shownChildren.isEmpty || (children == nil && childCount > 0)
     }
 
-    /// An element holding only a short text shows it on its own line.
     var inlineText: String? {
         guard isElement, shadowRoots.isEmpty, contentDocument == nil, before == nil, after == nil,
               let children, children.count == 1, children[0].isText else { return nil }
@@ -73,7 +63,6 @@ final class DOMNode {
         return text.count <= 80 && !text.contains("\n") ? text : nil
     }
 
-    /// `div#main.card.primary`, for breadcrumbs and links.
     var shortName: String {
         if let pseudoType { return "::\(pseudoType)" }
         guard isElement else { return name.lowercased() }
@@ -85,7 +74,6 @@ final class DOMNode {
         return text
     }
 
-    /// Every node under it already known, it included.
     func walk(_ visit: (DOMNode) -> Void) {
         visit(self)
         for child in shadowRoots { child.walk(visit) }
@@ -97,7 +85,6 @@ final class DOMNode {
     }
 }
 
-/// An expanded element's closing tag, its own row in the tree.
 @MainActor
 final class ClosingTag {
     let node: DOMNode
@@ -110,16 +97,11 @@ final class ElementsModel: InspectorModel {
     private(set) var document: DOMNode?
     private var nodes: [Int: DOMNode] = [:]
     private(set) var selected: DOMNode?
-    /// Stylesheets by id: their URLs for the styles' links.
     private(set) var styleSheets: [String: JSON] = [:]
-    /// The whole tree changed (a new document).
     let reset = Signal<Void>()
-    /// A node's children or attributes changed.
     let nodeChanged = Signal<DOMNode>()
     let selectionChanged = Signal<Void>()
-    /// The selected element's styles may have changed.
     let stylesChanged = Signal<Void>()
-    /// A node to select and scroll to.
     let revealed = Signal<DOMNode>()
     private var started = false
     private var waitingReveal: Int?
@@ -166,7 +148,6 @@ final class ElementsModel: InspectorModel {
             let previous = selected
             selected = nil
             reset.send()
-            // Select <body>, or what was selected before if it's still there.
             if let waitingReveal {
                 self.waitingReveal = nil
                 reveal(backendNodeID: waitingReveal)
@@ -289,9 +270,6 @@ final class ElementsModel: InspectorModel {
         return false
     }
 
-    // MARK: Actions
-
-    /// Fetches `node`'s children if they aren't known, then calls `done`.
     func loadChildren(_ node: DOMNode, _ done: @escaping @MainActor () -> Void) {
         guard node.children == nil, node.childCount > 0 else { return done() }
         let first = childWaiters[node.id] == nil
@@ -306,8 +284,6 @@ final class ElementsModel: InspectorModel {
         selectionChanged.send()
     }
 
-    /// Selects the node with `backendNodeID` (picked in the page, or from
-    /// the console), fetching its ancestors first.
     func reveal(backendNodeID: Int) {
         guard let session else { return }
         guard document != nil else {
@@ -337,7 +313,6 @@ final class ElementsModel: InspectorModel {
                 "borderColor": rgba(255, 229, 153, 0.66), "marginColor": rgba(246, 178, 107, 0.66)]
     }()
 
-    /// Runs a DOM edit as one undoable step.
     func edit(_ method: String, _ params: JSON, _ done: (@MainActor (JSON?, String?) -> Void)? = nil) {
         guard let session else { return }
         session.call(method, params) { result, error in
@@ -349,7 +324,6 @@ final class ElementsModel: InspectorModel {
     func undo() { session?.call("DOM.undo") }
     func redo() { session?.call("DOM.redo") }
 
-    /// The node as a JavaScript object, for the console and Properties.
     func resolve(_ node: DOMNode) async -> JSON? {
         guard let session else { return nil }
         return try? await session.send("DOM.resolveNode", ["nodeId": node.id, "objectGroup": "elements"]).obj("object")
@@ -362,12 +336,9 @@ final class ElementsModel: InspectorModel {
         return result?.obj("result")?["value"]
     }
 
-    // MARK: Search
-
     private var searchID: String?
     private(set) var searchResults: [Int] = []
 
-    /// Finds nodes by text, selector or XPath; calls back with how many.
     func search(_ query: String, _ done: @escaping @MainActor (Int) -> Void) {
         guard let session else { return }
         if let searchID { session.call("DOM.discardSearchResults", ["searchId": searchID]) }
@@ -404,13 +375,10 @@ private extension DOMNode {
     }
 }
 
-// MARK: - Tree text
-
 @MainActor
 enum DOMText {
     static let font = InspectorTheme.mono(11)
 
-    /// `<div id="main" class="card">…</div>` as DevTools draws a row.
     static func row(_ node: DOMNode, expanded: Bool) -> NSAttributedString {
         let out = NSMutableAttributedString()
         switch node.type {
@@ -458,8 +426,6 @@ enum DOMText {
     static let voidElements: Set<String> = ["area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
                                             "param", "source", "track", "wbr"]
 }
-
-// MARK: - Panel
 
 final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlineViewDelegate {
     private let toolbar = InspectorToolbar()
@@ -535,13 +501,11 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         let pane = treePane.bounds
         crumbs.frame = NSRect(x: 0, y: pane.height - BreadcrumbBar.height, width: pane.width, height: BreadcrumbBar.height)
         treeScroll.frame = NSRect(x: 0, y: 0, width: pane.width, height: max(pane.height - BreadcrumbBar.height, 0))
-        // The split moves its divider after this; they follow the pane.
         crumbs.autoresizingMask = [.width, .minYMargin]
         treeScroll.autoresizingMask = [.width, .height]
         sizeTreeColumn()
     }
 
-    /// Rows are as wide as their text, so long tags scroll sideways.
     private func sizeTreeColumn() {
         guard let column = tree.tableColumns.first else { return }
         let width = max(treeScroll.contentSize.width, column.width)
@@ -590,7 +554,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         closingTags = [:]
         tree.reloadData()
         guard let document = model?.document else { return }
-        // Open down to <body>, as DevTools does.
         for child in document.shownChildren {
             tree.expandItem(child)
             if child.localName == "html" {
@@ -601,8 +564,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         selectionChanged()
     }
 
-    /// Nodes whose rows changed, reloaded together: a busy page changes
-    /// its DOM many times a frame.
     private var changedNodes: [ObjectIdentifier: DOMNode] = [:]
     private lazy var reloadChanged = Coalescer(delay: 0.05) { [weak self] in self?.reloadChangedNodes() }
 
@@ -615,7 +576,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         guard !changedNodes.isEmpty else { return }
         let nodes = changedNodes
         changedNodes = [:]
-        // A node reloaded with its children covers its descendants.
         let covered = { (node: DOMNode) in
             var ancestor = node.parent
             while let current = ancestor {
@@ -658,7 +618,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         suppressSelection = false
     }
 
-    /// Expands its ancestors and scrolls it into the middle.
     private func revealRow(_ node: DOMNode) {
         guard let model else { return }
         reloadChanged.flush()
@@ -687,8 +646,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         }
     }
 
-    // MARK: Search
-
     private func find(_ query: String) {
         searchIndex = 0
         model?.search(query) { [weak self] count in
@@ -708,14 +665,11 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
     private func showSearchResult() {
         guard let model, model.searchResults.indices.contains(searchIndex) else { return }
         let id = model.searchResults[searchIndex]
-        // Results arrive with their ancestors pushed; a moment later they're known.
         if let node = model.node(id) {
             model.select(node)
             revealRow(node)
         }
     }
-
-    // MARK: Interaction
 
     private func node(atRow row: Int) -> DOMNode? {
         let item = tree.item(atRow: row)
@@ -849,7 +803,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
 
     private func expandRecursively(_ node: DOMNode) {
         session?.call("DOM.requestChildNodes", ["nodeId": node.id, "depth": -1])
-        // The children arrive as events; expand once they have.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
             self?.tree.expandItem(node, expandChildren: true)
         }
@@ -918,8 +871,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         }
     }
 
-    // MARK: Editing
-
     private func editHTML(_ node: DOMNode) {
         guard let model, let row = rowView(for: node) else { return }
         session?.call("DOM.getOuterHTML", ["nodeId": node.id]) { [weak self] result, _ in
@@ -937,8 +888,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         }
     }
 
-    /// Edits one attribute as `name="value"` text (several may be typed),
-    /// or adds new ones when `name` is nil.
     private func editAttribute(_ node: DOMNode, name: String?) {
         guard let model, let row = rowView(for: node) else { return }
         let current = name.flatMap { n in node.attribute(n).map { "\(n)=\"\($0)\"" } } ?? ""
@@ -958,8 +907,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
         let row = tree.row(forItem: node)
         return row >= 0 ? tree.rect(ofRow: row) : nil
     }
-
-    // MARK: Outline
 
     private func items(of item: Any?) -> [AnyObject] {
         guard let node = item as? DOMNode ?? model?.document else { return [] }
@@ -1032,8 +979,6 @@ final class ElementsPanel: InspectorPanelView, NSOutlineViewDataSource, NSOutlin
     }
 }
 
-/// The DOM tree: reports the row under the pointer, for highlighting the
-/// element in the page.
 final class DOMOutlineView: InspectorOutlineView {
     var onHover: ((Int?) -> Void)?
     private var area: NSTrackingArea?
@@ -1070,7 +1015,6 @@ final class DOMOutlineView: InspectorOutlineView {
     }
 }
 
-/// The selected element's ancestors along the bottom of the tree.
 final class BreadcrumbBar: FlippedView {
     static let height: CGFloat = 22
     var onSelect: ((DOMNode) -> Void)?
@@ -1107,7 +1051,6 @@ final class BreadcrumbBar: FlippedView {
         CATransaction.commit()
         scroll.frame = NSRect(x: 0, y: 1, width: bounds.width, height: bounds.height - 1)
         strip.frame.size.height = bounds.height - 1
-        // The selected end stays in view.
         strip.scroll(NSPoint(x: max(strip.frame.width - scroll.contentSize.width, 0), y: 0))
     }
 
@@ -1142,10 +1085,6 @@ final class BreadcrumbBar: FlippedView {
     }
 }
 
-// MARK: - Sidebar
-
-/// Under the tree: the selected element's Styles, Computed values, Event
-/// Listeners, Properties and Accessibility.
 final class ElementSidebar: FlippedView {
     private let tabs = InspectorChips(["Styles", "Computed", "Listeners", "Properties", "Accessibility"])
     private let bar = InspectorToolbar()
@@ -1156,9 +1095,7 @@ final class ElementSidebar: FlippedView {
     private weak var session: InspectorSession?
     private var tab = UserDefaults.standard.integer(forKey: "inspector.elements.tab")
     private lazy var refresh = Coalescer(delay: 0.1) { [weak self] in self?.reload() }
-    /// Pseudo-classes forced on, by node.
     private(set) var forcedStates: [Int: Set<String>] = [:]
-    /// Nodes hidden with H.
     private(set) var hiddenNodes: Set<Int> = []
 
     override init(frame: NSRect) {
@@ -1280,7 +1217,6 @@ final class ElementSidebar: FlippedView {
             }
             let properties = mine.list("properties").map { GroupNode(name: $0.str("name") ?? "", value: text($0.obj("value"))) }
             if !properties.isEmpty { rows.append(GroupNode(name: "Properties", children: properties)) }
-            // The way up: what assistive technology reads around it.
             var chain: [String] = []
             var parentID = mine.str("parentId")
             while let id = parentID, let parent = nodes.first(where: { $0.str("nodeId") == id }) {
@@ -1294,8 +1230,6 @@ final class ElementSidebar: FlippedView {
             values.expandRoots()
         }
     }
-
-    // MARK: States
 
     func toggleForcedState(_ state: String, on node: DOMNode) {
         var states = forcedStates[node.id] ?? []
@@ -1317,11 +1251,6 @@ final class ElementSidebar: FlippedView {
     }
 }
 
-// MARK: - Styles
-
-/// The rules that apply to the selected element, most specific first, as
-/// editable blocks: tick a declaration off, click a name or value to edit,
-/// click a rule's empty line to add one.
 final class StylesView: FlippedView {
     weak var model: ElementsModel?
     weak var session: InspectorSession?
@@ -1415,7 +1344,6 @@ final class StylesView: FlippedView {
         if let attributes = result.obj("attributesStyle"), !attributes.list("cssProperties").isEmpty {
             rules.append(StyleRule(selector: "\(node.localName)[Attributes Style]", style: attributes, origin: "attributes", media: [], source: nil))
         }
-        // Pseudo-elements' rules.
         for pseudo in result.list("pseudoElements") {
             let type = pseudo.str("pseudoType") ?? ""
             for match in pseudo.list("matches").reversed() {
@@ -1425,7 +1353,6 @@ final class StylesView: FlippedView {
                 rules.append(styleRule)
             }
         }
-        // Inherited properties, from each ancestor.
         var ancestor = node.parent
         for entry in result.list("inherited") {
             while let current = ancestor, !current.isElement { ancestor = current.parent }
@@ -1448,8 +1375,6 @@ final class StylesView: FlippedView {
             }
             ancestor = ancestor?.parent
         }
-        // Which declarations lose: a later one of the same name, or one an
-        // !important declaration beats.
         var winners: [String: (important: Bool, rule: Int)] = [:]
         for (r, rule) in rules.enumerated() {
             for (d, declaration) in rule.declarations.enumerated() where declaration.enabled && declaration.parsedOK {
@@ -1460,7 +1385,6 @@ final class StylesView: FlippedView {
                 let key = declaration.name
                 if let winner = winners[key] {
                     if declaration.important, !winner.important, winner.rule != r || true {
-                        // An earlier non-important winner loses to this one.
                         for (wr, wrule) in rules.enumerated() where wr <= r {
                             for (wd, wdecl) in wrule.declarations.enumerated() where wdecl.name == key && !wdecl.important && !(wr == r && wd == d) {
                                 rules[wr].declarations[wd].overridden = true
@@ -1478,7 +1402,6 @@ final class StylesView: FlippedView {
         return rules.map { RuleBlock(rule: $0, styles: self) }
     }
 
-    /// Properties children take from their parents.
     static func inherits(_ name: String) -> Bool {
         if name.hasPrefix("--") { return true }
         let inherited: Set = ["color", "cursor", "direction", "font", "font-family", "font-size", "font-style", "font-variant",
@@ -1492,7 +1415,6 @@ final class StylesView: FlippedView {
         return inherited.contains(name)
     }
 
-    /// A block's lines changed: lays the blocks out again.
     func blockResized() { layoutBlocks() }
 
     private func setBlocks(_ new: [RuleBlock]) {
@@ -1525,7 +1447,6 @@ final class StylesView: FlippedView {
         hov.popUp(menu)
     }
 
-    /// A new rule for the selected element in an inspector stylesheet.
     private func addRule() {
         guard let node, let session, node.isElement else { return }
         let selector = node.attribute("id").flatMap { $0.isEmpty ? nil : "#\($0)" }
@@ -1542,9 +1463,6 @@ final class StylesView: FlippedView {
         }
     }
 
-    // MARK: Edits
-
-    /// Replaces a style's text, then shows the result.
     func setStyleText(_ rule: StyleRule, _ text: String) {
         guard let session, let node else { return }
         if let sheet = rule.styleSheetID, let range = rule.range {
@@ -1568,21 +1486,17 @@ final class StylesView: FlippedView {
     }
 }
 
-/// A CSS declaration as the Styles pane shows it.
 struct StyleDeclaration {
     var name: String
     var value: String
     var important: Bool
     var enabled: Bool
     var parsedOK: Bool
-    /// Its text in the stylesheet, kept to rewrite the style.
     var text: String?
     var overridden = false
-    /// Not inherited from an ancestor.
     var inactive = false
 }
 
-/// A rule (or inline style) and its declarations.
 struct StyleRule {
     var selector: String
     var heading: String?
@@ -1594,7 +1508,6 @@ struct StyleRule {
     var selectorRange: JSON?
     var declarations: [StyleDeclaration] = []
     var inherited = false
-    /// Indices of the selectors in the list that match.
     var matching: [Int]?
     var selectors: [String] = []
 
@@ -1637,7 +1550,6 @@ struct StyleRule {
         let properties = style.list("cssProperties")
         let authored = properties.contains { $0.str("text") != nil }
         return properties.compactMap { property in
-            // Longhands a shorthand expands to have no text of their own.
             if authored, property.str("text") == nil { return nil }
             guard let name = property.str("name") else { return nil }
             var value = property.str("value") ?? ""
@@ -1651,31 +1563,22 @@ struct StyleRule {
 
     var editable: Bool { (origin == "regular" || origin == "inline" || origin == "inspector") && (styleSheetID != nil || origin == "inline") }
 
-    /// The style's text with `declarations` as given, disabled ones in
-    /// comments, as DevTools writes it.
     func text(with declarations: [StyleDeclaration]) -> String {
         let lines = declarations.map { d -> String in
             let line = "\(d.name): \(d.value)\(d.important ? " !important" : "");"
-            return d.enabled ? line : "/* \(line) */"
+            return d.enabled ? line : ""
         }
         return origin == "inline" && styleSheetID == nil ? lines.joined(separator: " ") : "\n    " + lines.joined(separator: "\n    ") + "\n"
     }
 }
 
-/// One rule's block in the Styles pane, drawn as lines of text: its
-/// heading, media, the selector and source, a line per declaration
-/// (`☑ color: ■ red;`, name and value each editable on click) and the
-/// closing brace. Drawing them rather than making views for each keeps
-/// long user agent rules cheap to show and to lay out again.
 final class RuleBlock: FlippedView, NSViewToolTipOwner {
     private(set) var rule: StyleRule
     private weak var styles: StylesView?
     var filter = ""
     private var lines: [(line: Line, y: CGFloat, height: CGFloat)] = []
-    /// A declaration being added, typed on a line before the brace.
     private var adding = false
     private let font = InspectorTheme.mono(11)
-    /// Each declaration's text and colour, made once.
     private lazy var drawn: [(name: NSAttributedString, nameWidth: CGFloat, value: NSAttributedString, color: NSColor?)] =
         rule.declarations.map { declaration in
             let name = nameText(declaration)
@@ -1697,7 +1600,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    /// Its height at `width`, or 0 when filtered out.
     func layoutRows(width: CGFloat) -> CGFloat {
         lines = []
         let matches = filter.isEmpty || rule.selector.localizedCaseInsensitiveContains(filter)
@@ -1735,8 +1637,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         }
     }
 
-    // MARK: Drawing
-
     override func draw(_ dirtyRect: NSRect) {
         for entry in lines where entry.y < dirtyRect.maxY && entry.y + entry.height > dirtyRect.minY {
             let y = entry.y
@@ -1762,7 +1662,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()
     }
 
-    /// A small checkbox, drawn: the system's is slow to draw by the hundred.
     private func drawCheckbox(on: Bool, enabled: Bool, at y: CGFloat) {
         let box = NSRect(x: 11, y: y + 3, width: 12, height: 12)
         let path = NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3)
@@ -1806,8 +1705,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         text.draw(with: rect, options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
     }
 
-    // MARK: Text and geometry
-
     private func nameText(_ declaration: StyleDeclaration) -> NSAttributedString {
         let dim = declaration.overridden || !declaration.enabled || declaration.inactive
         let color = !declaration.parsedOK ? InspectorTheme.warning
@@ -1831,7 +1728,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         return attributes
     }
 
-    /// Where a declaration's name, value and colour swatch go.
     private func parts(_ index: Int, y: CGFloat) -> (name: NSRect, value: NSRect, swatch: NSRect?) {
         let name = NSRect(x: 26, y: y + 1, width: min(drawn[index].nameWidth, bounds.width * 0.5), height: 16)
         var x = name.maxX + 4
@@ -1857,7 +1753,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         return out
     }
 
-    /// `style.css:12`, `user agent stylesheet` or nothing for inline styles.
     private func makeSourceText() -> NSAttributedString? {
         let text: String
         switch rule.origin {
@@ -1867,7 +1762,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         default:
             guard let source = rule.source else { return nil }
             var name = URL(string: source)?.lastPathComponent ?? source
-            // A <style> in the page, as DevTools names the document.
             if name.isEmpty || name == "/" { name = "(index)" }
             text = "\(name):\((rule.range?.int("startLine") ?? 0) + 1)"
         }
@@ -1910,8 +1804,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         default: return ""
         }
     }
-
-    // MARK: Clicks
 
     override func resetCursorRects() {
         guard rule.editable else { return }
@@ -1960,8 +1852,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         styles?.setStyleText(rule, rule.text(with: declarations))
     }
 
-    /// The name edited: typing `a: 1` replaces the whole declaration, and
-    /// leaving the name as it was moves on to an empty value.
     private func editName(_ index: Int, at y: CGFloat) {
         guard rule.editable else { return }
         let declaration = rule.declarations[index]
@@ -1987,8 +1877,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         }
     }
 
-    /// A name or value edited: "" removes the declaration; a value with
-    /// several declarations typed (`a: 1; b: 2`) adds them all.
     private func edit(_ index: Int, name: String, value: String) {
         guard rule.editable else { return }
         var declarations = rule.declarations
@@ -2005,7 +1893,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         styles?.setStyleText(rule, rule.text(with: declarations))
     }
 
-    /// `a: 1; b: 2 !important` as declarations.
     static func parse(_ text: String) -> [StyleDeclaration] {
         text.split(separator: ";").compactMap { part in
             let pieces = part.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
@@ -2017,8 +1904,6 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
         }
     }
 
-    /// A new declaration on a line before the brace: its name, then its
-    /// value.
     private func addDeclaration() {
         guard rule.editable, !adding else { return }
         adding = true
@@ -2059,8 +1944,6 @@ private extension Array {
     subscript(safe index: Int) -> Element? { indices.contains(index) ? self[index] : nil }
 }
 
-/// Edits a short text in place over a label: Return or leaving commits,
-/// Escape cancels (nil).
 @MainActor
 enum InlineEditor {
     private final class Delegate: NSObject, NSTextFieldDelegate {
@@ -2092,7 +1975,6 @@ enum InlineEditor {
 
     private nonisolated(unsafe) static var key: UInt8 = 0
 
-    /// Edits over `frame`, in `host`'s coordinates.
     static func edit(_ text: String, at frame: NSRect, in host: NSView, minWidth: CGFloat = 80, done: @escaping (String?) -> Void) {
         let field = NSTextField(string: text)
         field.font = InspectorTheme.mono(11)
@@ -2112,7 +1994,6 @@ enum InlineEditor {
     }
 }
 
-/// Colours in CSS values, for swatches.
 enum CSSColor {
     static func parse(_ value: String) -> NSColor? {
         let text = value.trimmingCharacters(in: .whitespaces).lowercased()
@@ -2152,9 +2033,6 @@ enum CSSColor {
     }
 }
 
-// MARK: - Computed
-
-/// The box model and every computed property, filterable.
 final class ComputedView: FlippedView, NSTableViewDataSource, NSTableViewDelegate {
     weak var model: ElementsModel?
     weak var session: InspectorSession?
@@ -2258,7 +2136,6 @@ final class ComputedView: FlippedView, NSTableViewDataSource, NSTableViewDelegat
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? { InspectorRowView() }
 }
 
-/// Margin, border, padding and content, nested as DevTools draws them.
 final class BoxModelView: NSView {
     var model: JSON? {
         didSet { needsDisplay = true }
@@ -2277,7 +2154,6 @@ final class BoxModelView: NSView {
         func quad(_ name: String) -> [Double] { (model[name] as? [NSNumber])?.map(\.doubleValue) ?? [] }
         let content = quad("content"), padding = quad("padding"), border = quad("border"), margin = quad("margin")
         guard content.count == 8, padding.count == 8, border.count == 8, margin.count == 8 else { return }
-        // Edges: top, right, bottom, left differences between quads.
         func edges(_ outer: [Double], _ inner: [Double]) -> [Double] {
             [inner[1] - outer[1], outer[2] - inner[2], outer[5] - inner[5], inner[0] - outer[0]]
         }
@@ -2320,9 +2196,6 @@ final class BoxModelView: NSView {
     }
 }
 
-// MARK: - Text editing
-
-/// A popover for editing HTML or text, committed with ⌘Return or Save.
 @MainActor
 enum TextEditPopover {
     private final class Controller: NSViewController {
@@ -2393,7 +2266,6 @@ enum TextEditPopover {
         popover.behavior = .transient
         popover.contentViewController = controller
         controller.popover = popover
-        // ⌘Return saves even while the text view has the keyboard.
         let monitor = Monitor()
         monitor.token = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak controller] event in
             guard let controller, controller.view.window?.isKeyWindow == true else { return event }

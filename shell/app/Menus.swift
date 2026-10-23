@@ -1,6 +1,5 @@
 import AppKit
 
-/// Context menus for tabs, folders and spaces.
 @MainActor
 enum Menus {
     static func tab(_ tab: TabInfo, in space: SpaceInfo, store: BrowserStore) -> NSMenu {
@@ -67,7 +66,6 @@ enum Menus {
         return menu
     }
 
-    /// The sidebar's + button: new space or folder.
     static func newItem(store: BrowserStore) -> NSMenu {
         let menu = NSMenu()
         menu.add("New Space…") { store.spaceEditor = SpaceEditorRequest(spaceID: nil) }

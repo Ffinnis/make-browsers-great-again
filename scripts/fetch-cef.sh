@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Downloads the prebuilt Chromium Embedded Framework into third_party/cef/dist.
 set -euo pipefail
 
 CEF_VERSION="154.0.34+g14c5a08+chromium-154.0.8037.98"

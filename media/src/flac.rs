@@ -1,11 +1,5 @@
-//! A small FLAC encoder: fixed predictors and one Rice partition per
-//! subframe. The audio never leaves the machine, so it only has to be
-//! lossless and quick, not small; about half the size of raw PCM keeps it
-//! within the engine's per-SourceBuffer audio budget.
-
 pub const BITS: u32 = 16;
 
-/// The STREAMINFO block for a dfLa box.
 pub fn streaminfo(rate: u32, channels: u32, block: u32) -> [u8; 34] {
     let mut w = BitWriter::default();
     w.put(block, 16);
@@ -15,7 +9,6 @@ pub fn streaminfo(rate: u32, channels: u32, block: u32) -> [u8; 34] {
     w.put(rate, 20);
     w.put(channels - 1, 3);
     w.put(BITS - 1, 5);
-    // Total samples (36 bits) and MD5 stay unknown.
     w.put(0, 4);
     w.put(0, 32);
     let mut out = [0; 34];
@@ -23,7 +16,6 @@ pub fn streaminfo(rate: u32, channels: u32, block: u32) -> [u8; 34] {
     out
 }
 
-/// One frame holding `planes` (one slice per channel, equal lengths).
 pub fn encode_frame(planes: &[Vec<i16>], rate: u32, frame_number: u64) -> Vec<u8> {
     let block = planes.first().map_or(0, Vec::len);
     let mut w = BitWriter::default();
@@ -72,7 +64,6 @@ fn rate_code(rate: u32) -> (u32, Option<(u32, u32)>) {
         48000 => (10, None),
         96000 => (11, None),
         r if r <= 0xffff => (13, Some((r, 16))),
-        // Read from STREAMINFO.
         _ => (0, None),
     }
 }
@@ -120,7 +111,6 @@ fn subframe(w: &mut BitWriter, plane: &[i16]) {
             for &s in &samples[..order] {
                 w.put_signed(s, BITS);
             }
-            // Rice coding with 4-bit parameters, a single partition.
             w.put(0, 2);
             w.put(0, 4);
             w.put(k, 4);
@@ -139,7 +129,6 @@ fn subframe(w: &mut BitWriter, plane: &[i16]) {
     }
 }
 
-/// Residuals of the fixed polynomial predictor of the given order.
 fn residual(s: &[i32], order: usize) -> Vec<i32> {
     (order..s.len())
         .map(|i| match order {
@@ -156,7 +145,6 @@ fn zigzag(r: i32) -> u32 {
     ((r << 1) ^ (r >> 31)) as u32
 }
 
-/// Bits for the residuals with the best Rice parameter, and that parameter.
 fn rice_cost(res: &[i32]) -> (u64, u32) {
     let sum: u64 = res.iter().map(|&r| u64::from(zigzag(r))).sum();
     let mean = sum / (res.len() as u64).max(1);
@@ -168,7 +156,6 @@ fn rice_cost(res: &[i32]) -> (u64, u32) {
             best = (bits, k);
         }
     }
-    // Header: method, partition order, parameter.
     (best.0.saturating_add(10), best.1)
 }
 
@@ -180,7 +167,6 @@ struct BitWriter {
 }
 
 impl BitWriter {
-    /// Writes the low `n` bits of `v`, n <= 32.
     fn put(&mut self, v: u32, n: u32) {
         if n == 0 {
             return;
@@ -244,11 +230,8 @@ mod tests {
     fn frame_header_matches_the_spec() {
         let silent = vec![vec![0i16; 1024], vec![0i16; 1024]];
         let frame = encode_frame(&silent, 44100, 0);
-        // Sync, 1024-sample block at 44.1 kHz, two independent 16-bit
-        // channels, frame 0.
         assert_eq!(&frame[..5], &[0xff, 0xf8, 0xa9, 0x18, 0x00]);
         assert_eq!(frame[5], crc8(&frame[..5]));
-        // Two CONSTANT subframes of 0.
         assert_eq!(&frame[6..12], &[0, 0, 0, 0, 0, 0]);
         let n = frame.len();
         assert_eq!(crc16(&frame[..n - 2]).to_be_bytes(), [frame[n - 2], frame[n - 1]]);

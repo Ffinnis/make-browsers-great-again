@@ -1,24 +1,13 @@
-//! Progressive (non-fragmented) MP4: the sample tables of a moov, and a plan
-//! to deliver them as fragments of a couple of seconds.
-
 use crate::bytes::{child, err, path, Reader, Result};
 use crate::frag::{Sample, NOT_SYNC, SYNC};
 
-/// How long a fragment runs. The worker's decoder carries on from one
-/// fragment to the next, so cuts needn't wait for keyframes, but one at
-/// most `KEYFRAME_SLACK` later is taken instead.
 const FRAGMENT_SECONDS: f64 = 2.0;
 const KEYFRAME_SLACK: f64 = 1.0;
 
-/// The most samples a track may have: over four hours of 60 fps video or
-/// six of AAC. Sample tables are tiny next to what they describe, so this
-/// bounds what a small, broken moov can make the converter allocate.
 pub const MAX_SAMPLES: usize = 1 << 20;
 
-/// Past any real file: 256 TB.
 const MAX_OFFSET: u64 = 1 << 48;
 
-/// A sample with its absolute position in the file.
 pub struct FileSample {
     pub dts: i64,
     pub cto: i64,
@@ -29,19 +18,14 @@ pub struct FileSample {
 }
 
 impl FileSample {
-    /// When the sample ends, in its track's timescale.
     pub fn end_time(&self) -> f64 {
         (self.dts + i64::from(self.duration)) as f64
     }
 
-    /// Where the sample's bytes end in the file.
     pub fn end(&self) -> u64 {
-        // Offsets are checked when the tables are read.
         self.offset.saturating_add(u64::from(self.size))
     }
 
-    /// The sample with its data range relative to `base` in the file, if
-    /// its bytes lie within the `len` bytes there.
     pub fn at(&self, base: u64, len: usize) -> Result<Sample> {
         let start = self.offset.checked_sub(base).and_then(|s| usize::try_from(s).ok());
         let range = start.and_then(|start| Some(start..start.checked_add(self.size as usize)?));
@@ -58,7 +42,6 @@ impl FileSample {
     }
 }
 
-/// Reads one trak's sample tables.
 pub fn samples(trak: &[u8]) -> Result<Vec<FileSample>> {
     let Some(stbl) = path(trak, &[b"mdia", b"minf", b"stbl"])? else {
         return err("trak without stbl");
@@ -85,8 +68,6 @@ pub fn samples(trak: &[u8]) -> Result<Vec<FileSample>> {
         for (count, offset) in pairs(Some(ctts))? {
             let (these, after) = rest.split_at_mut((count as usize).min(rest.len()));
             for s in these {
-                // Version 0 is unsigned on paper, but writers put negative
-                // offsets there too.
                 s.cto = i64::from(offset as i32);
             }
             rest = after;
@@ -169,7 +150,6 @@ fn sizes(stbl: &[u8]) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-/// Fills in file offsets from the chunk tables.
 fn place(stbl: &[u8], samples: &mut [FileSample]) -> Result<()> {
     let mut chunks = Vec::new();
     if let Some(stco) = child(stbl, *b"stco")? {
@@ -236,20 +216,9 @@ fn pairs_of_three(data: Option<&[u8]>) -> Result<Vec<(u32, u32)>> {
     Ok(out)
 }
 
-/// Where each fragment ends, as a decode time in seconds: every
-/// `FRAGMENT_SECONDS`, moved to a video keyframe if one comes within
-/// `KEYFRAME_SLACK` after that, so that fragments start on keyframes where
-/// the file allows and sparse keyframes don't make one huge fragment.
-///
-/// Planned one fragment at a time from where the samples still to go out
-/// start, so a span without samples (a sample whose duration claims years)
-/// is skipped rather than cut into two-second pieces, and every fragment
-/// takes at least one sample: the work is bounded by the sample count.
 pub struct Cuts {
-    /// Video keyframes' decode times in seconds, in order.
     keys: Vec<f64>,
     next_key: usize,
-    /// Where the file's last sample ends.
     end: f64,
 }
 
@@ -261,11 +230,8 @@ impl Cuts {
         Cuts { keys, next_key: 0, end }
     }
 
-    /// The end of the fragment after `start`, the decode time of the first
-    /// sample still to go out.
     pub fn next(&mut self, start: f64) -> f64 {
         let due = start + FRAGMENT_SECONDS;
-        // The last fragment runs longer rather than leave a short one after it.
         if self.end - due <= KEYFRAME_SLACK || !due.is_finite() {
             return f64::INFINITY;
         }
@@ -276,8 +242,6 @@ impl Cuts {
     }
 }
 
-/// For each sample, the lowest file offset of it and every sample after
-/// it: where the bytes still needed start, without rescanning the table.
 pub fn suffix_min_offsets(samples: &[FileSample]) -> Vec<u64> {
     let mut out = vec![0; samples.len()];
     let mut min = u64::MAX;
@@ -288,9 +252,6 @@ pub fn suffix_min_offsets(samples: &[FileSample]) -> Vec<u64> {
     out
 }
 
-/// The top-level boxes of a file so far: the moov's range once it's all
-/// there, or how far the scan got: where the box that isn't all there yet
-/// ends, if it's known and isn't the moov.
 pub enum Scan {
     Moov(std::ops::Range<usize>),
     NeedMore(Option<u64>),
@@ -329,13 +290,11 @@ mod tests {
 
     #[test]
     fn cuts_follow_keyframes_within_the_slack() {
-        // Keyframes every 2.5 s at timescale 10.
         let samples: Vec<FileSample> = (0..100).map(|i| sample(i, i % 25 == 0, 0)).collect();
         let mut cuts = Cuts::new(Some((&samples, 10)), 10.0);
         assert_eq!(cuts.next(0.0), 2.5);
         assert_eq!(cuts.next(2.5), 5.0);
         assert_eq!(cuts.next(5.0), 7.5);
-        // Less than the slack would be left after the next one.
         assert_eq!(cuts.next(7.5), f64::INFINITY);
     }
 

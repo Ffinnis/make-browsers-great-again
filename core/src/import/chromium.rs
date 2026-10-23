@@ -1,13 +1,8 @@
-//! Chrome, Helium, Brave, Edge and other Chromium-based browsers: profiles
-//! from "Local State", bookmarks from each profile's "Bookmarks" file and
-//! open tabs from its newest session file.
-
 use super::{snss, ImportedProfile, ImportedSpace, Item};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Profile directory names and display names, in the browser's own order.
 pub fn profiles(data_dir: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     if let Some(cache) = fs::read(data_dir.join("Local State"))
@@ -25,18 +20,14 @@ pub fn profiles(data_dir: &Path) -> Vec<(String, String)> {
     if out.is_empty() && is_browser_profile(&data_dir.join("Default")) {
         out.push(("Default".into(), "Default".into()));
     }
-    // "Default" first, then "Profile 1", "Profile 2", ... numerically.
     out.sort_by_key(|(dir, _)| dir.strip_prefix("Profile ").and_then(|n| n.parse::<u32>().ok()).map_or(0, |n| n + 1));
     out
 }
 
-/// Electron apps keep a "Local State" too; only browsers have profiles with
-/// bookmarks, history or sessions.
 fn is_browser_profile(dir: &Path) -> bool {
     ["Bookmarks", "History", "Sessions", "Current Session"].iter().any(|f| dir.join(f).exists())
 }
 
-/// One profile's bookmarks and open tabs as a space named `space_name`.
 pub fn load(data_dir: &Path, dir: &str, name: &str, space_name: &str) -> ImportedProfile {
     let profile = data_dir.join(dir);
     let tabs =
@@ -97,8 +88,6 @@ fn bookmark_items(children: &Value) -> Vec<Item> {
         .unwrap_or_default()
 }
 
-/// Chrome 100+ keeps "Sessions/Session_<time>" files; older versions keep
-/// "Current Session". The newest one describes the open tabs.
 fn newest_session(profile: &Path) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = fs::read_dir(profile.join("Sessions"))
         .into_iter()
