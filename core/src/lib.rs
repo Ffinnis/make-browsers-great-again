@@ -83,6 +83,8 @@ pub struct Snapshot {
     /// Something closed this session can be reopened.
     pub can_reopen: bool,
     pub block_ads: bool,
+    /// H.264 and AAC video plays by converting it; new pages only.
+    pub convert_video: bool,
     /// Today tabs untouched this long are archived; 0 is off.
     pub archive_after_hours: u32,
     pub cleanup_answered: bool,
@@ -549,6 +551,7 @@ impl BrowserCore {
             strict_site_isolation: s.policy.strict_site_isolation,
             can_reopen: !s.closed.is_empty(),
             block_ads: s.block_ads,
+            convert_video: s.convert_video,
             archive_after_hours: s.policy.archive_after_hours,
             cleanup_answered: s.cleanup_answered,
             keep_awake_sites: s.keep_awake.clone(),
@@ -1022,6 +1025,14 @@ impl BrowserCore {
     /// Origins that keep a dedicated renderer when strict isolation is off.
     pub fn isolated_origins(&self) -> Vec<String> {
         model::ALWAYS_ISOLATED_ORIGINS.iter().map(ToString::to_string).collect()
+    }
+
+    // ------------------------------------------------------------- video
+
+    /// Whether pages play H.264 and AAC by converting them. The engine
+    /// applies it to pages loaded afterwards.
+    pub fn set_convert_video(&self, enabled: bool) {
+        self.mutate(|s, _| s.convert_video = enabled);
     }
 
     // ---------------------------------------------------------------- misc

@@ -247,6 +247,11 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 /// reaches the delegate as text. Call before the first web view is created.
 + (void)setFormScript:(NSString*)script;
 
+/// Whether pages play H.264 and AAC, which the engine can't decode, by
+/// converting them to VP9 and FLAC as they play (Resources/media/shim.js).
+/// Takes effect for pages loaded afterwards.
++ (void)setConvertsVideo:(BOOL)converts;
+
 /// Whether cookies (and anything else the engine would keep in the
 /// keychain) use a fixed mock key, as development builds do.
 @property(class, nonatomic, readonly) BOOL usesMockKeychain;

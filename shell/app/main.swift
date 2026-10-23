@@ -27,6 +27,7 @@ guard MBEngine.start(
 ) else {
     fatalError("Failed to start the browser engine")
 }
+MBEngine.setConvertsVideo(core.snapshot().convertVideo)
 
 // main.swift runs on the main thread, which is also the engine's UI thread.
 let appDelegate = MainActor.assumeIsolated { AppDelegate(core: core) }

@@ -1,0 +1,8 @@
+# Limits for clippy's size and complexity lints (core/Cargo.toml turns
+# them on); past them, split the function by what it does.
+too-many-lines-threshold = 100
+cognitive-complexity-threshold = 25
+too-many-arguments-threshold = 7
+allow-unwrap-in-tests = true
+allow-print-in-tests = true
+allow-dbg-in-tests = true

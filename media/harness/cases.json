@@ -1,0 +1,180 @@
+[
+  {
+    "name": "x-video",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-av",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "samples/ainit.mp4",
+          "samples/a0.m4s",
+          "samples/a1.m4s",
+          "samples/a2.m4s",
+          "samples/a3.m4s",
+          "samples/a4.m4s",
+          "samples/a5.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-abr",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/s-init.mp4",
+          "samples/s1.m4s",
+          "samples/vinit.mp4",
+          "samples/v2.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-low",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.4D4015\"",
+        "files": [
+          "samples/s-init.mp4",
+          "samples/s0.m4s",
+          "samples/s1.m4s",
+          "samples/s2.m4s",
+          "samples/s3.m4s",
+          "samples/s4.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "samples/lo-init.mp4",
+          "samples/lo0.m4s",
+          "samples/lo1.m4s",
+          "samples/lo2.m4s",
+          "samples/lo3.m4s",
+          "samples/lo4.m4s",
+          "samples/lo5.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "muxed",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d,mp4a.40.2\"",
+        "files": ["fixtures/muxed.mp4"],
+        "split": 7001
+      }
+    ]
+  },
+  {
+    "name": "midgop",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": ["fixtures/midgop.mp4"],
+        "split": 9000
+      }
+    ]
+  },
+  {
+    "name": "fixture-av",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": ["fixtures/video-init.mp4", "fixtures/video-0.m4s", "fixtures/video-1.m4s", "fixtures/video-2.m4s"]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "fixtures/aac-init.mp4",
+          "fixtures/aac-0.m4s",
+          "fixtures/aac-1.m4s",
+          "fixtures/aac-2.m4s",
+          "fixtures/aac-3.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "heaac",
+    "sbs": [
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.5\"",
+        "files": [
+          "fixtures/heaac-init.mp4",
+          "fixtures/heaac-0.m4s",
+          "fixtures/heaac-1.m4s",
+          "fixtures/heaac-2.m4s",
+          "fixtures/heaac-3.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "gif",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": ["fixtures/gif.mp4"]
+      }
+    ]
+  },
+  {
+    "name": "progressive",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": ["fixtures/progressive.mp4"]
+      }
+    ]
+  },
+  {
+    "name": "x-gif",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": ["samples/gif.mp4"]
+      }
+    ]
+  },
+  {
+    "name": "x-fallback",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": ["samples/v.mp4"]
+      }
+    ]
+  }
+]

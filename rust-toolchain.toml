@@ -2,3 +2,5 @@
 [toolchain]
 channel = "1.94.0"
 components = ["clippy", "rustfmt"]
+# media/ builds to WebAssembly for the video converter worker.
+targets = ["wasm32-unknown-unknown"]

@@ -100,6 +100,9 @@ const char kBridgeOrigin[] = "https://mbga-extension.invalid/";
 // While a tab is dragged out of the sidebar, pages refuse drops so the drag
 // can end over a page (and pop the tab out) instead of navigating it.
 bool g_reject_drops = false;
+// H.264 and AAC played by converting them in the page (see
+// shell/resources/media/shim.js), for pages loaded while it's on.
+bool g_convert_video = false;
 
 // Page scripts report the class and id names they see with this prefix.
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
@@ -159,6 +162,71 @@ constexpr char kPauseMediaScript[] =
 constexpr char kResumeMediaScript[] =
     "(function(){document.querySelectorAll('[data-mbga-paused]').forEach("
     "function(m){delete m.dataset.mbgaPaused;m.play();});})();";
+
+// The media shim (see shell/resources/media/shim.js) runs in every frame
+// before the page's scripts. The first time a frame needs to convert video
+// it reports kCodecRequest; the engine asks every frame of the tab whether
+// it was the one, each answering with its own identifier, and sends that
+// frame the converter's worker and WebAssembly module. They're too big to
+// put in every frame, and a page's Content-Security-Policy would keep the
+// shim from fetching them.
+constexpr char kCodecRequest[] = "__mbga_codec";
+constexpr char kCodecFramePrefix[] = "__mbga_codec_frame:";
+// Dedicated workers, whose console the engine doesn't see, call this
+// binding instead; it's added to each as it starts.
+constexpr char kCodecBinding[] = "__mbgaCodecLoad";
+// Cross-site frames and workers are attached to as they start, for the
+// shim. They don't wait for it: a frame waiting for a debugger never went
+// on loading in this engine, even once told to run. The shim reaches a
+// worker before its script, which has to be fetched first, and runs in a
+// frame's first document at once if that started already.
+constexpr char kAutoAttach[] =
+    "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
+    "true}";
+
+// A file from the app's Resources/media, or nil.
+NSString* MediaResource(NSString* name) {
+  NSString* path = [[NSBundle.mainBundle.resourcePath
+      stringByAppendingPathComponent:@"media"]
+      stringByAppendingPathComponent:name];
+  NSData* data = [NSData dataWithContentsOfFile:path];
+  return data ? [[NSString alloc] initWithData:data
+                                      encoding:NSUTF8StringEncoding]
+              : nil;
+}
+
+const std::string& MediaShim() {
+  static const std::string shim = MediaResource(@"shim.js").UTF8String ?: "";
+  return shim;
+}
+
+// What a frame that asked for the converter runs: hands the worker's source
+// and the module, in base64, to the shim. Read once, when a page first needs
+// it.
+const std::string& CodecReply() {
+  static const std::string reply = [] {
+    NSString* worker = MediaResource(@"worker.js");
+    NSString* path = [NSBundle.mainBundle.resourcePath
+        stringByAppendingPathComponent:@"media/mbga_media.wasm"];
+    NSData* wasm = [NSData dataWithContentsOfFile:path];
+    NSString* args = @"null,null";
+    if (worker && wasm) {
+      NSData* json = [NSJSONSerialization dataWithJSONObject:@[
+        worker, [wasm base64EncodedStringWithOptions:0]
+      ]
+                                                     options:0
+                                                       error:nil];
+      args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+      args = [args substringWithRange:NSMakeRange(1, args.length - 2)];
+    }
+    NSString* script = [NSString
+        stringWithFormat:@"(function(f){if(typeof f==='function')f(%@)})("
+                         @"globalThis.__mbgaCodecReady)",
+                         args];
+    return std::string(script.UTF8String);
+  }();
+  return reply;
+}
 
 enum MenuCommand {
   kOpenLinkInNewTab = MENU_ID_USER_FIRST,
@@ -1049,10 +1117,11 @@ class WebClient : public BaseClient,
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     devtools_ = browser->GetHost()->AddDevToolsMessageObserver(this);
-    if (g_page_script || g_extension_script) {
+    if (g_page_script || g_extension_script || g_convert_video) {
       // Scripts for new documents only run with the Page domain enabled.
       browser->GetHost()->ExecuteDevToolsMethod(0, "Page.enable", nullptr);
     }
+    SyncMediaShim(browser);
     [view_ engineDidCreateBrowser:browser];
     if (deferred_url_.empty()) {
       return;
@@ -1163,6 +1232,14 @@ class WebClient : public BaseClient,
       }
       return true;
     }
+    if (text == kCodecRequest) {
+      AskWhoWantsCodec(browser);
+      return true;
+    }
+    if (text.rfind(kCodecFramePrefix, 0) == 0) {
+      SendCodec(browser, text.substr(strlen(kCodecFramePrefix)));
+      return true;
+    }
     if (text.rfind(kThemePrefix, 0) == 0) {
       [view_ engineSetThemeColor:@(text.c_str() + strlen(kThemePrefix))];
       return true;
@@ -1238,6 +1315,7 @@ class WebClient : public BaseClient,
     }
     blocked_ = 0;
     [view_ engineSetBlockedCount:0];
+    codec_sent_.clear();
     console_errors_ = 0;
     console_warnings_ = 0;
     ReportConsole();
@@ -1251,6 +1329,11 @@ class WebClient : public BaseClient,
       frame->ExecuteJavaScript(script.UTF8String, "", 0);
     }
     bool web = url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0;
+    // In case the first page started before the shim was registered; it
+    // runs once per document either way.
+    if (web && media_shim_ && !MediaShim().empty()) {
+      frame->ExecuteJavaScript(MediaShim(), "", 0);
+    }
     form_token_.clear();
     if (web && !g_form_script.empty()) {
       form_token_ = NSUUID.UUID.UUIDString.UTF8String;
@@ -1336,6 +1419,7 @@ class WebClient : public BaseClient,
     if (frame->IsMain()) {
       navigation_started_ = CFAbsoluteTimeGetCurrent();
       load_error_ = 0;
+      SyncMediaShim(browser);
       std::string url = request->GetURL().ToString();
       // The first load after a deferral already has its script.
       if (url == prepared_url_) {
@@ -1497,7 +1581,13 @@ class WebClient : public BaseClient,
   bool OnDevToolsMessage(CefRefPtr<CefBrowser> browser,
                          const void* message,
                          size_t message_size) override {
-    if (session_replies_.empty() && !following_frames_) {
+    if (session_replies_.empty() && !following_frames_ && !media_shim_) {
+      return false;
+    }
+    // The page's own messages, the most of them, carry no session.
+    static const char kSession[] = "\"sessionId\"";
+    if (session_replies_.empty() &&
+        !memmem(message, message_size, kSession, strlen(kSession))) {
       return false;
     }
     NSData* data = [NSData dataWithBytesNoCopy:const_cast<void*>(message)
@@ -1527,34 +1617,53 @@ class WebClient : public BaseClient,
     NSString* session = object[@"sessionId"];
     NSString* method = object[@"method"];
     if (session && method) {
-      HandleEvent(browser, method, object[@"params"]);
+      HandleEvent(browser, method, object[@"params"], session);
       return true;
     }
     return false;
   }
 
+  // |from| is the session of the frame or worker it came from, nil for the
+  // page.
   void HandleEvent(CefRefPtr<CefBrowser> browser,
                    NSString* method,
-                   NSDictionary* params) {
+                   NSDictionary* params,
+                   NSString* from = nil) {
     if (![params isKindOfClass:NSDictionary.class]) {
       return;
     }
     if ([method isEqualToString:@"Target.attachedToTarget"]) {
       NSDictionary* info = params[@"targetInfo"];
       NSString* session = params[@"sessionId"];
-      if (![info[@"type"] isEqualToString:@"iframe"] || !session) {
+      if (!session) {
+        return;
+      }
+      auto ignore = [](bool, const std::string&) {};
+      if (![info[@"type"] isEqualToString:@"iframe"]) {
+        // A worker may play media too (MediaSource in workers).
+        if ([info[@"type"] isEqualToString:@"worker"] && media_shim_) {
+          AddWorkerMediaShim(browser, session.UTF8String);
+        }
+        if ([params[@"waitingForDebugger"] boolValue]) {
+          CallInSession(browser, "Runtime.runIfWaitingForDebugger", "",
+                        session.UTF8String, ignore);
+        }
         return;
       }
       [view_ engineFrameAttached:info[@"targetId"] session:session];
-      // Frames inside it too, and it mustn't wait for a debugger.
-      CallInSession(browser, "Target.setAutoAttach",
-                    "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,"
-                    "\"flatten\":true}",
-                    session.UTF8String, [](bool, const std::string&) {});
+      if (media_shim_ && !MediaShim().empty()) {
+        AddMediaShim(browser, session.UTF8String);
+      }
+      // Frames inside it too.
+      CallInSession(browser, "Target.setAutoAttach", kAutoAttach,
+                    session.UTF8String, ignore);
       if ([params[@"waitingForDebugger"] boolValue]) {
         CallInSession(browser, "Runtime.runIfWaitingForDebugger", "",
-                      session.UTF8String, [](bool, const std::string&) {});
+                      session.UTF8String, ignore);
       }
+    } else if ([method isEqualToString:@"Runtime.bindingCalled"] && from &&
+               [params[@"name"] isEqualToString:@(kCodecBinding)]) {
+      SendWorkerCodec(browser, from);
     } else if ([method isEqualToString:@"Target.detachedFromTarget"]) {
       if (NSString* session = params[@"sessionId"]) {
         [view_ engineFrameDetached:session];
@@ -1569,10 +1678,132 @@ class WebClient : public BaseClient,
       return;
     }
     following_frames_ = true;
+    UpdateAutoAttach(browser);
+  }
+
+  // Cross-site frames are followed for agents, and for the media shim.
+  void UpdateAutoAttach(CefRefPtr<CefBrowser> browser) {
+    bool attach = following_frames_ || media_shim_;
+    if (!attach && !auto_attached_) {
+      return;
+    }
+    auto_attached_ = attach;
     CallRaw(browser, "Target.setAutoAttach",
-            "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
-            "true}",
+            attach ? kAutoAttach
+                   : "{\"autoAttach\":false,\"waitForDebuggerOnStart\":false}",
             [](bool, const std::string&) {});
+  }
+
+  // Registers the media shim, or unregisters it, as the setting says, for
+  // documents from now on.
+  void SyncMediaShim(CefRefPtr<CefBrowser> browser) {
+    bool wanted = g_convert_video && !MediaShim().empty();
+    if (wanted == media_shim_) {
+      return;
+    }
+    media_shim_ = wanted;
+    if (!wanted) {
+      RemoveDocumentScript(browser->GetHost(), media_script_);
+      media_script_.clear();
+      UpdateAutoAttach(browser);
+      return;
+    }
+    Call(browser, "Page.enable", nullptr);
+    CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+    params->SetString("source", MediaShim());
+    CefRefPtr<WebClient> client(this);
+    Call(browser, "Page.addScriptToEvaluateOnNewDocument", params,
+         [client, browser](CefRefPtr<CefDictionaryValue> result) {
+           std::string identifier =
+               result ? result->GetString("identifier").ToString() : "";
+           if (client->media_shim_) {
+             client->media_script_ = identifier;
+           } else {
+             client->RemoveDocumentScript(browser->GetHost(), identifier);
+           }
+         });
+    UpdateAutoAttach(browser);
+  }
+
+  // The same for a cross-site frame's session, as it attaches.
+  void AddMediaShim(CefRefPtr<CefBrowser> browser, const std::string& session) {
+    auto ignore = [](bool, const std::string&) {};
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+      @"source" : @(MediaShim().c_str()),
+      @"runImmediately" : @YES
+    }
+                                                   options:0
+                                                     error:nil];
+    std::string script(static_cast<const char*>(json.bytes), json.length);
+    CallInSession(browser, "Page.enable", "", session, ignore);
+    CallInSession(browser, "Page.addScriptToEvaluateOnNewDocument", script,
+                  session, ignore);
+  }
+
+  // A worker gets the shim before its own script, and the binding it asks
+  // for the converter with.
+  void AddWorkerMediaShim(CefRefPtr<CefBrowser> browser,
+                          const std::string& session) {
+    auto ignore = [](bool, const std::string&) {};
+    CallInSession(browser, "Runtime.addBinding",
+                  std::string("{\"name\":\"") + kCodecBinding + "\"}", session,
+                  ignore);
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+      @"expression" : @(MediaShim().c_str())
+    }
+                                                   options:0
+                                                     error:nil];
+    CallInSession(
+        browser, "Runtime.evaluate",
+        std::string(static_cast<const char*>(json.bytes), json.length), session,
+        ignore);
+  }
+
+  void SendWorkerCodec(CefRefPtr<CefBrowser> browser, NSString* session) {
+    std::string key = std::string("worker:") + session.UTF8String;
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - codec_sent_[key] < 5) {
+      return;
+    }
+    codec_sent_[key] = now;
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+      @"expression" : @(CodecReply().c_str())
+    }
+                                                   options:0
+                                                     error:nil];
+    CallInSession(
+        browser, "Runtime.evaluate",
+        std::string(static_cast<const char*>(json.bytes), json.length),
+        session.UTF8String, [](bool, const std::string&) {});
+  }
+
+  // Asks each frame of the tab whether it's waiting for the converter;
+  // the ones that are reply with their identifier.
+  void AskWhoWantsCodec(CefRefPtr<CefBrowser> browser) {
+    std::vector<CefString> frames;
+    browser->GetFrameIdentifiers(frames);
+    for (const CefString& id : frames) {
+      CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(id);
+      if (!frame) {
+        continue;
+      }
+      std::string probe =
+          "typeof __mbgaCodecReady==='function'&&__mbgaCodecReady.who('" +
+          std::string(kCodecFramePrefix) + id.ToString() + "')";
+      frame->ExecuteJavaScript(probe, "", 0);
+    }
+  }
+
+  // Sends the converter to a frame, at most every few seconds each: a page
+  // could ask over and over.
+  void SendCodec(CefRefPtr<CefBrowser> browser, const std::string& id) {
+    CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(id);
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (!frame || now - codec_sent_[id] < 5) {
+      return;
+    }
+    codec_sent_[id] = now;
+    frame->ExecuteJavaScript(CodecReply(), "", 0);
   }
 
   // Sends a command to a frame's session as a raw message.
@@ -2043,6 +2274,12 @@ class WebClient : public BaseClient,
   std::map<int, RawReply> session_replies_;
   int next_session_message_ = 1000000000;
   bool network_enabled_ = false;
+  // The media shim: registered for this tab's documents (and its frames'),
+  // its identifier, and when frames were last sent the converter.
+  bool media_shim_ = false;
+  bool auto_attached_ = false;
+  std::string media_script_;
+  std::map<std::string, CFAbsoluteTime> codec_sent_;
 
   IMPLEMENT_REFCOUNTING(WebClient);
 };
@@ -2398,6 +2635,10 @@ class CookieKeys : public CefCookieVisitor {
 
 + (void)setFormScript:(NSString*)script {
   g_form_script = script.UTF8String;
+}
+
++ (void)setConvertsVideo:(BOOL)converts {
+  g_convert_video = converts;
 }
 
 + (BOOL)usesMockKeychain {

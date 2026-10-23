@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Checks that the code is formatted and passes every linter and the core's
-# tests. CI and the pre-commit hook run it; a change that fails it doesn't go
-# in. Pass --fix to format everything and apply the linters' safe fixes
-# first, then check what's left.
+# Checks that the code is formatted and passes every linter and the Rust
+# crates' tests. CI and the pre-commit hook run it; a change that fails it
+# doesn't go in. Pass --fix to format everything and apply the linters' safe
+# fixes first, then check what's left.
 #
 # Tools: `brew bundle` installs them from the Brewfile; Rust comes from
 # rust-toolchain.toml and ruff runs through uv at the version pinned below.
@@ -58,6 +58,8 @@ SHELL_SCRIPTS=(scripts/*.sh .githooks/*)
 if [[ "$FIX" == 1 ]]; then
   cargo fmt --manifest-path core/Cargo.toml
   cargo clippy --manifest-path core/Cargo.toml --all-targets --fix --allow-dirty --allow-staged --quiet
+  cargo fmt --manifest-path media/Cargo.toml
+  cargo clippy --manifest-path media/Cargo.toml --all-targets --fix --allow-dirty --allow-staged --quiet
   swiftformat --quiet .
   swiftlint lint --fix --quiet
   clang-format -i "${OBJC[@]}"
@@ -69,6 +71,9 @@ fi
 step "rustfmt" cargo fmt --manifest-path core/Cargo.toml --check
 step "clippy" cargo clippy --manifest-path core/Cargo.toml --all-targets --quiet -- -D warnings
 step "cargo test" cargo test --manifest-path core/Cargo.toml --quiet
+step "rustfmt (media)" cargo fmt --manifest-path media/Cargo.toml --check
+step "clippy (media)" cargo clippy --manifest-path media/Cargo.toml --all-targets --quiet -- -D warnings
+step "cargo test (media)" cargo test --manifest-path media/Cargo.toml --quiet
 step "swiftformat" swiftformat --lint --quiet .
 step "swiftlint" scripts/swiftlint-ratchet.py
 step "clang-format" clang-format --dry-run --Werror "${OBJC[@]}"

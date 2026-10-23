@@ -1,0 +1,55 @@
+[package]
+name = "mbga-media"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# AAC-LC decoding in pure Rust. MPL-2.0. The engine has no AAC decoder.
+symphonia-codec-aac = "0.6.1"
+symphonia-core = "0.6.1"
+
+# The module ships inside the app, so it's built for size.
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Fixtures decode fast enough unoptimized, but AAC decoding is slow there.
+[profile.test]
+opt-level = 1
+
+# Same lints as core/, which scripts/check.sh runs with -D warnings.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_qualifications = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+# Bit fields and box types read best as written in the specs.
+unreadable_literal = "allow"
+# Media math moves between widths constantly; every narrowing is checked or
+# bounded by the format.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+undocumented_unsafe_blocks = "warn"
+cognitive_complexity = "warn"

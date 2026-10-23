@@ -226,6 +226,10 @@ pub struct State {
     /// Sites (see `site_of`) where ads and trackers are allowed.
     #[serde(default)]
     pub ads_allowed: Vec<String>,
+    /// Play H.264 and AAC video, which the engine can't decode, by
+    /// converting it in the page.
+    #[serde(default = "default_convert_video")]
+    pub convert_video: bool,
     /// Closed tabs and folders that can be reopened, newest last.
     #[serde(skip)]
     pub closed: Vec<Closed>,
@@ -244,6 +248,10 @@ fn default_onboarded() -> bool {
 }
 
 fn default_block_ads() -> bool {
+    true
+}
+
+fn default_convert_video() -> bool {
     true
 }
 
@@ -267,6 +275,7 @@ impl State {
             cleanup_answered: false,
             block_ads: true,
             ads_allowed: Vec::new(),
+            convert_video: true,
             closed: Vec::new(),
             shown_elsewhere: Vec::new(),
         };

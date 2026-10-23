@@ -351,3 +351,18 @@ final class Updater {
 private extension SHA256.Digest {
     var hex: String { map { String(format: "%02x", $0) }.joined() }
 }
+
+extension Updater {
+    /// Where updating stands, for Settings.
+    var statusText: String {
+        let version = "This is MBGA \(currentVersion)."
+        guard available else { return "\(version) Built from source, it doesn't update itself." }
+        switch state {
+        case .checking: return "\(version) Checking for updates…"
+        case .downloading(let next): return "\(version) Downloading \(next)…"
+        case .upToDate: return "\(version) It's the latest version."
+        case .failed(let problem): return "\(version) \(problem)."
+        case .idle: return "\(version) Updates download in the background and install when you restart."
+        }
+    }
+}

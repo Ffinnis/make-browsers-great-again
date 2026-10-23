@@ -51,6 +51,9 @@ saved passwords then sits in `passwords.key` in the data folder.
 - `core/`: Rust. Spaces, profiles, tabs, favorites, folders, persistence,
   tab sleep policy, omnibox, ad blocking, imports and passwords. Exposed to
   Swift through UniFFI.
+- `media/`: Rust built to WebAssembly. Converts H.264 and AAC, which the
+  engine can't decode, to VP9 and FLAC inside pages; the page script and
+  worker that run it are in `shell/resources/media/`.
 - `shell/engine/`: Objective-C++ bridge to CEF (`MBEngine`).
 - `shell/helper/`: entry point of Chromium's subprocesses.
 - `shell/app/`: the AppKit UI.
