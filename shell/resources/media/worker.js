@@ -28,6 +28,7 @@ const GROUP = 32;
 const KEY = 1;
 const DECODE_ONLY = 2;
 const FLUSH = 4;
+const FINISH = 8;
 const ENCODE_KEY = 2;
 const VP9 = 'vp09.00.41.08';
 
@@ -47,13 +48,19 @@ const TIMEOUT = 20000;
 // waits in it: WebAssembly memory never shrinks.
 const BIG_MEMORY = () => tune.bigMemory || 64 << 20;
 // A stream that gets nothing for this long (a paused, hidden or finished
-// player) closes its codecs: a VP9 encoder holds tens of MB.
-const REST = () => tune.rest || 8000;
+// player) closes its codecs: a VP9 encoder holds tens of MB. Longer than
+// the shim waits to append ahead of the playhead (10 s), and than it waits
+// between keepalives of a paused progressive download, so a player that
+// fetches a long segment at a time doesn't replay a GOP for each.
+const REST = () => tune.rest || 20000;
 // A page's element smaller than this is hidden or collapsed: its size
 // says nothing about how big the video will be shown.
 const MIN_DISPLAY = 32;
 // The displayed size has to change by more than this to re-encode at it.
 const HYSTERESIS = 0.25;
+// And the frame rate by more than this to change the encoder's between
+// keyframes: its rate control is told the frame rate it gets.
+const FPS_CHANGE = 0.1;
 // The most bits per pixel to encode at: 6 Mbps at 1080p30.
 const BPP = 0.1;
 
@@ -67,6 +74,7 @@ const stats = {
   keys: 0,
   encodedBytes: 0,
   resized: 0,
+  rerated: 0,
   recycled: 0,
   rested: 0,
 };
@@ -138,13 +146,19 @@ function refuse(msg) {
 function dispatch(msg) {
   let stream = streams.get(msg.sb);
   if (!stream) {
-    if (msg.type === 'close') return;
+    if (msg.type === 'close' || msg.type === 'keepalive') return;
     stream = new Stream(msg.sb);
     streams.set(msg.sb, stream);
   }
   if (msg.type === 'size') {
+    // The next frame decoded is encoded to fit.
     stream.display = { width: msg.width, height: msg.height };
     stream.fps = msg.fps > 0 ? msg.fps : 0;
+    return;
+  }
+  if (msg.type === 'keepalive') {
+    // A progressive download paused ahead of the playhead: not idle.
+    stream.rest();
     return;
   }
   if (msg.type === 'close') streams.delete(msg.sb);
@@ -195,14 +209,18 @@ class Stream {
     this.sb = sb;
     this.queue = Promise.resolve();
     this.progressive = false;
+    // Where a progressive file starts playing (open's `start`), seconds.
+    this.startAt = 0;
     this.ex = null;
     this.h = 0;
     // The last input init segment, to start over with if the module traps.
     this.init = null;
     this.initGeneration = 0;
     this.mime = '';
-    // Device pixels of the element showing this SourceBuffer, if known,
-    // and the most frames a second worth encoding for it (0: all).
+    // The size the shim wants the video encoded at most (it decides: the
+    // element's device pixels, CSS pixels on battery, the source's size
+    // for an element sized by the video), and the most frames a second
+    // worth encoding for it (0: all).
     this.display = null;
     this.fps = 0;
     // Per video track id: its decoder, encoder and what's in flight.
@@ -215,6 +233,7 @@ class Stream {
       case 'open':
         this.close();
         this.progressive = msg.mime === 'progressive';
+        this.startAt = this.progressive && msg.start > 0 ? msg.start : 0;
         this.init = null;
         this.initGeneration = 0;
         this.mime = '';
@@ -275,6 +294,7 @@ class Stream {
     spare = null;
     this.ex = instance.exports;
     this.h = this.ex.mm_create(this.progressive ? 1 : 0);
+    if (this.startAt) this.ex.mm_start(this.h, this.startAt);
     this.initGeneration = 0;
     if (this.init) {
       this.push(this.init);
@@ -328,7 +348,11 @@ class Stream {
       if (!this.h) this.start();
       this.checkCodecs();
       this.ex.mm_begin(this.h, msg.seq);
-      this.push(bytes);
+      // A progressive file's bytes say where they start: ones sent before
+      // the shim heard of `need` aren't where the converter is now, and
+      // are dropped (the reply is empty).
+      const offset = this.progressive && typeof msg.offset === 'number' ? msg.offset : -1;
+      if (offset < 0 || this.ex.mm_offset(this.h, offset)) this.push(bytes);
       bytes = null;
       for (;;) {
         const status = this.ex.mm_poll(this.h);
@@ -394,11 +418,26 @@ class Stream {
       const bytes = this.copy(ex.mm_output_ptr(h), ex.mm_output_len(h));
       out.bytes = bytes.buffer;
       transfer.push(bytes.buffer);
-      if (ex.mm_inits(h) > 0 && ex.mm_natural_width(h) > 0) {
-        // The input's display size: the converted video may be encoded
-        // smaller, and the page should see the size it would have.
-        out.natural = { width: ex.mm_natural_width(h), height: ex.mm_natural_height(h) };
+      // The times the media in `bytes` covers, so the shim can drop it if
+      // the page removes them before it's appended.
+      const start = ex.mm_output_start(h);
+      if (Number.isFinite(start)) out.range = { start, end: ex.mm_output_end(h) };
+      if (ex.mm_natural_width(h) > 0) {
+        // The input's display size, from the first frame at it on: the
+        // converted video may be encoded smaller, and the page should see
+        // the size it would have. The first comes with the first init and
+        // applies at once.
+        const natural = { width: ex.mm_natural_width(h), height: ex.mm_natural_height(h) };
+        const at = ex.mm_natural_at(h);
+        if (Number.isFinite(at)) natural.at = at;
+        const seq = ex.mm_natural_seq(h);
+        if (seq !== msg.seq) natural.seq = seq;
+        out.natural = natural;
       }
+      // A progressive file's next bytes aren't the ones after the last:
+      // the shim goes on from this offset.
+      const need = ex.mm_need(h);
+      if (need >= 0) out.need = need;
       ex.mm_output_clear(h);
       const mime = this.string('mime');
       if (mime !== this.mime) {
@@ -522,6 +561,18 @@ class Stream {
   // Feeds one track's samples to its decoder, as fast as the encoder keeps
   // up. Frames come out through output() and are encoded there.
   async decode(track, samples) {
+    if (samples.every((s) => s.flags & FINISH)) {
+      // Nothing to decode: a new init replaces the stream, and what the
+      // codecs hold of the old one comes out first.
+      const v = this.video.get(track);
+      if (v) {
+        if (v.decoder.state === 'configured') await within(v.decoder.flush(), 'decoding');
+        if (v.encoder && v.encoder.state === 'configured') await within(v.encoder.flush(), 'encoding');
+        if (v.error) throw v.error;
+      }
+      this.ex.mm_flushed(this.h, track);
+      return;
+    }
     const v = this.track(track);
     const codec = 'avc1.' + samples[0].codec.toString(16).padStart(6, '0');
     if (v.codec !== codec) {
@@ -542,7 +593,13 @@ class Stream {
     for (const s of samples) {
       await this.room(v);
       if (v.error) throw v.error;
-      if (s.flags & DECODE_ONLY) stats.decodeOnly++;
+      if (s.flags & DECODE_ONLY) {
+        stats.decodeOnly++;
+      } else if (s.flags & KEY) {
+        // Keyframes to come, which the frame-rate cap keeps anyway.
+        v.keys.push(s.timestamp);
+        if (v.keys.length > 256) v.keys.shift();
+      }
       flush ||= !!(s.flags & FLUSH);
       // Looked up each time: memory may have grown meanwhile.
       const data = new Uint8Array(this.ex.memory.buffer, this.ex.mm_job_data(this.h) + s.offset, s.len);
@@ -579,8 +636,10 @@ class Stream {
       outHeight: 0,
       bitrate: 0,
       framerate: 30,
-      // With a frame-rate cap, the first timestamp to encode again.
-      nextKept: -Infinity,
+      // With a frame-rate cap, which frames it keeps (see capped()), and
+      // the timestamps of keyframes fed and not out yet.
+      cadence: null,
+      keys: [],
       active: 0,
       error: null,
       wake: null,
@@ -639,19 +698,69 @@ class Stream {
       // The module says which frames it will write, and which are
       // keyframes, so the encoder gets exactly those, in order. Frames
       // past the frame-rate cap are left out where the module can make the
-      // one before last longer.
-      const skip = this.fps > 0 && ts < v.nextKept;
-      const what = this.ex.mm_frame(this.h, v.track, ts, skip ? 1 : 0);
+      // one before last longer. The visible size is what the page's
+      // videoWidth and videoHeight follow (an avc3 stream's SPS can change
+      // it at any keyframe).
+      while (v.keys.length && v.keys[0] < ts) v.keys.shift();
+      const slot = this.capped(v, ts);
+      const skip = slot < 0;
+      const rect = frame.visibleRect;
+      const width = rect ? rect.width : frame.displayWidth;
+      const height = rect ? rect.height : frame.displayHeight;
+      const what = this.ex.mm_frame(this.h, v.track, ts, skip ? 1 : 0, width, height);
       if (!what) {
         stats[skip ? 'capped' : 'dropped']++;
         return;
       }
-      if (this.fps > 0) v.nextKept = ts + 1e6 / this.fps - 5e5 / v.framerate;
+      this.kept(v, ts, slot, what === ENCODE_KEY);
       this.encode(v, frame, what === ENCODE_KEY);
     } catch (e) {
       v.error ||= e;
     } finally {
       frame.close();
+    }
+  }
+
+  // The frame-rate cap keeps at most one frame in each 1/fps slot of a grid
+  // that starts at the first frame kept: a steady cadence (24 fps becomes
+  // 15 as 2 of every 3 frames kept, then 1 of 2, and so on), where
+  // spacing each kept frame from the one before would keep every second
+  // frame of anything under twice the cap (12 fps of 24). A frame counts
+  // as in a slot from half a frame before it, so source timestamps that
+  // land a microsecond early don't skip one. The grid starts over at
+  // keyframes, which are always kept, and where the timeline jumps or the
+  // cap changes; a frame is also left out for a keyframe later in its
+  // slot. Returns the frame's slot, or -1 to leave it out.
+  capped(v, ts) {
+    const fps = this.fps;
+    if (!(fps > 0)) {
+      v.cadence = null;
+      return 0;
+    }
+    const period = 1e6 / fps;
+    const half = Math.min(period, 1e6 / v.framerate) / 2;
+    let c = v.cadence;
+    if (!c || c.fps !== fps || ts <= c.last || ts - c.last > 1e6) {
+      c = v.cadence = { fps, origin: ts, slot: -1, last: ts, half, period };
+    }
+    c.last = ts;
+    const slotOf = (t) => Math.floor((t - c.origin + c.half) / c.period);
+    const slot = slotOf(ts);
+    if (slot <= c.slot) return -1;
+    if (v.keys.some((k) => k > ts && slotOf(k) === slot)) return -1;
+    return slot;
+  }
+
+  // A frame went to the encoder: its slot is taken, or the grid starts
+  // over at it if it's a keyframe.
+  kept(v, ts, slot, key) {
+    const c = v.cadence;
+    if (!c) return;
+    if (key) {
+      c.origin = ts;
+      c.slot = 0;
+    } else {
+      c.slot = Math.max(c.slot, slot);
     }
   }
 
@@ -674,6 +783,7 @@ class Stream {
     const config = this.target(v, width, height, key);
     let keyFrame = key;
     if (config !== v.config) {
+      const resized = !v.config || v.config.width !== config.width || v.config.height !== config.height;
       const options = {
         codec: VP9,
         width: config.width,
@@ -687,11 +797,13 @@ class Stream {
       } else {
         options.bitrate = this.bitrate(v, config);
       }
+      // The same size keeps the encoder going (only its rate control
+      // changes, without a keyframe); another starts it over at this
+      // frame, a keyframe, which gets an init of its own.
       v.encoder.configure(options);
-      if (v.config && (v.config.width !== config.width || v.config.height !== config.height)) stats.resized++;
+      if (v.config) stats[resized ? 'resized' : 'rerated']++;
       v.config = config;
-      // A new configuration starts with a keyframe anyway.
-      keyFrame = true;
+      if (resized) keyFrame = true;
     }
     const options = { keyFrame };
     if (tune.quantizer) options.vp9 = { quantizer: tune.quantizer };
@@ -699,13 +811,14 @@ class Stream {
     v.encoder.encode(frame, options);
   }
 
-  // The size to encode at: the source's, or smaller to fit the element
-  // showing it, keeping the aspect ratio. Changes only at keyframes, and
-  // for a displayed size only when it differs by more than HYSTERESIS.
+  // The size to encode at: the source's, or smaller to fit the size the
+  // shim gives, keeping the aspect ratio, and the frame rate the encoder
+  // gets. A new size applies at once (a video scrolled into view gets
+  // sharp at the next frame), if it differs by more than HYSTERESIS; a new
+  // frame rate too, if by more than FPS_CHANGE, and exactly at keyframes.
   target(v, width, height, key) {
     const current = v.config;
     const sameSource = current && current.sourceWidth === width && current.sourceHeight === height;
-    if (sameSource && !key) return current;
     // Frames a second the encoder gets, for its rate control.
     const fps = this.fps > 0 ? Math.min(v.framerate, this.fps) : v.framerate;
     let scale = 1;
@@ -715,8 +828,9 @@ class Stream {
     } else if (sameSource) {
       scale = current.scale;
     }
-    if (sameSource && Math.abs(scale - current.scale) <= HYSTERESIS * current.scale && fps === current.fps) {
-      return current;
+    if (sameSource && Math.abs(scale - current.scale) <= HYSTERESIS * current.scale) {
+      const same = key ? fps === current.fps : Math.abs(fps - current.fps) <= FPS_CHANGE * current.fps;
+      return same ? current : { ...current, fps };
     }
     const even = (x) => Math.max(2, Math.round(x / 2) * 2);
     return {

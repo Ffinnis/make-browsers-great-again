@@ -14,5 +14,6 @@ mod progressive;
 
 pub use bytes::Error;
 pub use conv::{
-    Converter, HeldGroup, Job, JobSample, Poll, DECODE_ONLY, DROP, ENCODE, ENCODE_KEY, FLUSH, KEY, MAX_INPUT,
+    Converter, HeldGroup, Job, JobSample, Natural, Poll, DECODE_ONLY, DROP, ENCODE, ENCODE_KEY, FINISH, FLUSH, KEY,
+    MAX_INPUT,
 };

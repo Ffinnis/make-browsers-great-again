@@ -152,16 +152,25 @@ pub unsafe extern "C" fn mm_job_data(h: *mut Converter) -> *const u8 {
     unsafe { conv(h) }.and_then(|c| c.job()).map_or(std::ptr::null(), |j| j.data.as_ptr())
 }
 
-/// The decoder put out the frame with `timestamp`: 1 to encode it, 2 to
-/// encode it as a keyframe, 0 to drop it. `skip` != 0 asks to leave it out
-/// to cap the frame rate, which the converter allows unless it can't.
+/// The decoder put out the frame with `timestamp`, whose visible size is
+/// `width` × `height` (0 if unknown): 1 to encode it, 2 to encode it as a
+/// keyframe, 0 to drop it. `skip` != 0 asks to leave it out to cap the
+/// frame rate, which the converter allows unless it can't.
 ///
 /// # Safety
 /// See `conv`.
 #[no_mangle]
-pub unsafe extern "C" fn mm_frame(h: *mut Converter, track: u32, timestamp: f64, skip: u32) -> u32 {
+pub unsafe extern "C" fn mm_frame(
+    h: *mut Converter,
+    track: u32,
+    timestamp: f64,
+    skip: u32,
+    width: u32,
+    height: u32,
+) -> u32 {
+    let visible = (width.min(0xffff) as u16, height.min(0xffff) as u16);
     // SAFETY: forwarded contract.
-    unsafe { conv(h) }.map_or(0, |c| c.frame(track, timestamp, skip != 0))
+    unsafe { conv(h) }.map_or(0, |c| c.frame(track, timestamp, skip != 0, visible))
 }
 
 /// Room for an encoded chunk of `len` bytes, for `mm_chunk`.
@@ -410,6 +419,67 @@ pub unsafe extern "C" fn mm_output_discard(h: *mut Converter) {
     }
 }
 
+/// Where a progressive file starts playing, in seconds (`open`'s `start`).
+/// Before any input.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_start(h: *mut Converter, seconds: f64) {
+    // SAFETY: forwarded contract.
+    if let Some(c) = unsafe { conv(h) } {
+        c.set_start(seconds);
+    }
+}
+
+/// The next append of a progressive file starts at byte `offset` of it:
+/// 1 to take it, 0 to drop it (it isn't where the converter left off, nor
+/// where `mm_need` asked for).
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_offset(h: *mut Converter, offset: f64) -> u32 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
+        return 0;
+    };
+    if !(0.0..9_007_199_254_740_992.0).contains(&offset) {
+        return 0;
+    }
+    u32::from(c.offset(offset as u64))
+}
+
+/// The byte offset of the file a progressive stream needs next, if it
+/// isn't where the input left off; -1 if not.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_need(h: *mut Converter) -> f64 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.need).map_or(-1.0, |n| n as f64)
+}
+
+/// The output's presentation time range in seconds, on the stream's own
+/// timeline; NaN without media in the output.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_output_start(h: *mut Converter) -> f64 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.output_range).map_or(f64::NAN, |r| r.0)
+}
+
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_output_end(h: *mut Converter) -> f64 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.output_range).map_or(f64::NAN, |r| r.1)
+}
+
 /// How many converted inits the output and `held` have.
 ///
 /// # Safety
@@ -421,14 +491,14 @@ pub unsafe extern "C" fn mm_inits(h: *mut Converter) -> u32 {
 }
 
 /// The input video's display width and height, as the engine would show
-/// it unconverted; 0 without video.
+/// it unconverted, if it changes in the output or `held`; 0 if not.
 ///
 /// # Safety
 /// See `conv`.
 #[no_mangle]
 pub unsafe extern "C" fn mm_natural_width(h: *mut Converter) -> u32 {
     // SAFETY: forwarded contract.
-    unsafe { conv(h) }.and_then(|c| c.natural()).map_or(0, |n| n.0)
+    unsafe { conv(h) }.and_then(|c| c.natural_out).map_or(0, |n| n.width)
 }
 
 /// # Safety
@@ -436,7 +506,28 @@ pub unsafe extern "C" fn mm_natural_width(h: *mut Converter) -> u32 {
 #[no_mangle]
 pub unsafe extern "C" fn mm_natural_height(h: *mut Converter) -> u32 {
     // SAFETY: forwarded contract.
-    unsafe { conv(h) }.and_then(|c| c.natural()).map_or(0, |n| n.1)
+    unsafe { conv(h) }.and_then(|c| c.natural_out).map_or(0, |n| n.height)
+}
+
+/// Where the first frame at that size is shown, in seconds on the stream's
+/// own timeline; NaN for a size that applies at once.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_natural_at(h: *mut Converter) -> f64 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.natural_out).and_then(|n| n.at).unwrap_or(f64::NAN)
+}
+
+/// The append that frame came in.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_natural_seq(h: *mut Converter) -> f64 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.natural_out).map_or(f64::NAN, |n| n.seq)
 }
 
 /// # Safety

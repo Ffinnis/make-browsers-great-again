@@ -917,9 +917,11 @@ class BrowserApp : public CefApp {
     // Smaller caches and heap budgets throughout Blink and V8.
     AppendDefaultSwitch(command_line, "enable-low-end-device-mode");
     AppendDefaultSwitch(command_line, "js-flags", "--optimize-for-size");
-    // Except Media Source audio, which low-end mode keeps to about 2 MB: the
-    // FLAC that converted AAC becomes (shell/resources/media) is eight times
-    // the size, so that's only 20 seconds. 12 MB is the desktop default.
+    // Except Media Source audio, which low-end mode keeps to 2 MB (and video
+    // to 30 MB): the FLAC that converted AAC becomes (shell/resources/media)
+    // is eight times the size, so that's only 20 seconds. 12 MB is the
+    // desktop default. Renderers get this switch; measured by appending
+    // FLAC until QuotaExceededError: 1.6 MB fit without it, 11.5 MB with.
     AppendDefaultSwitch(command_line, "mse-audio-buffer-size-limit-mb", "12");
 
     if (g_pipe_write >= 0) {
@@ -1142,8 +1144,10 @@ class PopupMedia : public CefDevToolsMessageObserver {
          });
   }
 
-  // As WebClient does for tabs: workers get the shim and are let go,
-  // frames keep their session for the shim in their later documents.
+  // As WebClient does for tabs: workers get the shim and keep their
+  // session for as long as they live, so the workers they start get it
+  // too (the converter's own worker needs nothing and is let go); frames
+  // keep theirs for the shim in their later documents.
   void Attached(CefRefPtr<CefBrowser> browser,
                 NSDictionary* params,
                 NSString* from) {

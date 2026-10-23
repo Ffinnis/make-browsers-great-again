@@ -55,6 +55,23 @@
           "samples/s1.m4s",
           "samples/vinit.mp4",
           "samples/v2.m4s"
+        ],
+        "naturals": [
+          [
+            720,
+            1280,
+            null
+          ],
+          [
+            320,
+            568,
+            3
+          ],
+          [
+            720,
+            1280,
+            6
+          ]
         ]
       }
     ]
@@ -279,7 +296,14 @@
           "0": {
             "abort": true
           }
-        }
+        },
+        "naturals": [
+          [
+            720,
+            1280,
+            null
+          ]
+        ]
       }
     ]
   },
@@ -589,5 +613,329 @@
         }
       }
     ]
+  },
+  {
+    "name": "init-replace",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "3": {
+            "patch": [
+              {
+                "box": "mvhd",
+                "set": {
+                  "12": 12345
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "cadence-24",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate24.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-25",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate25.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-30",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate30.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-50",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate50.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-60",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate60.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "x-uncap",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              360,
+              640,
+              10
+            ]
+          },
+          "3": {
+            "size": [
+              360,
+              640,
+              0
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rerated": 1,
+      "resized": [
+        0,
+        0
+      ]
+    }
+  },
+  {
+    "name": "avc3",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc3.64000d\"",
+        "files": [
+          "fixtures/avc3.mp4"
+        ],
+        "split": 9000,
+        "naturals": [
+          [
+            320,
+            180,
+            null
+          ],
+          [
+            480,
+            270,
+            1.067
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "name": "progressive-start",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "split": 4096,
+        "start": 1.2,
+        "needs": 1
+      }
+    ],
+    "expected": [
+      [
+        1.0,
+        2.0
+      ]
+    ],
+    "expectStats": {
+      "decoded": [
+        28,
+        34
+      ]
+    }
+  },
+  {
+    "name": "moov-last",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "samples/big-last.mp4"
+        ],
+        "split": 262144,
+        "needs": 2
+      }
+    ]
+  },
+  {
+    "name": "moov-last-start",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "samples/big-last.mp4"
+        ],
+        "split": 262144,
+        "start": 20.5,
+        "needs": 2
+      }
+    ],
+    "expected": [
+      [
+        20.0,
+        30.0
+      ]
+    ],
+    "expectStats": {
+      "decoded": [
+        290,
+        330
+      ]
+    }
+  },
+  {
+    "name": "keepalive",
+    "tune": {
+      "rest": 300
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "2": {
+            "wait": 1000,
+            "keepalive": true
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rested": [
+        0,
+        0
+      ]
+    }
   }
 ]

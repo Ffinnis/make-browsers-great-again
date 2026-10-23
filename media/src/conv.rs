@@ -27,7 +27,7 @@ const MAX_GOP: usize = 1200;
 const MAX_GOP_BYTES: usize = 32 << 20;
 
 /// Changes whenever `save_state`'s layout does.
-const STATE_VERSION: u32 = 1;
+const STATE_VERSION: u32 = 2;
 
 fn put_opt(w: &mut Writer, v: Option<i64>) {
     w.u8(u8::from(v.is_some()));
@@ -59,6 +59,13 @@ pub const DECODE_ONLY: u32 = 2;
 /// next fragment starts at a keyframe (or, for MSE segments, every one so
 /// far has), so nothing is lost by starting over.
 pub const FLUSH: u32 = 4;
+/// No data: only flush the decoder, so the frames of a stream that a new,
+/// different init replaces all come out, and are written, before it does.
+pub const FINISH: u32 = 8;
+
+/// While looking for a progressive file's moov, a box this much bigger than
+/// the bytes so far is skipped: the worker asks for the bytes after it.
+const SKIP_BOX: u64 = 1 << 20;
 
 /// A sample for the worker to decode, laid out for reading from JS.
 #[repr(C)]
@@ -239,6 +246,8 @@ struct Frame {
     run: u64,
     /// An IDR picture: encoded as a keyframe.
     key: bool,
+    /// The decoded picture's visible size, (0, 0) if unknown.
+    visible: (u16, u16),
 }
 
 /// An encoded frame waiting to be written.
@@ -249,6 +258,7 @@ struct Chunk {
     seq: f64,
     key: bool,
     size: (u16, u16),
+    visible: (u16, u16),
     data: Vec<u8>,
 }
 
@@ -273,6 +283,9 @@ struct VideoOut {
     /// The run and presentation time of the last frame sent to the encoder,
     /// which a frame left out to cap the frame rate extends.
     last_kept: Option<(u64, i64)>,
+    /// The display size of the last frame written, as the engine would
+    /// show the input.
+    natural: Option<(u32, u32)>,
 }
 
 impl VideoOut {
@@ -331,8 +344,6 @@ struct Table {
 }
 
 struct Progressive {
-    /// Absolute file offset of the input's first byte.
-    base: u64,
     tables: Vec<Table>,
     cuts: Cuts,
     /// Where the fragment being gathered ends, once planned, and where the
@@ -344,7 +355,7 @@ struct Progressive {
 impl Progressive {
     /// A file that's all out, or broken: no more input is read.
     fn closed() -> Self {
-        Progressive { base: 0, tables: Vec::new(), cuts: Cuts::new(None, 0.0), cut: None, last_cut: 0.0 }
+        Progressive { tables: Vec::new(), cuts: Cuts::new(None, 0.0), cut: None, last_cut: 0.0 }
     }
 
     fn finished(&self) -> bool {
@@ -397,6 +408,46 @@ pub struct Converter {
     reinit: bool,
     /// Which of `held` and `output` got the init again in this append.
     reinit_done: [bool; 2],
+    /// The input ftyp, which goes out with the next converted init.
+    pending_ftyp: Option<Vec<u8>>,
+    /// A finishing job ran for the changed init of this size at the front
+    /// of the input.
+    finishing: Option<usize>,
+    /// The presentation time range of the media in `output`, in seconds on
+    /// the stream's own timeline.
+    pub output_range: Option<(f64, f64)>,
+    /// The latest display size change written to `output` or `held`.
+    pub natural_out: Option<Natural>,
+    seek: Seek,
+    /// The offset asked for in this reply.
+    pub need: Option<u64>,
+}
+
+/// Where a progressive file's input is: the file offset of its first byte,
+/// where to start (seconds), and the offset the next append has to start
+/// at, once asked for (`need`). Appends that say where they start
+/// (`offsets`) are taken only from there; without, input runs on and bytes
+/// before `skip_to` are dropped as they come.
+#[derive(Default)]
+struct Seek {
+    base: u64,
+    start: f64,
+    awaiting: Option<u64>,
+    offsets: bool,
+    skip_to: u64,
+}
+
+/// A change of the video's display size, for the worker to pass on.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Natural {
+    pub width: u32,
+    pub height: u32,
+    /// Where the first frame at this size is shown, in seconds on the
+    /// stream's own timeline; None for the first, which comes with the
+    /// first converted init, before any frame, and applies at once.
+    pub at: Option<f64>,
+    /// The append that frame came in.
+    pub seq: f64,
 }
 
 /// What `poll` found.
@@ -441,15 +492,84 @@ impl Converter {
         }
         self.held_groups.clear();
         self.inits_out = 0;
+        self.output_range = None;
+        self.natural_out = None;
+        self.need = None;
     }
 
     /// Drops the output of an append that failed: the page never gets it,
     /// so the converted init in it, if any, comes again before the next.
     pub fn discard_output(&mut self) {
+        // What was asked for still is.
+        let need = self.seek.awaiting;
         self.clear_output();
+        self.need = need;
         if !self.out_init.is_empty() {
             self.reinit = true;
             self.reinit_done = [false; 2];
+        }
+        self.forget_natural();
+    }
+
+    /// The page may not have got the display size: it goes out again with
+    /// the next frame written.
+    fn forget_natural(&mut self) {
+        for v in self.video.values_mut() {
+            v.natural = None;
+        }
+    }
+
+    /// Where a progressive file should start playing, in seconds on its
+    /// own timeline: samples before the keyframe at or before it are left
+    /// out. Before its moov is read.
+    pub fn set_start(&mut self, seconds: f64) {
+        if seconds.is_finite() && seconds > 0.0 {
+            self.seek.start = seconds;
+        }
+    }
+
+    /// The next append of a progressive file starts at byte `offset` of
+    /// it. Whether to take it: only where the input left off, or where
+    /// `need` asked for; appends sent before the page heard of `need` are
+    /// dropped.
+    pub fn offset(&mut self, offset: u64) -> bool {
+        self.seek.offsets = true;
+        if !self.wants_input() || !self.progressive {
+            // All out, or a fragmented file: nothing to seek in.
+            return true;
+        }
+        let want = self.seek.awaiting.unwrap_or(self.seek.base + self.input.len() as u64);
+        if offset != want {
+            return false;
+        }
+        if self.seek.awaiting.take().is_some() && offset != self.seek.base + self.input.len() as u64 {
+            self.input.clear();
+            self.seek.base = offset;
+        }
+        true
+    }
+
+    /// Asks for the file's bytes from `offset` on: everything before them
+    /// is done with.
+    fn request(&mut self, offset: u64) {
+        let have = self.seek.base + self.input.len() as u64;
+        if (self.seek.base..=have).contains(&offset) {
+            let n = (offset - self.seek.base) as usize;
+            self.input.consume(n);
+            self.seek.base = offset;
+            return;
+        }
+        if self.seek.offsets {
+            if self.seek.awaiting != Some(offset) {
+                self.seek.awaiting = Some(offset);
+                self.need = Some(offset);
+            }
+            self.input.clear();
+        } else if offset > have {
+            // Input that doesn't say where it starts runs on from here.
+            self.seek.skip_to = offset;
+            self.input.clear();
+            self.seek.base = have;
         }
     }
 
@@ -466,6 +586,7 @@ impl Converter {
         }
         if let Some(buf) = self.input.room(bytes.len()) {
             buf.extend_from_slice(bytes);
+            self.committed(bytes.len());
         }
     }
 
@@ -475,6 +596,11 @@ impl Converter {
         if !self.wants_input() {
             let buf = self.input.buffer();
             buf.truncate(buf.len().saturating_sub(len));
+        } else if self.seek.skip_to > self.seek.base {
+            // Bytes before the ones asked for, not kept.
+            let n = (self.seek.skip_to - self.seek.base).min(self.input.len() as u64);
+            self.input.consume(n as usize);
+            self.seek.base += n;
         }
     }
 
@@ -521,7 +647,16 @@ impl Converter {
         else {
             return Ok(());
         };
-        v.ready.push(Chunk { pts: f.pts, duration: f.duration, epoch: f.epoch, seq: f.seq, key, size, data });
+        v.ready.push(Chunk {
+            pts: f.pts,
+            duration: f.duration,
+            epoch: f.epoch,
+            seq: f.seq,
+            key,
+            size,
+            visible: f.visible,
+            data,
+        });
         Ok(())
     }
 
@@ -533,8 +668,9 @@ impl Converter {
     /// encoder gets is exactly what's written. `skip` asks to leave the
     /// frame out to cap the frame rate: then the frame before it lasts
     /// until the next, unless it's a keyframe or there's no frame before it
-    /// to stretch, and then it's encoded after all.
-    pub fn frame(&mut self, track: u32, timestamp: f64, skip: bool) -> u32 {
+    /// to stretch, and then it's encoded after all. `visible` is the
+    /// decoded picture's visible size, which the display size follows.
+    pub fn frame(&mut self, track: u32, timestamp: f64, skip: bool, visible: (u16, u16)) -> u32 {
         let Some(v) = self.video.get_mut(&track) else {
             return DROP;
         };
@@ -552,9 +688,10 @@ impl Converter {
             }
             next = v.frames.range((run.saturating_add(1), i64::MIN)..).next().map(|(k, _)| k.0).filter(|&r| r > run);
         }
-        let Some(f) = found.and_then(|run| v.frames.remove(&(run, ts))) else {
+        let Some(mut f) = found.and_then(|run| v.frames.remove(&(run, ts))) else {
             return DROP;
         };
+        f.visible = visible;
         // The run's earlier frames, and earlier runs, have all come out.
         v.frames = v.frames.split_off(&(f.run, ts));
         if skip && !f.key && v.stretch(&f) {
@@ -615,6 +752,8 @@ impl Converter {
         self.input.overflow = false;
         self.job = None;
         self.prog = None;
+        self.finishing = None;
+        self.seek = Seek { start: self.seek.start, offsets: self.seek.offsets, ..Seek::default() };
         for s in &mut self.streams {
             s.gop.clear();
             s.needs_key = true;
@@ -630,6 +769,7 @@ impl Converter {
             v.last_kept = None;
         }
         self.reinit = !self.out_init.is_empty();
+        self.forget_natural();
     }
 
     /// Whether a fresh converter primed with `init` and given this one's
@@ -685,6 +825,11 @@ impl Converter {
             let (width, height) = size.unwrap_or_default();
             w.u16(width);
             w.u16(height);
+            let natural = v.and_then(|v| v.natural);
+            w.u8(u8::from(natural.is_some()));
+            let (width, height) = natural.unwrap_or_default();
+            w.u32(width);
+            w.u32(height);
         }
         self.state = w.buf;
     }
@@ -730,6 +875,8 @@ impl Converter {
             let main_epoch = r.u32()?;
             let has_size = r.u8()? != 0;
             let size = (r.u16()?, r.u16()?);
+            let has_natural = r.u8()? != 0;
+            let natural = (r.u32()?, r.u32()?);
             loaded.push((
                 next_dts,
                 end_dts,
@@ -742,10 +889,12 @@ impl Converter {
                 gop,
                 main_epoch,
                 has_size.then_some(size),
+                has_natural.then_some(natural),
             ));
         }
         for (s, l) in self.streams.iter_mut().zip(loaded) {
-            let (next_dts, end_dts, needs_key, aligned, run, last_pts, bytes, ticks, gop, main_epoch, size) = l;
+            let (next_dts, end_dts, needs_key, aligned, run, last_pts, bytes, ticks, gop, main_epoch, size, natural) =
+                l;
             s.next_dts = next_dts;
             s.end_dts = end_dts;
             s.needs_key = needs_key;
@@ -759,6 +908,7 @@ impl Converter {
                 let v = self.video.entry(s.track.id).or_default();
                 v.main_epoch = main_epoch;
                 v.size = size;
+                v.natural = natural.or(v.natural);
             }
         }
         self.epoch = epoch;
@@ -790,15 +940,47 @@ impl Converter {
 
     fn write_fragment(&mut self, held: bool, tracks: &[OutTrack]) {
         if tracks.iter().any(|t| !t.samples.is_empty()) {
+            if !held {
+                for t in tracks {
+                    if let Some((start, end)) = self.time_range(t) {
+                        let (a, b) = self.output_range.unwrap_or((start, end));
+                        self.output_range = Some((a.min(start), b.max(end)));
+                    }
+                }
+            }
             self.sequence = self.sequence.wrapping_add(1);
             let bytes = frag::write_fragment(self.sequence, tracks);
             self.emit(held, &bytes, false);
         }
     }
 
+    /// A track's presentation times in some samples, in seconds on the
+    /// stream's own timeline (after the edit list, as the engine reads it).
+    fn seconds(&self, id: u32, ticks: i64) -> f64 {
+        let (timescale, edit) =
+            self.streams.iter().find(|s| s.track.id == id).map_or((1, 0), |s| (s.track.timescale, s.track.edit_offset));
+        ticks.saturating_sub(edit) as f64 / f64::from(timescale.max(1))
+    }
+
+    fn time_range(&self, t: &OutTrack) -> Option<(f64, f64)> {
+        let mut dts = i64::try_from(t.base_dts).ok()?;
+        let (mut start, mut end) = (i64::MAX, i64::MIN);
+        for s in &t.samples {
+            let pts = dts.saturating_add(i64::from(s.cto));
+            start = start.min(pts);
+            end = end.max(pts.saturating_add(i64::from(s.duration)));
+            dts = dts.saturating_add(i64::from(s.duration));
+        }
+        (start <= end).then(|| (self.seconds(t.id, start), self.seconds(t.id, end)))
+    }
+
     /// Writes the converted init again from the input moov, with the coded
-    /// sizes the encoder uses now.
+    /// sizes the encoder uses now. The first one says what size the video
+    /// is, at once: the page reads it as soon as the init is in.
     fn write_init(&mut self, held: bool) -> Result<()> {
+        if let Some(ftyp) = self.pending_ftyp.take() {
+            self.emit(held, &ftyp, true);
+        }
         let tracks: Vec<&Track> = self.streams.iter().map(|s| &s.track).collect();
         let video = &self.video;
         let moov =
@@ -806,6 +988,14 @@ impl Converter {
         self.out_init.clone_from(&self.out_ftyp);
         self.out_init.extend_from_slice(&moov);
         self.emit(held, &moov, true);
+        // None since the first init, or since the page may have lost it.
+        if self.video.values().all(|v| v.natural.is_none()) {
+            let first = self.streams.iter().find(|s| s.track.is_video()).map(|s| (s.track.id, s.track.natural()));
+            if let Some((id, Some((width, height)))) = first {
+                self.natural_out = Some(Natural { width, height, at: None, seq: self.seq });
+                self.video.entry(id).or_default().natural = Some((width, height));
+            }
+        }
         Ok(())
     }
 
@@ -848,11 +1038,9 @@ impl Converter {
             return Ok(());
         };
         let seq = first.seq;
-        let (timescale, edit) =
-            self.streams.iter().find(|s| s.track.id == id).map_or((1, 0), |s| (s.track.timescale, s.track.edit_offset));
-        let seconds = |ticks: i64| ticks.saturating_sub(edit) as f64 / f64::from(timescale.max(1));
-        let start = seconds(chunks.iter().map(|c| c.pts).min().unwrap_or(0));
-        let end = seconds(chunks.iter().map(|c| c.pts.saturating_add(i64::from(c.duration))).max().unwrap_or(0));
+        let start = self.seconds(id, chunks.iter().map(|c| c.pts).min().unwrap_or(0));
+        let end =
+            self.seconds(id, chunks.iter().map(|c| c.pts.saturating_add(i64::from(c.duration))).max().unwrap_or(0));
         let at = self.held.len();
         self.write_video(id, chunks, true, &mut Vec::new())?;
         let len = self.held.len() - at;
@@ -906,11 +1094,32 @@ impl Converter {
                     self.flush_run(id, &mut run, held, parts);
                 }
             }
+            self.note_natural(id, &c, source);
             let flags = if c.key { SYNC } else { NOT_SYNC };
             run.push((c.pts, OutSample { duration: c.duration.max(1), flags, cto: 0, data: c.data }));
         }
         self.flush_run(id, &mut run, held, parts);
         Ok(())
+    }
+
+    /// Notes where the display size changes: the first frame written at
+    /// another one.
+    fn note_natural(&mut self, id: u32, c: &Chunk, source: Option<(u16, u16)>) {
+        let visible = if c.visible.0 > 0 && c.visible.1 > 0 { Some(c.visible) } else { source };
+        let natural = visible.and_then(|size| self.streams.iter().find(|s| s.track.id == id)?.track.natural_for(size));
+        let Some((width, height)) = natural else {
+            return;
+        };
+        // The first since the page may have lost the last applies at once.
+        let again = self.video.values().all(|v| v.natural.is_none());
+        let at = (!again).then(|| self.seconds(id, c.pts));
+        let Some(v) = self.video.get_mut(&id) else {
+            return;
+        };
+        if v.natural != Some((width, height)) {
+            v.natural = Some((width, height));
+            self.natural_out = Some(Natural { width, height, at, seq: c.seq });
+        }
     }
 
     fn flush_run(&mut self, id: u32, run: &mut Vec<(i64, OutSample)>, held: bool, parts: &mut Vec<OutTrack>) {
@@ -971,11 +1180,28 @@ impl Converter {
                 }
                 continue;
             }
+            if &kind == b"moov" {
+                // A different init replaces the streams: the frames the
+                // decoder still holds of the old ones come out first, to be
+                // written with what they came with.
+                let changed = self.streams.is_empty() || data.get(header..size) != Some(&self.moov[..]);
+                if changed && self.finishing != Some(size) {
+                    if let Some(job) = self.finish_job() {
+                        self.job = Some(job);
+                        self.finishing = Some(size);
+                        return Ok(Poll::Job);
+                    }
+                }
+                self.finishing = None;
+            }
+            let data = self.input.data();
             let bytes = data[..size].to_vec();
             self.input.consume(size);
             match &kind {
+                // It goes out with the converted moov, after any frames of
+                // the init before.
                 b"ftyp" => {
-                    self.emit(false, &bytes, true);
+                    self.pending_ftyp = Some(bytes.clone());
                     self.out_ftyp.clone_from(&bytes);
                     self.ftyp = bytes;
                 }
@@ -987,19 +1213,58 @@ impl Converter {
         }
     }
 
+    /// A job that only flushes the decoders of video tracks with frames in
+    /// them, if any have.
+    fn finish_job(&self) -> Option<Job> {
+        let mut job = Job::default();
+        for s in &self.streams {
+            let Codec::Avc(avc) = &s.track.codec else {
+                continue;
+            };
+            if self.video.get(&s.track.id).is_some_and(|v| !v.frames.is_empty() || !v.encoding.is_empty()) {
+                job.samples.push(JobSample {
+                    track: s.track.id,
+                    flags: FINISH | FLUSH,
+                    offset: 0,
+                    len: 0,
+                    timestamp: 0.0,
+                    duration: 0.0,
+                    codec: avc.codec_word(),
+                    bitrate: s.bitrate(),
+                });
+            }
+        }
+        (!job.samples.is_empty()).then_some(job)
+    }
+
     fn open_init(&mut self, moov: &[u8], header: usize) -> Result<()> {
         let body = &moov[header..];
         let tracks = init::parse_moov(body)?;
-        self.mime = init::mime(&tracks);
+        let mime = init::mime(&tracks);
         // Players append the same init again at every discontinuity or
         // quality switch; the tracks carry on through an identical one.
         if body != self.moov || self.streams.is_empty() {
+            // Frames encoded for the old one go out with its timescale and
+            // sizes. Runs go on counting, so that frames of the old streams
+            // a decoder still puts out are told apart from the new ones'.
+            self.write_parts(Vec::new())?;
+            let run = self.streams.iter().map(|s| s.run).max().unwrap_or(0);
             for t in tracks.iter().filter(|t| t.is_video()) {
-                self.video.entry(t.id).or_default().size = None;
+                let v = self.video.entry(t.id).or_default();
+                v.size = None;
+                v.last_kept = None;
             }
-            self.streams = tracks.into_iter().map(Stream::new).collect();
+            self.streams = tracks
+                .into_iter()
+                .map(|t| {
+                    let mut s = Stream::new(t);
+                    s.run = run;
+                    s
+                })
+                .collect();
             self.moov = body.to_vec();
         }
+        self.mime = mime;
         self.moov_progressive = false;
         self.write_init(false)?;
         self.reinit = false;
@@ -1061,10 +1326,11 @@ impl Converter {
             let Some(prog) = self.prog.as_mut() else {
                 return Ok(Poll::Idle);
             };
-            if prog.finished() {
+            // Waiting for the bytes `need` asked for.
+            if prog.finished() || self.seek.awaiting.is_some() {
                 return Ok(Poll::Idle);
             }
-            let have = prog.base + self.input.len() as u64;
+            let have = self.seek.base + self.input.len() as u64;
             let cut = if let Some(cut) = prog.cut {
                 cut
             } else {
@@ -1097,7 +1363,7 @@ impl Converter {
                 }
                 picks.push(n);
             }
-            let base = prog.base;
+            let base = self.seek.base;
             let len = self.input.len();
             let mut runs = Vec::new();
             let mut next_key = Vec::new();
@@ -1115,11 +1381,11 @@ impl Converter {
             let input = std::mem::take(&mut self.input);
             let became_job = self.convert_runs(runs, input.data(), &next_key);
             self.input = input;
-            if let Some(prog) = self.prog.as_mut() {
-                let drop = keep_from.map_or(self.input.len() as u64, |k| k.saturating_sub(prog.base));
+            if self.prog.is_some() {
+                let drop = keep_from.map_or(self.input.len() as u64, |k| k.saturating_sub(self.seek.base));
                 let drop = drop.min(self.input.len() as u64);
                 self.input.consume(drop as usize);
-                prog.base += drop;
+                self.seek.base += drop;
             }
             if became_job? {
                 return Ok(Poll::Job);
@@ -1132,7 +1398,13 @@ impl Converter {
     fn open_progressive(&mut self) -> Result<bool> {
         let range = match progressive::find_moov(self.input.data())? {
             Scan::Moov(range) => range,
-            Scan::NeedMore => return Ok(false),
+            Scan::NeedMore(Some(end)) if self.seek.offsets && end > self.input.len() as u64 + SKIP_BOX => {
+                // A big box in the way, the mdat of a file with its moov at
+                // the end: what comes after it is what's needed first.
+                self.request(self.seek.base.saturating_add(end));
+                return Ok(false);
+            }
+            Scan::NeedMore(_) => return Ok(false),
         };
         let moov = self.input.data()[range].to_vec();
         if crate::bytes::child(&moov, *b"mvex")?.is_some() {
@@ -1146,6 +1418,9 @@ impl Converter {
             let keep = progressive::suffix_min_offsets(&samples);
             tables.push(Table { samples, keep, done: 0 });
             tracks.push(track);
+        }
+        if self.seek.start > 0.0 {
+            start_at(self.seek.start, &tracks, &mut tables);
         }
         let end = tracks
             .iter()
@@ -1168,8 +1443,46 @@ impl Converter {
         self.moov_progressive = true;
         self.write_init(false)?;
         self.reinit = false;
-        self.prog = Some(Progressive { base: 0, tables, cuts, cut: None, last_cut: 0.0 });
+        // The bytes of the first samples to go out.
+        let need = tables.iter().filter_map(|t| t.keep.get(t.done).copied()).min();
+        self.prog = Some(Progressive { tables, cuts, cut: None, last_cut: 0.0 });
+        if let Some(need) = need {
+            self.request(need);
+        }
         Ok(true)
+    }
+}
+
+/// Leaves out the samples before `start` seconds: video from the keyframe
+/// shown at or before it, other tracks from the sample playing then, and
+/// one before that, which an AAC decoder needs to start from.
+fn start_at(start: f64, tracks: &[Track], tables: &mut [Table]) {
+    let seconds = |t: &Track, ticks: i64| ticks.saturating_sub(t.edit_offset) as f64 / f64::from(t.timescale);
+    let video = tracks.iter().zip(tables.iter()).find(|(t, _)| t.is_video());
+    let from = match video {
+        Some((t, table)) => table
+            .samples
+            .iter()
+            .filter(|s| s.sync)
+            .map(|s| seconds(t, s.dts.saturating_add(s.cto)))
+            .filter(|&at| at <= start)
+            .fold(f64::NEG_INFINITY, f64::max),
+        None => start,
+    };
+    if !from.is_finite() {
+        return;
+    }
+    for (t, table) in tracks.iter().zip(tables.iter_mut()) {
+        table.done = if t.is_video() {
+            let key = table.samples.iter().position(|s| s.sync && seconds(t, s.dts.saturating_add(s.cto)) >= from);
+            key.unwrap_or(0)
+        } else {
+            let playing = table
+                .samples
+                .iter()
+                .position(|s| seconds(t, s.dts.saturating_add(s.cto).saturating_add(i64::from(s.duration))) > from);
+            playing.unwrap_or(table.samples.len()).saturating_sub(1)
+        };
     }
 }
 
@@ -1301,7 +1614,8 @@ impl Stream {
                 continue;
             }
             flags.push(key);
-            let frame = Frame { pts: s.pts(), duration: s.duration, epoch, seq, run: self.run, key: key != 0 };
+            let frame =
+                Frame { pts: s.pts(), duration: s.duration, epoch, seq, run: self.run, key: key != 0, visible: (0, 0) };
             out.frames.insert((self.run, micros(s.pts(), timescale)), frame);
             self.last_pts = Some(self.last_pts.map_or(s.pts(), |last| last.max(s.pts())));
         }

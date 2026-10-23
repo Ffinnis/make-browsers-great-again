@@ -289,26 +289,30 @@ pub fn suffix_min_offsets(samples: &[FileSample]) -> Vec<u64> {
 }
 
 /// The top-level boxes of a file so far: the moov's range once it's all
-/// there, or how far the scan got.
+/// there, or how far the scan got: where the box that isn't all there yet
+/// ends, if it's known and isn't the moov.
 pub enum Scan {
     Moov(std::ops::Range<usize>),
-    NeedMore,
+    NeedMore(Option<u64>),
 }
 
 pub fn find_moov(data: &[u8]) -> Result<Scan> {
     let mut pos = 0usize;
     loop {
         let Some(rest) = data.get(pos..) else {
-            return Ok(Scan::NeedMore);
+            return Ok(Scan::NeedMore(None));
         };
         let Some((size, header)) = crate::bytes::box_extent(rest)? else {
-            return Ok(Scan::NeedMore);
+            return Ok(Scan::NeedMore(None));
         };
         if rest.get(4..8) == Some(b"moov") {
             if size > rest.len() {
-                return Ok(Scan::NeedMore);
+                return Ok(Scan::NeedMore(None));
             }
             return Ok(Scan::Moov(pos + header..pos + size));
+        }
+        if size > rest.len() {
+            return Ok(Scan::NeedMore(Some(pos as u64 + size as u64)));
         }
         pos = pos.saturating_add(size);
     }

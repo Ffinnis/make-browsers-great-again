@@ -63,8 +63,10 @@ class Converter {
     });
   }
 
-  append(sb, bytes) {
-    return this.request(sb, { type: 'append', bytes }, [bytes]);
+  append(sb, bytes, offset) {
+    const msg = { type: 'append', bytes };
+    if (offset !== undefined) msg.offset = offset;
+    return this.request(sb, msg, [bytes]);
   }
 
   // The seq the next append or drain on `sb` gets.
@@ -185,7 +187,7 @@ async function runCase(conv, c, sbBase, expected) {
   // Every SourceBuffer is made before any append, as players do.
   const states = c.sbs.map((spec, i) => {
     const id = sbBase + i;
-    conv.post({ type: 'open', sb: id, mime: spec.mime });
+    conv.post({ type: 'open', sb: id, mime: spec.mime, start: spec.start });
     const out = spec.mime === 'progressive' ? null : mapMime(spec.mime);
     return {
       spec,
@@ -197,6 +199,9 @@ async function runCase(conv, c, sbBase, expected) {
       sizes: [],
       helds: 0,
       natural: null,
+      naturals: [],
+      needs: [],
+      dropped: 0,
     };
   });
   if (states.some((s) => !s.sb) && states.length > 1) throw new Error('one progressive SourceBuffer per case');
@@ -206,7 +211,22 @@ async function runCase(conv, c, sbBase, expected) {
       s.mime = reply.mime;
       s.sb = ms.addSourceBuffer(reply.mime);
     }
-    if (reply.natural) s.natural = [reply.natural.width, reply.natural.height];
+    if (reply.natural) {
+      const n = reply.natural;
+      s.natural = [n.width, n.height];
+      s.naturals.push([n.width, n.height, n.at === undefined ? null : +n.at.toFixed(3)]);
+      if (n.seq !== undefined && !(n.seq < reply.seq)) fail(`${label}: natural of append ${n.seq} in ${reply.seq}`);
+    }
+    // The output's times: there with media, within the input's.
+    const media = reply.bytes && [...walk(new Uint8Array(reply.bytes))].some((b) => b[0] === 'moof');
+    if (media !== !!reply.range) fail(`${label}: range ${JSON.stringify(reply.range)} for ${media ? 'media' : 'no media'}`);
+    if (reply.range) {
+      const { start, end } = reply.range;
+      const want = s.want;
+      if (!(end > start) || (want && (start < want[0] - 0.1 || end > want[1] + 0.1))) {
+        fail(`${label}: range ${start}..${end} outside ${JSON.stringify(want)}`);
+      }
+    }
     const parts = [];
     for (const g of reply.held || []) {
       // Each group is an earlier append's, with that append's settings (the
@@ -231,6 +251,7 @@ async function runCase(conv, c, sbBase, expected) {
     }
   };
 
+  for (const [i, s] of states.entries()) s.want = (c.expected && c.expected[i]) || (expected && expected[i]);
   await Promise.all(states.map(async (s) => {
     const actions = s.spec.actions || {};
     // `units`: the files' moof+mdat units, appended in this order (indices,
@@ -251,7 +272,12 @@ async function runCase(conv, c, sbBase, expected) {
     }
     for (const [index, file] of appends.entries()) {
       const action = actions[index] || {};
-      if (action.wait) await new Promise((r) => setTimeout(r, action.wait));
+      if (action.wait) {
+        // With keepalive, as the shim's paused progressive downloads.
+        const timer = action.keepalive && setInterval(() => conv.post({ type: 'keepalive', sb: s.id }), 100);
+        await new Promise((r) => setTimeout(r, action.wait));
+        clearInterval(timer);
+      }
       if (action.drain) {
         // As before endOfStream(), and then the page carries on.
         const reply = await conv.drain(s.id);
@@ -264,11 +290,15 @@ async function runCase(conv, c, sbBase, expected) {
       let data = pieces ? pieces[index] : await fetched(file);
       if (action.patch) data = patch(data, action.patch);
       const step = s.spec.split || data.length;
-      for (let at = 0; at < data.length; at += step) {
+      // A progressive file's appends say where they start, and go on from
+      // `need` when a reply has one, as the shim's do.
+      const progressive = s.spec.mime === 'progressive';
+      for (let at = 0, next = 0; at < data.length; at = next) {
+        next = at + step;
         const piece = data.slice(at, at + step);
         const size = piece.length;
         const t0 = performance.now();
-        const replied = conv.append(s.id, piece.buffer);
+        const replied = conv.append(s.id, piece.buffer, progressive ? at : undefined);
         if (action.abort) {
           // The page's abort(): the shim drops the reply and resets.
           conv.post({ type: 'reset', sb: s.id });
@@ -293,6 +323,15 @@ async function runCase(conv, c, sbBase, expected) {
         }
         if (action.abort) continue;
         await deliver(s, file, reply);
+        if (reply.need === undefined) continue;
+        s.needs.push(reply.need);
+        if (at + step < data.length) {
+          // The append the shim sent before it heard: dropped, empty.
+          const stale = await conv.append(s.id, data.slice(at + step, at + 2 * step).buffer, at + step);
+          if (stale.type !== 'output' || stale.bytes.byteLength || stale.held) fail(`stale append at ${at + step} not dropped`);
+          s.dropped++;
+        }
+        next = reply.need;
       }
     }
     if (!params.has('v1')) {
@@ -335,8 +374,21 @@ async function runCase(conv, c, sbBase, expected) {
     } else if (!got.length) {
       fail(`sb ${i}: nothing buffered`);
     }
+    info.naturals = s.naturals;
+    info.needs = s.needs;
     if (s.spec.natural && JSON.stringify(s.natural) !== JSON.stringify(s.spec.natural)) {
       fail(`sb ${i}: natural size ${JSON.stringify(s.natural)}, expected ${JSON.stringify(s.spec.natural)}`);
+    }
+    // Every natural size change: [width, height, at] (null: at once).
+    if (s.spec.naturals) {
+      const ok = s.naturals.length === s.spec.naturals.length && s.naturals.every((n, k) => {
+        const e = s.spec.naturals[k];
+        return n[0] === e[0] && n[1] === e[1] && (e[2] === null ? n[2] === null : Math.abs(n[2] - e[2]) < 0.05);
+      });
+      if (!ok) fail(`sb ${i}: naturals ${JSON.stringify(s.naturals)}, expected ${JSON.stringify(s.spec.naturals)}`);
+    }
+    if (s.spec.needs !== undefined && s.needs.length !== s.spec.needs) {
+      fail(`sb ${i}: ${s.needs.length} needs ${JSON.stringify(s.needs)}, expected ${s.spec.needs}`);
     }
     if (s.spec.lastSize) {
       const last = s.sizes[s.sizes.length - 1];
@@ -403,9 +455,12 @@ async function runCase(conv, c, sbBase, expected) {
   for (const key of Object.keys(after)) {
     if (typeof after[key] === 'number') result.worker[key] = after[key] - (before[key] || 0);
   }
-  // Counters that have to have moved, such as {"recycled": 1}: at least.
-  for (const [key, least] of Object.entries(c.expectStats || {})) {
-    if (!(result.worker[key] >= least)) fail(`worker ${key} ${result.worker[key]}, expected at least ${least}`);
+  // Counters that have to have moved, such as {"recycled": 1}: at least,
+  // or [least, most].
+  for (const [key, want] of Object.entries(c.expectStats || {})) {
+    const [least, most] = Array.isArray(want) ? want : [want, Infinity];
+    const got = result.worker[key] || 0;
+    if (!(got >= least && got <= most)) fail(`worker ${key} ${got}, expected ${JSON.stringify(want)}`);
   }
   if (c.tune) conv.post({ type: 'tune', tune: {} });
   video.pause();

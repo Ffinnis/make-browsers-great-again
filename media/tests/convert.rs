@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use mbga_media::{Converter, HeldGroup, Poll, DECODE_ONLY, DROP, ENCODE_KEY, FLUSH, KEY};
+use mbga_media::{Converter, HeldGroup, Natural, Poll, DECODE_ONLY, DROP, ENCODE_KEY, FINISH, FLUSH, KEY};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap()
@@ -46,6 +46,10 @@ struct Worker {
     /// another (as when the page's video gets smaller).
     size: (u16, u16),
     resize: Option<(i64, (u16, u16))>,
+    /// The decoded pictures' visible size, and from which keyframe on it's
+    /// another (as when an avc3 stream's SPS changes it).
+    visible: (u16, u16),
+    revisible: Option<(i64, (u16, u16))>,
     /// A frame-rate cap: the least time between frames, in microseconds.
     cap: Option<i64>,
     /// The page's number for appends and drains.
@@ -62,6 +66,8 @@ impl Worker {
             encoded: 0,
             size: (320, 180),
             resize: None,
+            visible: (320, 180),
+            revisible: None,
             cap: None,
             seq: 0.0,
         }
@@ -72,7 +78,12 @@ impl Worker {
         d.waiting.remove(&frame);
         let ts = frame.0;
         let skip = self.cap.is_some() && ts < d.next_kept;
-        let r = c.frame(track, ts as f64, skip);
+        if let Some((from, size)) = self.revisible.filter(|&(from, _)| ts >= from) {
+            let _ = from;
+            self.visible = size;
+            self.revisible = None;
+        }
+        let r = c.frame(track, ts as f64, skip, self.visible);
         if r == DROP {
             return;
         }
@@ -133,6 +144,11 @@ impl Worker {
         let samples = job.samples.clone();
         let mut flush = BTreeSet::new();
         for s in &samples {
+            if s.flags & FINISH != 0 {
+                assert_eq!(s.len, 0);
+                flush.insert(s.track);
+                continue;
+            }
             let data = &job.data[s.offset as usize..(s.offset + s.len) as usize];
             assert_eq!(&data[..4], &[0, 0, 0, 1], "not Annex-B");
             assert!(s.codec >> 16 == 0x64 || s.codec >> 16 == 0x4d, "codec {:x}", s.codec);
@@ -141,7 +157,7 @@ impl Worker {
                 flush.insert(s.track);
             }
         }
-        for s in &samples {
+        for s in samples.iter().filter(|s| s.flags & FINISH == 0) {
             self.decode(c, s.track, s.timestamp as i64, s.flags);
         }
         for track in flush {
@@ -166,6 +182,20 @@ impl Worker {
         take(c)
     }
 
+    /// An append of a progressive file's bytes from `offset`: None if the
+    /// converter drops it, as one sent before the shim heard of `need`.
+    fn append_at(&mut self, c: &mut Converter, bytes: &[u8], offset: u64) -> Option<Output> {
+        if !c.offset(offset) {
+            self.seq += 1.0;
+            c.begin(self.seq);
+            c.write().unwrap();
+            let o = take(c);
+            assert!(o.bytes.is_empty() && o.held.is_empty());
+            return None;
+        }
+        Some(self.append(c, bytes))
+    }
+
     /// Before `endOfStream()`: everything the decoders still hold.
     fn drain(&mut self, c: &mut Converter) -> Output {
         self.seq += 1.0;
@@ -184,10 +214,21 @@ struct Output {
     groups: Vec<HeldGroup>,
     bytes: Vec<u8>,
     inits: u32,
+    natural: Option<Natural>,
+    range: Option<(f64, f64)>,
+    need: Option<u64>,
 }
 
 fn take(c: &mut Converter) -> Output {
-    let o = Output { held: c.held.clone(), groups: c.held_groups.clone(), bytes: c.output.clone(), inits: c.inits_out };
+    let o = Output {
+        held: c.held.clone(),
+        groups: c.held_groups.clone(),
+        bytes: c.output.clone(),
+        inits: c.inits_out,
+        natural: c.natural_out,
+        range: c.output_range,
+        need: c.need,
+    };
     // The groups tile `held`.
     let mut at = 0;
     for g in &o.groups {
@@ -1077,11 +1118,17 @@ fn natural_size_is_the_inputs_display_size() {
 /// `delta` ticks apart at `timescale`, the last lasting `last` ticks.
 #[allow(clippy::similar_names)]
 fn opus_file(count: u32, delta: u32, timescale: u32, last: u32) -> Vec<u8> {
+    opus_file_of(count, delta, timescale, last, 1)
+}
+
+/// The same with `size`-byte samples.
+#[allow(clippy::similar_names)]
+fn opus_file_of(count: u32, delta: u32, timescale: u32, last: u32, size: u32) -> Vec<u8> {
     let full = |kind: [u8; 4], body: &[u8]| make_box(kind, &[&[0u8; 4][..], body].concat());
     let ftyp = make_box(*b"ftyp", b"isom\0\0\0\0isom");
     let mdat_header = 8;
     let data_at = (ftyp.len() + mdat_header) as u32;
-    let mdat = make_box(*b"mdat", &vec![0x55; count as usize]);
+    let mdat = make_box(*b"mdat", &vec![0x55; (count * size) as usize]);
     // Version 0: the track id, and the timescale, 12 bytes into the body.
     let mut tkhd = [0u8; 84];
     tkhd[12..16].copy_from_slice(&1u32.to_be_bytes());
@@ -1102,7 +1149,7 @@ fn opus_file(count: u32, delta: u32, timescale: u32, last: u32) -> Vec<u8> {
     }
     let stts = full(*b"stts", &stts);
     let stsc = full(*b"stsc", &[1u32, 1, count, 1].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
-    let stsz = full(*b"stsz", &[1u32, count].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
+    let stsz = full(*b"stsz", &[size, count].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
     let stco = full(*b"stco", &[1u32, data_at].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
     let stbl = make_box(*b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
     let minf = make_box(*b"minf", &stbl);
@@ -1164,4 +1211,224 @@ fn an_init_lost_with_a_failed_append_comes_again() {
     assert!(!o.held.is_empty());
     let at = |kind: &[u8]| o.held.windows(4).position(|w| w == kind).unwrap();
     assert!(at(b"moov") < at(b"moof"));
+}
+
+// ----------------------------------------------------------- round three
+
+/// The frames in an output, held groups first, with the append each came
+/// for.
+fn frames_by_seq(o: &Output, seq: f64) -> Vec<(f64, i64)> {
+    let mut out = Vec::new();
+    for g in &o.groups {
+        let times = chunk_times(&o.held[g.offset as usize..(g.offset + g.len) as usize]);
+        out.extend(times.into_iter().map(|t| (g.seq, t)));
+    }
+    out.extend(chunk_times(&o.bytes).into_iter().map(|t| (seq, t)));
+    out
+}
+
+#[test]
+fn a_different_init_over_the_same_times_keeps_both_streams_frames_apart() {
+    // An ABR switch that replaces what's buffered: a new init (here only
+    // its creation time differs), then the same times again, while the
+    // decoder still holds frames of the old stream at those times.
+    let units = units(&fixture("midgop.mp4"));
+    let mut init = units[0].clone();
+    let (mvhd, _) = *find_path(&init, &[b"moov", b"mvhd"]).last().unwrap();
+    set_u32(&mut init, mvhd + 12, 12345);
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    let mut frames = Vec::new();
+    for u in &units[..3] {
+        let o = w.append(&mut c, u);
+        frames.extend(frames_by_seq(&o, w.seq));
+    }
+    let old_last = w.seq;
+    let o = w.append(&mut c, &init);
+    // The old stream's frames come out now, for the appends they came in,
+    // before the new init.
+    assert!(!o.groups.is_empty(), "the old frames weren't finished");
+    assert!(o.groups.iter().all(|g| g.seq <= old_last));
+    assert_eq!(count(&o.bytes, *b"moov"), 1);
+    assert!(chunk_times(&o.bytes).is_empty());
+    frames.extend(frames_by_seq(&o, w.seq));
+    let first_new = w.seq + 1.0;
+    for u in &units[1..] {
+        let o = w.append(&mut c, u);
+        frames.extend(frames_by_seq(&o, w.seq));
+    }
+    let o = w.drain(&mut c);
+    frames.extend(frames_by_seq(&o, w.seq));
+    let old: BTreeSet<i64> = frames.iter().filter(|f| f.0 < first_new).map(|f| f.1).collect();
+    let new: Vec<i64> = frames.iter().filter(|f| f.0 >= first_new).map(|f| f.1).collect();
+    // Every frame of the two old fragments, and every frame of the new
+    // stream, its first keyframe included, once.
+    assert_eq!(old.len(), 30, "{old:?}");
+    assert_eq!(new.len(), 60, "{new:?}");
+    assert_eq!(new.iter().collect::<BTreeSet<_>>().len(), 60);
+    assert!(new.contains(&66_667), "the new stream's first keyframe is lost");
+}
+
+#[test]
+fn natural_size_comes_with_the_first_init_and_where_frames_change_it() {
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    let o = w.append(&mut c, &fixture("video-init.mp4"));
+    // The first comes with the init, before any frame, and applies at once.
+    assert_eq!(o.natural, Some(Natural { width: 320, height: 180, at: None, seq: 1.0 }));
+    // The SPS (avc3) doubles the size from the keyframe at 1 s.
+    w.revisible = Some((1_000_000, (640, 360)));
+    let mut naturals = Vec::new();
+    for i in 0..3 {
+        let o = w.append(&mut c, &fixture(&format!("video-{i}.m4s")));
+        naturals.extend(o.natural.map(|n| (w.seq, n)));
+    }
+    assert_eq!(naturals.len(), 1, "{naturals:?}");
+    let (seq, n) = naturals[0];
+    assert_eq!((n.width, n.height, n.seq), (640, 360, seq));
+    let at = n.at.unwrap();
+    assert!((1.0..1.1).contains(&at), "at {at}");
+    // The page may have lost it with an aborted append: again, at once.
+    c.reset();
+    let o = w.append(&mut c, &fixture("video-2.m4s"));
+    assert_eq!(o.natural.map(|n| (n.width, n.height, n.at)), Some((640, 360, None)));
+}
+
+#[test]
+fn the_output_says_what_times_it_covers() {
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    let o = w.append(&mut c, &fixture("video-init.mp4"));
+    assert_eq!(o.range, None, "an init has no times");
+    let mut last_end = None;
+    for i in 0..3 {
+        let o = w.append(&mut c, &fixture(&format!("video-{i}.m4s")));
+        let (start, end) = o.range.unwrap();
+        assert!((end - start - 1.0).abs() < 0.01, "{start}..{end}");
+        assert!(last_end.is_none_or(|e: f64| (e - start).abs() < 1e-6), "{last_end:?} then {start}");
+        last_end = Some(end);
+    }
+    // Muxed: both tracks' times.
+    let mut c = Converter::new(false);
+    let o = Worker::new().append(&mut c, &fixture("muxed.mp4"));
+    let (start, end) = o.range.unwrap();
+    assert!(start < 0.1 && end > 1.9, "{start}..{end}");
+}
+
+#[test]
+fn a_progressive_file_starts_at_the_keyframe_before_start() {
+    // Keyframes every second; start at 1.2 s, from the one at 1 s.
+    let input = fixture("progressive.mp4");
+    let mut c = Converter::new(true);
+    c.set_start(1.2);
+    let mut w = Worker::new();
+    let out = convert(&mut c, &mut w, &input, 4096);
+    let times = chunk_times(&out);
+    assert_eq!(times.len(), 30, "{times:?}");
+    assert!(times.iter().all(|&t| t >= 1_000_000), "{times:?}");
+    // Nothing before it was decoded.
+    assert_eq!(w.encoded, 30);
+    if has_ffmpeg() {
+        let dst = write_temp("start-out.mp4", &out);
+        assert_decode_order(&dst);
+        // Audio from the keyframe on, too, with one frame before it.
+        let audio = &packet_times(&dst)[1].1;
+        let first: i64 = audio.iter().map(|t| t.parse::<i64>().unwrap()).min().unwrap();
+        assert!((40_000..44_100).contains(&first), "audio starts at {first}");
+    }
+}
+
+/// Streams `file` in `step`-byte appends that say where they start, the
+/// way the shim does: after a reply with `need` it goes on from there, and
+/// the append it had already sent is dropped.
+fn stream_file(c: &mut Converter, w: &mut Worker, file: &[u8], step: usize) -> (Vec<u8>, Vec<u64>) {
+    let mut out = Vec::new();
+    let mut needs = Vec::new();
+    let mut pos = 0;
+    while pos < file.len() {
+        let end = (pos + step).min(file.len());
+        let o = w.append_at(c, &file[pos..end], pos as u64).expect("dropped");
+        out.extend(o.held);
+        out.extend(o.bytes);
+        // Never the whole of a big mdat: at most a fragment's worth.
+        assert!(c.input.len() < 1 << 20, "{} bytes waiting", c.input.len());
+        match o.need {
+            Some(need) => {
+                needs.push(need);
+                if end < file.len() {
+                    // Sent before the shim heard: dropped, with an empty reply.
+                    assert!(w.append_at(c, &file[end..(end + step).min(file.len())], end as u64).is_none());
+                }
+                pos = usize::try_from(need).unwrap();
+            }
+            None => pos = end,
+        }
+    }
+    let o = w.drain(c);
+    out.extend(o.held);
+    (out, needs)
+}
+
+#[test]
+fn a_progressive_file_asks_for_the_bytes_it_needs() {
+    let input = fixture("progressive.mp4");
+    let mut c = Converter::new(true);
+    c.set_start(1.2);
+    let mut w = Worker::new();
+    let (out, needs) = stream_file(&mut c, &mut w, &input, 4096);
+    assert_eq!(needs.len(), 1, "{needs:?}");
+    let times = chunk_times(&out);
+    assert_eq!(times.len(), 30);
+    assert!(times.iter().all(|&t| t >= 1_000_000));
+    // Without a start, the bytes run on and nothing is asked for.
+    let mut c = Converter::new(true);
+    let (out, needs) = stream_file(&mut c, &mut Worker::new(), &input, 4096);
+    assert!(needs.is_empty());
+    assert_eq!(chunk_times(&out).len(), 60);
+}
+
+#[test]
+fn a_big_file_with_its_moov_last_asks_for_it_then_for_its_samples() {
+    // 4 MB of samples, then the moov.
+    let file = opus_file_of(1000, 1, 50, 1, 4096);
+    let moov_at = find_path(&file, &[b"moov"])[0].0;
+    let mut c = Converter::new(true);
+    let (out, needs) = stream_file(&mut c, &mut Worker::new(), &file, 65536);
+    let ftyp_and_mdat_header = 20 + 8;
+    assert_eq!(needs, [moov_at as u64, ftyp_and_mdat_header], "moov at {moov_at}");
+    // Two-second fragments of 50 samples a second, all there.
+    assert_eq!(count(&out, *b"moof"), 10);
+    // A small one just streams through.
+    let file = opus_file_of(100, 1, 50, 1, 4096);
+    let mut c = Converter::new(true);
+    let (out, needs) = stream_file(&mut c, &mut Worker::new(), &file, 65536);
+    assert!(needs.is_empty());
+    assert_eq!(count(&out, *b"moof"), 1);
+}
+
+#[test]
+fn an_avc3_stream_whose_sps_changes_its_size() {
+    let units = units(&fixture("avc3.mp4"));
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    // The decoder puts the second second out at 480x270, as its SPS says
+    // (from 16384/15360 s).
+    w.revisible = Some((1_066_667, (480, 270)));
+    let mut naturals = Vec::new();
+    let mut out = Vec::new();
+    for u in &units {
+        let o = w.append(&mut c, u);
+        naturals.extend(o.natural);
+        out.extend(o.held);
+        out.extend(o.bytes);
+    }
+    let o = w.drain(&mut c);
+    naturals.extend(o.natural);
+    out.extend(o.held);
+    assert_eq!(chunk_times(&out).len(), 60);
+    assert_eq!(naturals.len(), 2, "{naturals:?}");
+    assert_eq!((naturals[0].width, naturals[0].height, naturals[0].at), (320, 180, None));
+    assert_eq!((naturals[1].width, naturals[1].height), (480, 270));
+    let at = naturals[1].at.unwrap();
+    assert!((1.0..1.1).contains(&at), "at {at}");
 }

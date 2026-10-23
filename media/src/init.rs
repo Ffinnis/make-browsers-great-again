@@ -66,10 +66,16 @@ impl Track {
     /// MP4 parser does: the sample entry's size, wider or taller by the
     /// pasp box's pixel aspect ratio, or else by the track header's aspect.
     pub fn natural(&self) -> Option<(u32, u32)> {
+        self.natural_for(self.size()?)
+    }
+
+    /// The same for a picture of `(width, height)`, such as a decoded frame
+    /// after the stream's SPS changed its size (avc3): the engine fits the
+    /// decoder's visible size to the container's aspect ratio.
+    pub fn natural_for(&self, (width, height): (u16, u16)) -> Option<(u32, u32)> {
         if !self.is_video() {
             return None;
         }
-        let (width, height) = self.size()?;
         let (mut w, mut h) = (f64::from(width), f64::from(height));
         if w < 1.0 || h < 1.0 {
             return Some((u32::from(width), u32::from(height)));

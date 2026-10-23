@@ -27,6 +27,15 @@ ff "${src[@]}" -t 3 -map 1:a -c:a aac_at -profile:a 4 -b:a 32k -ac 2 "${hls[@]}"
   -hls_fmp4_init_filename heaac-init.mp4 -hls_segment_filename 'heaac-%d.m4s' heaac.m3u8
 rm -f ./*.m3u8
 
+# avc3, with SPS and PPS before every keyframe, whose size grows from
+# 320x180 to 480x270 at 1 s: the SPS changes it, not an init.
+for size in 320x180 480x270; do
+  ff -f lavfi -i "testsrc2=size=$size:rate=30" -t 1 "${x264[@]}" -x264-params repeat-headers=1 "avc3-$size.mp4"
+done
+printf "file '%s'\n" avc3-320x180.mp4 avc3-480x270.mp4 >avc3.txt
+ff -f concat -i avc3.txt -c copy -tag:v avc3 -movflags empty_moov+default_base_moof+frag_keyframe avc3.mp4
+rm -f avc3-*.mp4 avc3.txt
+
 # Progressive files: a muted loop like X's GIFs with moov last, and one with
 # audio and moov first.
 ff "${src[@]}" -t 2 -map 0:v -c:v libx264 -profile:v main -preset veryfast -b:v 100k -bf 2 -g 15 gif.mp4

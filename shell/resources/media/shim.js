@@ -67,11 +67,17 @@
   var VP9 = 'vp09.00.41.08';
   var FLAC = 'flac';
   // Seconds converted ahead of the playhead while the video plays; more
-  // each time playback runs dry.
+  // each time playback runs dry. A video out of view or shown tiny, whose
+  // frames are encoded fewer a second, gets only LOOKAHEAD_SHORT, so those
+  // frames are soon behind it once it's back in view.
   var LOOKAHEAD = 20;
   var LOOKAHEAD_MAX = 60;
-  // The longest an append waits for the playhead, in milliseconds.
+  var LOOKAHEAD_SHORT = 5;
+  // The longest an append waits for the playhead, in milliseconds. The
+  // converter closes a stream's codecs after 20 seconds without a message,
+  // so a download that waits longer than KEEPALIVE says it's still there.
   var DEFER_MAX = 10000;
+  var KEEPALIVE = 10000;
   // A full SourceBuffer is tried again this often while the video plays
   // (and five times less often paused); the page's append ends after
   // QUOTA_WAIT, and a stream the page ended, without what doesn't fit.
@@ -84,8 +90,12 @@
   // How long to wait for the engine to send the converter, asking again
   // after each: it serves a tab's documents a few at a time.
   var CODEC_WAITS = [10000, 20000, 30000];
-  // Videos shown smaller than this (CSS pixels tall), or out of view, are
-  // encoded at SLOW_FPS frames a second at most.
+  // Videos out of view (NEAR counts as in), shown smaller than TINY (CSS
+  // pixels of the picture), or on battery power smaller than SMALL tall are
+  // encoded at SLOW_FPS frames a second at most. X's feed videos, about
+  // 516×290, aren't.
+  var NEAR = '200px';
+  var TINY = [320, 180];
   var SMALL = 360;
   var SLOW_FPS = 15;
   var RELAY = '__mbga_media_relay__';
@@ -434,17 +444,26 @@
     return parentLink.port;
   }
 
-  // Workers this context started, each with its channel once it asks, the
-  // handles it posted (numbered in order) and what's known about them.
+  // Workers this context started that convert or post MediaSourceHandles,
+  // each with its channel once it asks, the handles it posted (numbered in
+  // order) and what's known about them. A record is made when the worker
+  // first says so, and goes with the worker: terminate(), its end of the
+  // channel closing, or the Worker being collected.
   var links = new Set();
   var linkOf = new WeakMap();
   var linkIds = 0;
+  var linkGone = G.FinalizationRegistry ? new FinalizationRegistry(function (link) {
+    unlink(link);
+  }) : null;
   // Where each MediaSourceHandle seen here comes from: {link, n} for one a
-  // worker posted, {ms} for this worker's own.
+  // worker posted, {ms: WeakRef} for this worker's own.
   var origins = new WeakMap();
   // In a worker, the handles it posted to its parent, numbered the same way
-  // the parent numbers them: n -> origin, and back.
+  // the parent numbers them: n -> origin, and back. |unposted| counts the
+  // handles seen here and not posted yet: only then are messages to the
+  // parent looked through.
   var posted = 0;
+  var unposted = 0;
   var slots = new Map();
   var ownSlot = new WeakMap();
   var linkSlot = new Map();
@@ -483,15 +502,45 @@
     return found;
   }
 
-  function childMessage(link, event) {
+  function linkFor(worker) {
+    var link = linkOf.get(worker);
+    if (!link) {
+      link = {
+        id: ++linkIds, port: null, count: 0, scan: false, sizes: new Map(), views: new Map(),
+        naturals: new Map(),
+      };
+      linkOf.set(worker, link);
+      links.add(link);
+      if (linkGone) {
+        linkGone.register(worker, link);
+      }
+    }
+    return link;
+  }
+
+  // A worker's own messages come first: the shim there opens the channel
+  // with one, and says with another that the next carries handles. Nothing
+  // else is looked at.
+  function childMessage(worker, event) {
     var data = event.data;
-    if (data && data[RELAY] === 1 && event.ports && event.ports[0]) {
+    var kind = data && typeof data === 'object' ? data[RELAY] : 0;
+    if (kind === 1 && event.ports && event.ports[0]) {
       event.stopImmediatePropagation();
-      bind(link, event.ports[0]);
+      bind(linkFor(worker), event.ports[0]);
       return;
     }
-    if (Handle && data && typeof data === 'object') {
+    if (kind === 2) {
+      event.stopImmediatePropagation();
+      linkFor(worker).scan = true;
+      return;
+    }
+    var link = Handle && linkOf.get(worker);
+    if (link && link.scan) {
+      link.scan = false;
       findHandles(data).forEach(function (h) {
+        if (!origins.has(h)) {
+          unposted++;
+        }
         origins.set(h, { link: link, n: link.count++ });
         hookPost();
       });
@@ -512,7 +561,13 @@
           }
         });
       } else if (data.natural) {
-        childNatural(link, data.n, { width: data.width, height: data.height });
+        childNatural(link, data.n, data.clear ? null : { width: data.width, height: data.height }, data.time);
+      }
+    };
+    // The worker closed itself or went away.
+    port.onclose = function () {
+      if (link.port === port) {
+        unlink(link);
       }
     };
     link.sizes.forEach(function (size, n) {
@@ -523,14 +578,22 @@
   function unlink(link) {
     links.delete(link);
     if (link.port) {
+      link.port.onmessage = null;
+      link.port.onclose = null;
       link.port.close();
       link.port = null;
     }
+    link.sizes.clear();
+    link.views.clear();
+    link.naturals.clear();
   }
 
   // How big the element showing handle |n| of |link| (undefined: any of
   // its handles) is, now or once it asks.
   function sendLink(link, n, size) {
+    if (!links.has(link)) {
+      return;
+    }
     link.sizes.set(n === undefined ? 'any' : n, size);
     if (link.port) {
       link.port.postMessage({ size: 1, n: n, width: size.width, height: size.height, fps: size.fps });
@@ -541,7 +604,7 @@
   function routeSize(n, size) {
     if (n === undefined || n === null) {
       anySize = size;
-      live.forEach(function (st) {
+      eachLive(function (st) {
         if (!ownSlot.has(st.ms)) {
           sendSize(st, size);
         }
@@ -552,9 +615,10 @@
       return;
     }
     var slot = slots.get(n);
-    if (slot && slot.ms) {
-      msSizes.set(slot.ms, size);
-      var source = sources.get(slot.ms);
+    var ms = slot && slot.ms && slot.ms.deref();
+    if (ms) {
+      msSizes.set(ms, size);
+      var source = sources.get(ms);
       if (source) {
         source.list.forEach(function (st) {
           sendSize(st, size);
@@ -565,26 +629,34 @@
     }
   }
 
-  // The source's size of what a child worker converts, for handle |n|.
-  function childNatural(link, n, size) {
-    link.naturals.set(n, size);
+  // The source's size of what a child worker converts, for handle |n|
+  // (null: it no longer converts), from |time| on.
+  function childNatural(link, n, size, time) {
+    if (size) {
+      link.naturals.set(n, { width: size.width, height: size.height, time: time });
+    } else {
+      link.naturals.delete(n);
+    }
     if (isWindow) {
       var ref = link.views.get(n);
       var el = ref && ref.deref();
       if (el && shown.get(el) && shown.get(el).origin.link === link) {
-        setNatural(el, size);
+        addNatural(el, size, time);
       }
       return;
     }
     var own = linkSlot.get(link.id + ':' + n);
     var port = own === undefined ? null : parentPort();
     if (port) {
-      port.postMessage({ natural: 1, n: own, width: size.width, height: size.height });
+      port.postMessage(size ? { natural: 1, n: own, width: size.width, height: size.height, time: time }
+        : { natural: 1, n: own, clear: 1 });
     }
   }
 
   // In a worker: numbers the handles it posts to its parent, as the parent
-  // numbers what it receives, so sizes and natural sizes can name them.
+  // numbers what it receives, so sizes and natural sizes can name them. A
+  // message with handles goes right after one that says so, on the same
+  // channel, so the parent looks through that one only.
   var postHooked = false;
   function hookPost() {
     if (postHooked || isWindow || !Handle) {
@@ -602,15 +674,20 @@
       return function (self, args) {
         // Called bare, as postMessage(...), it has no this.
         var toParent = self === G || self === undefined || self === null;
-        var found = toParent && args[0] && typeof args[0] === 'object' ? findHandles(args[0]) : [];
+        var found = toParent && unposted > 0 && args[0] && typeof args[0] === 'object' ? findHandles(args[0]) : [];
+        if (!found.length) {
+          return original.apply(self, args);
+        }
         var first = posted;
         posted += found.length;
         try {
+          original.call(G, { [RELAY]: 2 });
           var result = original.apply(self, args);
         } catch (e) {
           posted = first;
           throw e;
         }
+        unposted = Math.max(0, unposted - found.length);
         found.forEach(function (h, i) {
           numbered(first + i, origins.get(h));
         });
@@ -625,16 +702,17 @@
     }
     slots.set(n, origin);
     var natural;
-    if (origin.ms) {
-      ownSlot.set(origin.ms, n);
-      natural = msNaturals.get(origin.ms);
-    } else {
+    var ms = origin.ms && origin.ms.deref();
+    if (ms) {
+      ownSlot.set(ms, n);
+      natural = msNaturals.get(ms);
+    } else if (origin.link) {
       linkSlot.set(origin.link.id + ':' + origin.n, n);
       natural = origin.link.naturals.get(origin.n);
     }
     var port = natural ? parentPort() : null;
     if (port) {
-      port.postMessage({ natural: 1, n: n, width: natural.width, height: natural.height });
+      port.postMessage({ natural: 1, n: n, width: natural.width, height: natural.height, time: natural.time });
     }
   }
 
@@ -643,7 +721,8 @@
       return function (self) {
         var h = original.get.call(self);
         if (h && !origins.has(h)) {
-          origins.set(h, { ms: self });
+          origins.set(h, { ms: new WeakRef(self) });
+          unposted++;
         }
         hookPost();
         return h;
@@ -667,13 +746,8 @@
       value: new Proxy(NativeWorker, {
         construct: function (target, args, newTarget) {
           var worker = Reflect.construct(target, args, newTarget);
-          var link = {
-            id: ++linkIds, port: null, count: 0, sizes: new Map(), views: new Map(), naturals: new Map(),
-          };
-          linkOf.set(worker, link);
-          links.add(link);
           worker.addEventListener('message', function (event) {
-            childMessage(link, event);
+            childMessage(worker, event);
           });
           return worker;
         },
@@ -691,8 +765,18 @@
   var silence = 0;
   var outbox = [];
   var nextId = 0;
-  // Conversions by id: {reply(data), fail(message)}.
+  // Conversions by id: {reply(data), fail(message)}. They hold what they
+  // convert for weakly: a stream the page let go of without closing it
+  // (an element removed from a feed) is collected, and its converter
+  // stream closed then.
   var conversions = {};
+  var conversionGone = G.FinalizationRegistry ? new FinalizationRegistry(function (id) {
+    if (conversions[id]) {
+      delete conversions[id];
+      live.delete(id);
+      post({ type: 'close', sb: id });
+    }
+  }) : null;
 
   function post(message, transfer) {
     if (broken) {
@@ -828,29 +912,83 @@
     }
   }
 
-  function register(conversion) {
+  // Registers what converts for |owner| (a SourceBuffer's state or a
+  // file's job), held weakly: |onReply| and |onFail| (top-level functions:
+  // a closure would hold the owner through its scope) get (owner, data or
+  // message, id).
+  function register(owner, onReply, onFail) {
     var id = ++nextId;
-    conversions[id] = conversion;
+    conversions[id] = conversion(id, new WeakRef(owner), onReply, onFail);
+    if (conversionGone) {
+      conversionGone.register(owner, id, owner);
+    }
     return id;
+  }
+
+  function conversion(id, ref, onReply, onFail) {
+    return {
+      reply: function (data) {
+        var it = ref.deref();
+        if (it) {
+          onReply(it, data, id);
+        }
+      },
+      fail: function (message) {
+        var it = ref.deref();
+        if (it) {
+          onFail(it, message, id);
+        }
+      },
+    };
+  }
+
+  // Done with conversion |id| of |owner|: the converter's stream closes.
+  function unregister(id, owner) {
+    if (conversions[id]) {
+      delete conversions[id];
+      post({ type: 'close', sb: id });
+    }
+    if (conversionGone && owner) {
+      conversionGone.unregister(owner);
+    }
   }
 
   // --------------------------------------------------------- display size
 
   // How big each converted video is shown, so the worker encodes no more
-  // than that: in device pixels, or CSS pixels on battery power, with at
-  // most SLOW_FPS frames a second for small videos and ones out of view.
-  // Elements are found through the blob: URL of their MediaSource, or the
-  // handle of one in a worker.
+  // than that: the picture's size (object-fit and letterboxing counted) in
+  // device pixels, or CSS pixels on battery power, with at most SLOW_FPS
+  // frames a second for videos out of view, tiny ones, and on battery small
+  // ones. An element whose size comes from the video's (width and height
+  // auto) is laid out at the encoded size, whatever videoWidth says, so it
+  // gets the source's size. Elements are found through the blob: URL of
+  // their MediaSource, or the handle of one in a worker.
   var msUrls = new WeakMap();
+  // blob: URL -> WeakRef of the <video>, <audio> or <source> it was given.
   var urlElements = new Map();
   var sized = new WeakMap();
+  // Entries of the elements observed now: those in the document.
   var watched = new Set();
   var resizer = null;
   var seer = null;
   var onBattery = false;
   var batteryAsked = false;
-  // Per element showing a worker's MediaSource: {handle, origin}.
+  var pageHidden = false;
+  var pageAsked = false;
+  // Per element showing a worker's MediaSource: {handle, origin, stop}.
   var shown = new WeakMap();
+  var SourceElement = G.HTMLSourceElement;
+  var attributesHooked = false;
+  var AUTO = { 'auto': 1, 'fit-content': 1, 'min-content': 1, 'max-content': 1 };
+
+  function noteUrl(el, value) {
+    if (typeof value === 'string' && value.lastIndexOf('blob:', 0) === 0) {
+      urlElements.set(value, new WeakRef(el));
+      if (urlElements.size > 32) {
+        urlElements.delete(urlElements.keys().next().value);
+      }
+    }
+  }
 
   if (isWindow && Media) {
     hook(URL, 'createObjectURL', function (original) {
@@ -858,8 +996,39 @@
         var url = original.apply(self, args);
         if (args[0] instanceof MS) {
           msUrls.set(args[0], url);
+          hookAttributes();
         }
         return url;
+      };
+    });
+  }
+
+  // A MediaSource's URL reaches an element through its src property (see
+  // playPlainFiles), and also through setAttribute(), which elementOf()
+  // can't see inside shadow roots, and <source>. Hooked once the page
+  // makes a MediaSource URL.
+  function hookAttributes() {
+    if (attributesHooked || !G.Element) {
+      return;
+    }
+    attributesHooked = true;
+    if (SourceElement) {
+      hookAccessor(SourceElement.prototype, 'src', null, function (original) {
+        return function (self, value) {
+          noteUrl(self, value);
+          return original.set.call(self, value);
+        };
+      });
+    }
+    hook(G.Element.prototype, 'setAttribute', function (original) {
+      return function (self, args) {
+        var value = args[1];
+        if (typeof value === 'string' && value.charCodeAt(0) === 98 &&
+            (self instanceof Media || (SourceElement && self instanceof SourceElement)) &&
+            String(args[0]).toLowerCase() === 'src') {
+          noteUrl(self, value);
+        }
+        return original.apply(self, args);
       };
     });
   }
@@ -871,40 +1040,40 @@
     }
     var ref = urlElements.get(url);
     var el = ref && ref.deref();
-    if (el) {
+    if (SourceElement && el instanceof SourceElement) {
+      el = el.parentElement;
+    }
+    if (el instanceof Media) {
       return el;
     }
-    var all = document.querySelectorAll('video,audio');
+    var all = document.querySelectorAll('video,audio,video>source,audio>source');
     for (var i = 0; i < all.length; i++) {
       if (nativeGetAttribute.call(all[i], 'src') === url) {
-        return all[i];
+        return all[i] instanceof Media ? all[i] : all[i].parentElement;
       }
     }
     return null;
   }
 
   // Calls |update({width, height, fps})| soon and whenever |el| is shown
-  // otherwise, until it returns false: at once when the video is shown
-  // bigger (or faster), at most every half second when smaller.
+  // otherwise: at once when the video is shown bigger or faster, at most
+  // every half second when smaller or slower. Returns what stops it. An
+  // element out of the document isn't observed (observers keep what they
+  // observe) until it's back and plays.
   function watchSize(el, update) {
     if (!G.ResizeObserver || !el) {
-      return;
+      return function () {};
     }
     var entry = sized.get(el);
     if (!entry) {
       entry = {
-        el: el, updates: [], timer: 0, at: 0, css: null, device: null, visible: true, pip: null,
-        intrinsic: false, last: null, pending: null,
+        el: el, updates: [], timer: 0, at: 0, css: null, visible: true, pip: null, last: null, pending: null,
+        observed: false, events: new AbortController(), back: null,
       };
       sized.set(el, entry);
-      watched.add(entry);
-      resizer = resizer || new ResizeObserver(resized);
-      resizer.observe(el, { box: 'device-pixel-content-box' });
-      if (G.IntersectionObserver) {
-        seer = seer || new IntersectionObserver(seen);
-        seer.observe(el);
-      }
       watchBattery();
+      watchPage();
+      var signal = entry.events.signal;
       // Picture in picture shows it in a window of its own.
       el.addEventListener('enterpictureinpicture', function (event) {
         var pip = event.pictureInPictureWindow;
@@ -914,55 +1083,133 @@
             if (entry.pip === pip) {
               report(entry);
             }
-          });
+          }, { signal: signal });
         }
         report(entry);
-      });
+      }, { signal: signal });
       el.addEventListener('leavepictureinpicture', function () {
         entry.pip = null;
         report(entry);
-      });
-      // A new source: its size isn't the old one's.
-      el.addEventListener('emptied', function () {
-        entry.intrinsic = false;
-      });
+      }, { signal: signal });
+      sweep();
+      observe(entry);
     }
     if (entry.updates.indexOf(update) < 0) {
       entry.updates.push(update);
     }
-    if (entry.last && update(entry.last) === false) {
-      entry.updates.splice(entry.updates.indexOf(update), 1);
+    if (entry.last) {
+      update(entry.last);
     }
+    return function () {
+      unwatch(entry, update);
+    };
+  }
+
+  function observe(entry) {
+    if (entry.observed) {
+      return;
+    }
+    if (!entry.el.isConnected) {
+      awaitReturn(entry);
+      return;
+    }
+    entry.observed = true;
+    watched.add(entry);
+    resizer = resizer || new ResizeObserver(resized);
+    resizer.observe(entry.el);
+    if (G.IntersectionObserver) {
+      seer = seer || new IntersectionObserver(seen, { rootMargin: NEAR });
+      seer.observe(entry.el);
+    }
+  }
+
+  function unobserve(entry) {
+    if (!entry.observed) {
+      return;
+    }
+    entry.observed = false;
+    watched.delete(entry);
+    resizer.unobserve(entry.el);
+    if (seer) {
+      seer.unobserve(entry.el);
+    }
+    clearTimer(entry.timer);
+    entry.timer = 0;
+  }
+
+  // Out of the document: observed again once it's back and plays.
+  function awaitReturn(entry) {
+    unobserve(entry);
+    if (entry.back) {
+      return;
+    }
+    var back = entry.back = new AbortController();
+    var check = function () {
+      if (entry.back === back && entry.el.isConnected) {
+        back.abort();
+        entry.back = null;
+        observe(entry);
+      }
+    };
+    ['play', 'playing', 'timeupdate', 'seeking', 'loadeddata'].forEach(function (name) {
+      entry.el.addEventListener(name, check, { signal: back.signal });
+    });
+  }
+
+  function unwatch(entry, update) {
+    var i = entry.updates.indexOf(update);
+    if (i >= 0) {
+      entry.updates.splice(i, 1);
+    }
+    if (entry.updates.length || sized.get(entry.el) !== entry) {
+      return;
+    }
+    unobserve(entry);
+    if (entry.back) {
+      entry.back.abort();
+      entry.back = null;
+    }
+    entry.events.abort();
+    sized.delete(entry.el);
+  }
+
+  // Elements taken out of the document that the observers didn't report
+  // (one without a size has none to lose).
+  function sweep() {
+    watched.forEach(function (entry) {
+      if (!entry.el.isConnected) {
+        awaitReturn(entry);
+      }
+    });
   }
 
   function resized(entries) {
     entries.forEach(function (e) {
       var entry = sized.get(e.target);
-      var css = e.contentBoxSize && e.contentBoxSize[0];
-      var device = e.devicePixelContentBoxSize && e.devicePixelContentBoxSize[0];
-      if (!entry || !css) {
+      if (!entry || !entry.observed) {
         return;
       }
-      var was = entry.css;
-      entry.css = [css.inlineSize, css.blockSize];
-      var ratio = G.devicePixelRatio || 1;
-      entry.device = device ? [device.inlineSize, device.blockSize] : [css.inlineSize * ratio, css.blockSize * ratio];
-      // An element that takes its size from the video changes size as the
-      // encoded size does; shown natively, it would be the source's size.
-      if (was && (was[0] !== entry.css[0] || was[1] !== entry.css[1]) && followsVideo(entry)) {
-        entry.intrinsic = true;
-      }
+      var css = e.contentBoxSize && e.contentBoxSize[0];
+      entry.css = css ? [css.inlineSize, css.blockSize] : [e.contentRect.width, e.contentRect.height];
       report(entry);
     });
+    sweep();
   }
 
   function seen(entries) {
     entries.forEach(function (e) {
       var entry = sized.get(e.target);
-      if (entry && entry.visible !== e.isIntersecting) {
+      if (entry && entry.observed && entry.visible !== e.isIntersecting) {
         entry.visible = e.isIntersecting;
         report(entry);
       }
+    });
+    sweep();
+  }
+
+  function reportAll() {
+    watched.forEach(function (entry) {
+      report(entry);
     });
   }
 
@@ -977,9 +1224,7 @@
           var was = onBattery;
           onBattery = battery.charging === false;
           if (was !== onBattery) {
-            watched.forEach(function (entry) {
-              report(entry);
-            });
+            reportAll();
           }
         };
         battery.addEventListener('chargingchange', update);
@@ -988,11 +1233,61 @@
     } catch (e) {}
   }
 
-  function followsVideo(entry) {
-    var nat = naturals.get(entry.el);
-    var size = realSize(entry.el);
-    return !!nat && size[0] > 0 && Math.abs(entry.css[0] - size[0]) < 1.5 &&
-      Math.abs(entry.css[1] - size[1]) < 1.5 && (size[0] !== nat.width || size[1] !== nat.height);
+  // A hidden page shows no video.
+  function watchPage() {
+    if (pageAsked || !isWindow) {
+      return;
+    }
+    pageAsked = true;
+    var update = function () {
+      var was = pageHidden;
+      pageHidden = document.visibilityState === 'hidden';
+      if (was !== pageHidden) {
+        reportAll();
+      }
+    };
+    document.addEventListener('visibilitychange', update);
+    update();
+  }
+
+  // Whether the element's size comes from the video's: width and height
+  // both auto (or content-sized), as with max-width: 100%; height: auto.
+  function autoSized(el) {
+    try {
+      var map = el.computedStyleMap();
+      var width = map.get('width');
+      var height = map.get('height');
+      return !!width && !!height && AUTO[width.value] === 1 && AUTO[height.value] === 1;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // The size of the video's picture in an element |box| big (CSS pixels):
+  // it may be letterboxed (contain) or cropped (cover).
+  function painted(el, box, video) {
+    if (!video) {
+      return box;
+    }
+    var fit = 'contain';
+    try {
+      fit = String(el.computedStyleMap().get('object-fit'));
+    } catch (e) {}
+    var contain = Math.min(box[0] / video[0], box[1] / video[1]);
+    var cover = Math.max(box[0] / video[0], box[1] / video[1]);
+    var scale = fit === 'cover' || fit === 'fill' ? cover : fit === 'none' ? 1
+      : fit === 'scale-down' ? Math.min(1, contain) : contain;
+    return [video[0] * scale, video[1] * scale];
+  }
+
+  // The size the page sees for the video, or null before it has one.
+  function videoSize(el) {
+    var nat = naturals.get(el);
+    if (nat) {
+      return [nat.width, nat.height];
+    }
+    var real = realSize(el);
+    return real[0] > 0 && real[1] > 0 ? real : null;
   }
 
   // What to tell the worker about |entry|'s element, or null for nothing.
@@ -1003,29 +1298,42 @@
       return null;
     }
     var scale = onBattery ? 1 : G.devicePixelRatio || 1;
-    var nat = naturals.get(el);
     var size;
+    var visible;
     if (entry.pip) {
       size = [entry.pip.width * scale, entry.pip.height * scale];
-    } else if (entry.intrinsic && nat) {
+      visible = [entry.pip.width, entry.pip.height];
+    } else if (!(css[0] > 0) || !(css[1] > 0)) {
+      // Not shown (display: none): keep the size, drop the frames.
+      var last = entry.pending || entry.last;
+      return last ? { width: last.width, height: last.height, fps: SLOW_FPS } : null;
+    } else if (autoSized(el)) {
+      // Before the first frame it's the poster's size or the default.
+      var nat = naturals.get(el);
+      if (!nat || !(realSize(el)[0] > 0)) {
+        return null;
+      }
       size = [nat.width, nat.height];
-    } else if (!realSize(el)[0] && css[0] === 300 && css[1] === 150) {
-      // The default size of a video with no frames yet: it may take the
-      // video's own once it has some.
-      return null;
+      visible = css;
     } else {
-      size = onBattery ? css : entry.device;
+      var picture = painted(el, css, videoSize(el));
+      size = [picture[0] * scale, picture[1] * scale];
+      visible = [Math.min(picture[0], css[0]), Math.min(picture[1], css[1])];
     }
     var width = Math.round(size[0]);
     var height = Math.round(size[1]);
     if (!(width > 0) || !(height > 0)) {
       return null;
     }
-    var slow = !entry.pip && (!entry.visible || css[1] < SMALL);
+    var slow = !entry.pip && (!entry.visible || pageHidden || visible[0] < TINY[0] || visible[1] < TINY[1] ||
+                              (onBattery && visible[1] < SMALL));
     return { width: width, height: height, fps: slow ? SLOW_FPS : 0 };
   }
 
   function report(entry) {
+    if (!entry.observed) {
+      return;
+    }
     var size = measure(entry);
     if (!size) {
       return;
@@ -1062,17 +1370,16 @@
     }
     entry.last = size;
     entry.at = now();
-    entry.updates = entry.updates.filter(function (f) {
-      return f(size) !== false;
+    entry.updates.slice().forEach(function (f) {
+      f(size);
     });
-    if (!entry.updates.length) {
-      resizer.unobserve(entry.el);
-      if (seer) {
-        seer.unobserve(entry.el);
-      }
-      sized.delete(entry.el);
-      watched.delete(entry);
-    }
+  }
+
+  // Whether |el|'s frames are encoded fewer a second: out of view or tiny.
+  function capped(el) {
+    var entry = el && sized.get(el);
+    var size = entry && (entry.pending || entry.last);
+    return !!size && size.fps > 0;
   }
 
   function sendSize(st, size) {
@@ -1088,31 +1395,37 @@
   }
 
   // An element now shows a worker's MediaSource: sizes go to that worker,
-  // for that handle; one from elsewhere hears them all.
+  // for that handle. One whose worker isn't known goes to the only worker
+  // that converts, if there's one.
   function showHandle(el, handle) {
+    unshow(el);
     var origin = origins.get(handle) || null;
-    shown.set(el, { handle: handle, origin: origin || {} });
+    var view = { handle: handle, origin: origin || {}, stop: null };
+    shown.set(el, view);
     if (origin && origin.link) {
       origin.link.views.set(origin.n, new WeakRef(el));
       var nat = origin.link.naturals.get(origin.n);
       if (nat) {
-        setNatural(el, nat);
+        addNatural(el, nat, nat.time);
       }
     }
-    watchSize(el, function (size) {
-      var current = shown.get(el);
-      if (!current || current.handle !== handle) {
-        return false;
-      }
+    view.stop = watchSize(el, function (size) {
       if (origin && origin.link) {
         sendLink(origin.link, origin.n, size);
-      } else {
+      } else if (links.size === 1) {
         links.forEach(function (link) {
           sendLink(link, undefined, size);
         });
       }
-      return true;
     });
+  }
+
+  function unshow(el) {
+    var view = shown.get(el);
+    if (view) {
+      shown.delete(el);
+      view.stop();
+    }
   }
 
   // -------------------------------------------------------- natural size
@@ -1120,10 +1433,17 @@
   // The engine takes videoWidth and videoHeight from the frames, which the
   // worker may encode smaller than the source: a page that sizes the
   // element from them would shrink it at every keyframe. An element playing
-  // converted video reports the source's size (the worker says what it is),
-  // and fires resize when that changes, not when the encoded size does.
+  // converted video reports the source's size (the worker says what it is,
+  // and from when on the stream's timeline), and fires resize when that
+  // changes as it plays, not when the encoded size does. Canvas drawing
+  // and createImageBitmap() take the source's coordinates too.
   var naturals = new WeakMap();
+  // Per element: [{time, width, height}], the source's size from |time| on
+  // (seconds on the element's timeline), in time order; width 0 where what
+  // plays from then on isn't converted.
+  var naturalTimes = new WeakMap();
   var resizeSeen = new WeakMap();
+  var resizeHandled = new WeakSet();
   var videoProto = Video && Video.prototype;
   var realWidth = videoProto && getDescriptor(videoProto, 'videoWidth');
   var realHeight = videoProto && getDescriptor(videoProto, 'videoHeight');
@@ -1166,38 +1486,68 @@
         });
       };
     });
-    G.addEventListener('resize', function (event) {
-      var el = event.target;
-      var nat = el instanceof Video && naturals.get(el);
-      if (!nat) {
-        return;
-      }
-      var was = resizeSeen.get(el);
-      if (was && was.width === nat.width && was.height === nat.height) {
-        event.stopImmediatePropagation();
-        return;
-      }
-      resizeSeen.set(el, nat);
-    }, true);
+    G.addEventListener('resize', onResize, true);
+    hookCanvas();
   }
 
-  function setNatural(el, size) {
-    if (!videoProto || !(el instanceof Video) || !size || !(size.width > 0) || !(size.height > 0)) {
+  // A resize the page should see is one where the source's size changed.
+  // Heard on the window and on the element itself, for one out of the
+  // document or in a shadow root.
+  function onResize(event) {
+    var el = event.target;
+    if (!(el instanceof Video) || resizeHandled.has(event)) {
       return;
     }
-    installVideoHooks();
+    resizeHandled.add(event);
+    if (!naturalTimes.has(el)) {
+      return;
+    }
+    // The engine fires it when a frame of a new encoded size shows, which
+    // may be where the source's size changes too.
+    syncNatural(el, true);
+    var nat = naturals.get(el);
+    if (!nat) {
+      return;
+    }
+    var was = resizeSeen.get(el);
+    if (was && was.width === nat.width && was.height === nat.height) {
+      event.stopImmediatePropagation();
+      return;
+    }
+    resizeSeen.set(el, nat);
+  }
+
+  function onNaturalTime(event) {
+    syncNatural(event.target, false);
+  }
+
+  function onEmptied(event) {
+    clearNatural(event.target);
+  }
+
+  // The source's size for where |el| plays now.
+  function syncNatural(el, quiet) {
+    var list = naturalTimes.get(el);
+    if (!list || !list.length) {
+      return;
+    }
+    var time = el.currentTime;
+    var pick = list[0];
+    for (var i = 1; i < list.length && list[i].time <= time + 0.05; i++) {
+      pick = list[i];
+    }
     var old = naturals.get(el);
-    if (old && old.width === size.width && old.height === size.height) {
+    if (old ? old.width === pick.width && old.height === pick.height : !pick.width) {
       return;
     }
-    if (!old) {
-      el.addEventListener('emptied', function () {
-        naturals.delete(el);
-        resizeSeen.delete(el);
-      }, { once: true });
+    var real = realSize(el);
+    if (pick.width) {
+      naturals.set(el, { width: pick.width, height: pick.height });
+    } else {
+      naturals.delete(el);
+      resizeSeen.delete(el);
     }
-    naturals.set(el, { width: size.width, height: size.height });
-    if (realSize(el)[0] > 0) {
+    if (!quiet && real[0] > 0 && (pick.width ? true : real[0] !== old.width || real[1] !== old.height)) {
       task(function () {
         el.dispatchEvent(new NativeEvent('resize'));
       });
@@ -1208,24 +1558,208 @@
     }
   }
 
-  // The source's size of what |st| converts: for its element here, or the
-  // parent's for the handle it was posted as.
-  function naturalFor(st, size) {
-    if (!st.video || !size || !(size.width > 0)) {
+  // The source's size is |size| from |time| on (undefined: from now; null
+  // size: what plays from then on isn't converted). The first one counts
+  // at once: the page reads it at loadedmetadata.
+  function addNatural(el, size, time) {
+    if (!size) {
+      if (typeof time === 'number' && time > 0 && naturals.has(el)) {
+        size = { width: 0, height: 0 };
+      } else {
+        clearNatural(el);
+        return;
+      }
+    }
+    if (!videoProto || !(el instanceof Video) || !(size.width >= 0) || !(size.height >= 0)) {
       return;
     }
+    installVideoHooks();
+    var list = naturalTimes.get(el);
+    if (!list) {
+      list = [];
+      el.addEventListener('resize', onResize, true);
+      el.addEventListener('emptied', onEmptied);
+      ['timeupdate', 'seeked', 'loadedmetadata'].forEach(function (name) {
+        el.addEventListener(name, onNaturalTime);
+      });
+    }
+    var at = typeof time === 'number' && isFinite(time) && naturals.has(el) ? time : -Infinity;
+    // Appended from |at| on, it replaces what was there.
+    list = list.filter(function (item) {
+      return item.time < at;
+    });
+    list.push({ time: at, width: size.width, height: size.height });
+    naturalTimes.set(el, list.slice(-16));
+    syncNatural(el, false);
+  }
+
+  // |el| plays no converted video any more: its size is the engine's.
+  function clearNatural(el) {
+    if (!el || !naturalTimes.has(el)) {
+      return;
+    }
+    var old = naturals.get(el);
+    naturalTimes.delete(el);
+    naturals.delete(el);
+    resizeSeen.delete(el);
+    el.removeEventListener('resize', onResize, true);
+    el.removeEventListener('emptied', onEmptied);
+    ['timeupdate', 'seeked', 'loadedmetadata'].forEach(function (name) {
+      el.removeEventListener(name, onNaturalTime);
+    });
+    var real = realSize(el);
+    if (old && real[0] > 0 && (real[0] !== old.width || real[1] !== old.height)) {
+      task(function () {
+        el.dispatchEvent(new NativeEvent('resize'));
+      });
+    }
+    var entry = sized.get(el);
+    if (entry) {
+      report(entry);
+    }
+  }
+
+  // How much smaller converted |el|'s frames are than the source: [x, y,
+  // source size], or null.
+  function shrunk(el) {
+    var nat = naturals.get(el);
+    if (!nat) {
+      return null;
+    }
+    var real = realSize(el);
+    if (!(real[0] > 0) || !(real[1] > 0) || (real[0] === nat.width && real[1] === nat.height)) {
+      return null;
+    }
+    return [real[0] / nat.width, real[1] / nat.height, nat];
+  }
+
+  // drawImage(video, ...) and createImageBitmap(video, ...) with the
+  // source's coordinates mapped to the frame's. Never throws: anything odd
+  // goes to the engine as it was.
+  function hookCanvas() {
+    [G.CanvasRenderingContext2D, G.OffscreenCanvasRenderingContext2D].forEach(function (Context) {
+      if (!Context) {
+        return;
+      }
+      hook(Context.prototype, 'drawImage', function (original) {
+        return function (self, args) {
+          var mapped = args[0] instanceof Video ? drawArgs(args) : null;
+          return original.apply(self, mapped || args);
+        };
+      });
+    });
+    var owner = G;
+    while (owner && !Object.prototype.hasOwnProperty.call(owner, 'createImageBitmap')) {
+      owner = Object.getPrototypeOf(owner);
+    }
+    if (owner) {
+      hook(owner, 'createImageBitmap', function (original) {
+        return function (self, args) {
+          var mapped = args[0] instanceof Video ? bitmapArgs(args) : null;
+          return original.apply(self, mapped || args);
+        };
+      });
+    }
+  }
+
+  function drawArgs(args) {
+    try {
+      var f = shrunk(args[0]);
+      if (!f) {
+        return null;
+      }
+      var a = Array.prototype.slice.call(args);
+      if (a.length === 3) {
+        return [a[0], a[1], a[2], f[2].width, f[2].height];
+      }
+      if (a.length >= 9) {
+        a[1] = Number(a[1]) * f[0];
+        a[2] = Number(a[2]) * f[1];
+        a[3] = Number(a[3]) * f[0];
+        a[4] = Number(a[4]) * f[1];
+        return a;
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function bitmapArgs(args) {
+    try {
+      var f = shrunk(args[0]);
+      if (!f) {
+        return null;
+      }
+      var a = Array.prototype.slice.call(args);
+      var rect = a.length >= 5;
+      var at = rect ? 5 : 1;
+      var options = Object.assign({}, a[at] && typeof a[at] === 'object' ? a[at] : null);
+      if (options.resizeWidth === undefined && options.resizeHeight === undefined) {
+        options.resizeWidth = Math.max(1, Math.round(Math.abs(rect ? Number(a[3]) : f[2].width))) || 1;
+        options.resizeHeight = Math.max(1, Math.round(Math.abs(rect ? Number(a[4]) : f[2].height))) || 1;
+      }
+      if (rect) {
+        a[1] = Number(a[1]) * f[0];
+        a[2] = Number(a[2]) * f[1];
+        a[3] = Number(a[3]) * f[0];
+        a[4] = Number(a[4]) * f[1];
+      }
+      a[at] = options;
+      return a;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // The source's size of what |st| converts, from where |natural.at| is on
+  // the timeline of the append |snap| had: for its element here, or the
+  // parent's for the handle it was posted as.
+  function naturalFor(st, natural, snap) {
+    if (!st.video || !natural || !(natural.width > 0) || !(natural.height > 0)) {
+      return;
+    }
+    var size = { width: natural.width, height: natural.height };
+    var time = typeof natural.at === 'number' && snap && snap.mode !== 'sequence'
+      ? natural.at + snap.timestampOffset : undefined;
     if (isWindow) {
       var source = sources.get(st.ms);
-      if (source && source.el) {
-        setNatural(source.el, size);
+      var el = source && elementFor(source);
+      if (el) {
+        addNatural(el, size, time);
       }
       return;
     }
-    msNaturals.set(st.ms, size);
+    msNaturals.set(st.ms, { width: size.width, height: size.height, time: time });
     var n = ownSlot.get(st.ms);
     var port = n === undefined ? null : parentPort();
     if (port) {
-      port.postMessage({ natural: 1, n: n, width: size.width, height: size.height });
+      port.postMessage({ natural: 1, n: n, width: size.width, height: size.height, time: time });
+    }
+  }
+
+  // |st| no longer converts video: if nothing else on its MediaSource
+  // does, the element's sizes are the engine's again, from |time| on
+  // (undefined: now).
+  function naturalGone(st, time) {
+    if (!st.video) {
+      return;
+    }
+    var source = sources.get(st.ms);
+    if (!source || source.list.some(function (other) {
+      return other !== st && other.video && other.convert && !other.dead && !other.raw;
+    })) {
+      return;
+    }
+    if (isWindow) {
+      if (source.el) {
+        addNatural(source.el, null, time);
+      }
+      return;
+    }
+    msNaturals.delete(st.ms);
+    var n = ownSlot.get(st.ms);
+    var port = n === undefined ? null : parentPort();
+    if (port) {
+      port.postMessage({ natural: 1, n: n, clear: 1, time: time });
     }
   }
 
@@ -1238,8 +1772,9 @@
   //       before endOfStream() and changeType(), and the type changes that
   //       go in after them.
   //   chunks: what the real SourceBuffer is still to get: converted bytes
-  //       {bytes, snap}, or a type change {change, raw}; current: the one
-  //       it's appending now.
+  //       {bytes, snap, seq, range}, a type change {change, raw}, or a
+  //       remove() to do again {remove: [start, end]}; current: the one it's
+  //       appending or removing now.
   //   page: the settings the page sees, which the real SourceBuffer has
   //       whenever it isn't appending.
   //   snaps: the settings of recent appends by seq, for their frames the
@@ -1248,6 +1783,8 @@
   //       removed don't come back.
   //   carry: chunks of appends the page saw finish didn't fit; the page
   //       hears QuotaExceededError at its next append until they do.
+  //       What the page removes afterwards is removed again once they're
+  //       in, and abort() leaves them be: the page was told they went in.
   //   raw: the page changed to a type the engine plays: its appends go in
   //       as they are, after what was converted, and then the shim lets go.
   var states = new WeakMap();
@@ -1256,7 +1793,17 @@
   var sources = new WeakMap();
   // The MediaSource of every SourceBuffer made since this frame started.
   var owners = new WeakMap();
-  var live = new Set();
+  // Converted SourceBuffers by id, held weakly.
+  var live = new Map();
+
+  function eachLive(f) {
+    live.forEach(function (ref) {
+      var st = ref.deref();
+      if (st) {
+        f(st);
+      }
+    });
+  }
   var native = {};
   var EVENTS = ['updatestart', 'update', 'updateend', 'abort', 'error'];
   var SETTINGS = ['mode', 'appendWindowStart', 'appendWindowEnd', 'timestampOffset'];
@@ -1363,23 +1910,14 @@
     var st = {
       ms: ms, sb: sb, id: 0, seq: 0, convert: true, dead: false, firing: 0,
       video: mapType(type).indexOf(VP9) >= 0, size: null, sizer: null,
-      op: null, drain: null, chunks: [], current: null, reopening: false,
-      removing: false, queuedRemove: null, quota: 0, carry: false, retry: 0,
+      op: null, drain: null, chunks: [], current: null, reopening: false, unwatch: null,
+      removing: false, queuedRemove: null, quota: 0, carry: false, retry: 0, reach: 0,
       page: read(sb), last: null, lastSeq: 0, snaps: new Map(), removals: [], held: false, raw: false,
     };
     st.last = st.page;
-    st.id = register({
-      reply: function (data) {
-        reply(st, data);
-      },
-      fail: function (message) {
-        if (st.convert && !st.raw && !st.dead) {
-          failAppend(st, message);
-        }
-      },
-    });
+    st.id = register(st, reply, failConversion);
     states.set(sb, st);
-    live.add(st);
+    live.set(st.id, new WeakRef(st));
     var source = sources.get(ms);
     if (!source) {
       source = { ms: ms, list: [], el: elementOf(ms), eos: null, watching: null, lookahead: LOOKAHEAD };
@@ -1405,6 +1943,14 @@
     sizeFor(st);
   }
 
+  // Top-level, as conversions' handlers must be: a closure made in adopt()
+  // would share its scope, and hold the SourceBuffer and element strongly.
+  function failConversion(st, message) {
+    if (st.convert && !st.raw && !st.dead) {
+      failAppend(st, message);
+    }
+  }
+
   // Converting again, after the page changed to a type the engine plays.
   function resume(st, type) {
     st.convert = true;
@@ -1414,7 +1960,7 @@
     st.last = st.page;
     st.size = null;
     forget(st);
-    live.add(st);
+    live.set(st.id, new WeakRef(st));
     post({ type: 'open', sb: st.id, mime: type });
     sizeFor(st);
   }
@@ -1426,7 +1972,19 @@
     st.convert = false;
     dropOutput(st);
     restore(st);
-    live.delete(st);
+    live.delete(st.id);
+    stopSizing(st);
+    // What the page appends now plays after what was converted.
+    naturalGone(st, st.reach);
+  }
+
+  // The element showing |source|'s MediaSource, looked for again if it
+  // wasn't found when the SourceBuffer was made.
+  function elementFor(source) {
+    if (!source.el && isWindow) {
+      source.el = elementOf(source.ms);
+    }
+    return source.el;
   }
 
   function sizeFor(st) {
@@ -1434,12 +1992,13 @@
       return;
     }
     var source = sources.get(st.ms);
-    if (source && source.el) {
+    var el = source && elementFor(source);
+    if (el) {
       st.sizer = st.sizer || function (size) {
         sendSize(st, size);
-        return !st.dead;
       };
-      watchSize(source.el, st.sizer);
+      stopSizing(st);
+      st.unwatch = watchSize(el, st.sizer);
       return;
     }
     var size = msSizes.get(st.ms) || (ownSlot.has(st.ms) ? null : anySize);
@@ -1448,18 +2007,26 @@
     }
   }
 
+  function stopSizing(st) {
+    if (st.unwatch) {
+      st.unwatch();
+      st.unwatch = null;
+    }
+  }
+
   function close(st) {
     if (st.dead) {
       return;
     }
+    naturalGone(st);
     st.dead = true;
     dropOutput(st);
     endOp(st);
     st.queuedRemove = null;
     clearTimer(st.retry);
-    live.delete(st);
-    post({ type: 'close', sb: st.id });
-    delete conversions[st.id];
+    live.delete(st.id);
+    stopSizing(st);
+    unregister(st.id, st);
     var source = sources.get(st.ms);
     if (source) {
       source.list = source.list.filter(function (s) {
@@ -1602,7 +2169,7 @@
       failAppend(st, 'the engine could not play the converted video');
       return;
     }
-    if (chunk.snap.mode === 'sequence') {
+    if (chunk.snap && chunk.snap.mode === 'sequence') {
       // Sequence mode moves timestampOffset along with what went in.
       chunk.snap.timestampOffset = native.timestampOffset.get.call(st.sb);
     }
@@ -1630,12 +2197,14 @@
       // For an append the page aborted.
       return;
     }
+    var snap = mine ? op.snap : st.last;
     if (data.natural) {
-      naturalFor(st, data.natural);
+      var seq = data.natural.seq;
+      naturalFor(st, data.natural, (seq !== undefined && st.snaps.get(seq)) || snap);
     }
     takeHeld(st, data.held);
     if (data.bytes && data.bytes.byteLength) {
-      st.chunks.push({ bytes: data.bytes, snap: mine ? op.snap : st.last });
+      st.chunks.push({ bytes: data.bytes, snap: snap, seq: mine ? op.seq : st.lastSeq, range: data.range || null });
     }
     if (mine) {
       clearTimer(op.timer);
@@ -1667,7 +2236,7 @@
       }
       var snap = st.snaps.get(group.seq) || st.last;
       if (!removed(st, group, snap)) {
-        st.chunks.push({ bytes: group.bytes, snap: snap });
+        st.chunks.push({ bytes: group.bytes, snap: snap, seq: group.seq, range: { start: group.start, end: group.end } });
       }
     });
   }
@@ -1681,6 +2250,30 @@
     return st.removals.some(function (r) {
       return r.seq >= group.seq && r.start < end && start < r.end;
     });
+  }
+
+  // The page removed |from| to |to|: converted bytes of its earlier appends
+  // that haven't gone in yet (they didn't fit, or wait their turn) would
+  // bring some of it back, so it's removed again after them.
+  function removeAgain(st, from, to) {
+    var after = -1;
+    st.chunks.forEach(function (chunk, i) {
+      if (chunk.bytes && overlaps(chunk, from, to)) {
+        after = i;
+      }
+    });
+    if (after >= 0) {
+      st.chunks.splice(after + 1, 0, { remove: [from, to] });
+    }
+  }
+
+  function overlaps(chunk, from, to) {
+    var range = chunk.range;
+    if (!range || !(range.end > range.start) || chunk.snap.mode === 'sequence') {
+      return true;
+    }
+    var offset = chunk.snap.timestampOffset;
+    return range.start + offset < to && from < range.end + offset;
   }
 
   // No frames of earlier appends can come any more.
@@ -1709,9 +2302,20 @@
       }
       return;
     }
-    while (st.chunks.length && st.chunks[0].change) {
+    while (st.chunks.length && (st.chunks[0].change || st.chunks[0].remove)) {
+      var next = st.chunks.shift();
+      if (next.remove) {
+        try {
+          native.remove.call(st.sb, next.remove[0], next.remove[1]);
+          st.current = next;
+          return;
+        } catch (e) {
+          // Nothing there to remove (past the duration).
+          continue;
+        }
+      }
       try {
-        native.changeType.call(st.sb, st.chunks.shift().change);
+        native.changeType.call(st.sb, next.change);
       } catch (e) {
         failAppend(st, e.message);
         return;
@@ -1735,6 +2339,7 @@
       st.quota = 0;
       clearTimer(st.retry);
       st.retry = 0;
+      reached(st, chunk);
       return;
     }
     restore(st);
@@ -1775,7 +2380,7 @@
     if (source && source.eos && waited >= (playing ? 4 : 1) * QUOTA_WAIT) {
       debug('MBGA could not convert video: no room for the end of it');
       st.chunks = st.chunks.filter(function (chunk) {
-        return chunk.change;
+        return chunk.change || chunk.remove;
       });
       st.carry = false;
       st.quota = 0;
@@ -1789,6 +2394,14 @@
     }, playing ? RETRY : 5 * RETRY);
     if (source) {
       watch(source);
+    }
+  }
+
+  // How far on the timeline the converted bytes that went in reach.
+  function reached(st, chunk) {
+    var range = chunk.range;
+    if (range && range.end > range.start && chunk.snap.mode !== 'sequence' && !st.raw) {
+      st.reach = Math.max(st.reach, range.end + chunk.snap.timestampOffset);
     }
   }
 
@@ -1884,7 +2497,7 @@
         !(el.playbackRate > 0) || el.readyState < 3) {
       return false;
     }
-    return ahead(el) > source.lookahead;
+    return ahead(el) > (capped(el) ? LOOKAHEAD_SHORT : source.lookahead);
   }
 
   // Sends the page's append to the worker, unless the video plays with
@@ -2082,6 +2695,7 @@
           st.chunks.shift();
           st.current = chunk;
           st.quota = 0;
+          reached(st, chunk);
         }
         st.carry = false;
         var op = {
@@ -2095,7 +2709,7 @@
         if (op.raw) {
           op.sent = true;
           op.received = true;
-          st.chunks.push({ bytes: op.bytes, snap: op.snap });
+          st.chunks.push({ bytes: op.bytes, snap: op.snap, seq: op.seq, range: null });
           op.bytes = null;
           pump(st);
           return;
@@ -2123,31 +2737,37 @@
                                  'Aborting asynchronous remove() operation is disallowed.',
                                  'InvalidStateError');
         }
-        original.apply(self, args);
-        // A type change the page made still holds: the real SourceBuffer
-        // takes the last one now.
-        var changes = st.chunks.filter(function (chunk) {
-          return chunk.change;
+        // abort() drops the append it interrupts. What earlier appends
+        // converted and type changes the page made stay and still go in:
+        // the page was told they did. The real SourceBuffer's own append
+        // is aborted only if it's the interrupted one's.
+        var had = st.op;
+        var aborted = had ? had.seq : NaN;
+        var current = st.current;
+        var keepCurrent = !!current && !st.reopening && current.seq !== aborted && readyState(st.ms) === 'open';
+        if (!keepCurrent) {
+          original.apply(self, args);
+        }
+        endOp(st);
+        var keep = st.chunks.filter(function (chunk) {
+          return chunk.change || chunk.remove || chunk.seq !== aborted;
         }).concat(st.drain && !st.drain.received ? st.drain.changes : []);
-        var had = endOp(st);
-        // The worker starts over; what it hasn't given back is dropped, as
-        // the page asked.
+        var carry = st.carry;
+        // The worker starts over; frames it held are dropped.
         dropOutput(st);
         forget(st);
         st.reopening = false;
+        st.chunks = keep;
+        st.current = keepCurrent ? current : null;
+        st.carry = carry && keep.some(function (chunk) {
+          return chunk.bytes;
+        });
         st.page.appendWindowStart = 0;
         st.page.appendWindowEnd = Infinity;
-        if (changes.length) {
-          try {
-            native.changeType.call(st.sb, changes[changes.length - 1].change);
-          } catch (e) {}
-        }
-        if (st.raw) {
-          finishRaw(st);
-        } else {
-          restore(st);
+        if (!st.raw) {
           post({ type: 'reset', sb: st.id });
         }
+        restore(st);
         if (had) {
           task(function () {
             start(had, st);
@@ -2157,6 +2777,7 @@
             fire(st, 'updateend');
           });
         }
+        pump(st);
       };
     });
 
@@ -2186,6 +2807,7 @@
           reopen(st);
           st.removing = true;
         }
+        removeAgain(st, from, to);
         st.removals.push({ seq: st.seq, start: from, end: to });
         var oldest = st.snaps.size ? st.snaps.keys().next().value : Infinity;
         st.removals = st.removals.filter(function (r) {
@@ -2350,12 +2972,7 @@
         if (anyJob) {
           cancel(jobs.get(self));
         }
-        if (typeof value === 'string' && value.lastIndexOf('blob:', 0) === 0) {
-          urlElements.set(value, new WeakRef(self));
-          if (urlElements.size > 32) {
-            urlElements.delete(urlElements.keys().next().value);
-          }
-        }
+        noteUrl(self, value);
         return original.set.call(self, value);
       };
     });
@@ -2370,7 +2987,7 @@
           // hears how big it's shown.
           showHandle(self, value);
         } else {
-          shown.delete(self);
+          unshow(self);
         }
         return original.set.call(self, value);
       };
@@ -2568,8 +3185,14 @@
       if (job.fetch) {
         job.fetch.abort();
       }
-      post({ type: 'close', sb: job.id });
-      delete conversions[job.id];
+      unregister(job.id, job);
+      if (job.unwatch) {
+        job.unwatch();
+        job.unwatch = null;
+      }
+      if (job.opened) {
+        clearNatural(job.el);
+      }
       job.out = [];
       job.sb = null;
       job.resolve(false);
@@ -2616,6 +3239,7 @@
         fetch: null, id: 0, sent: 0, received: 0, out: [], ms: null, sb: null, blob: null, read: false,
         drained: false, failed: false, done: false, swapped: false, wake: null, mime: null,
         ready: null, resolve: null, size: null, natural: null, opened: false, reached: 0, windowStart: 0,
+        offset: 0, ranges: null, unwatch: null, keepalive: 0,
       };
       job.ready = new Promise(function (resolve) {
         job.resolve = resolve;
@@ -2629,15 +3253,11 @@
           }
         }, { signal: job.abort.signal });
       });
-      watchSize(el, function (size) {
-        if (job.done) {
-          return false;
-        }
+      job.unwatch = watchSize(el, function (size) {
         job.size = size;
         sendJobSize(job);
-        return true;
       });
-      startStream(job);
+      startStream(job, 0);
     }
 
     function sendJobSize(job) {
@@ -2650,77 +3270,118 @@
       post({ type: 'size', sb: job.id, width: size.width, height: size.height, fps: size.fps || 0 });
     }
 
-    // Converts the file from its start: first, and again after a seek back
-    // into what was dropped to make room.
-    function startStream(job) {
-      if (job.fetch) {
-        job.fetch.abort();
-      }
+    // Converts the file from |start| seconds on: from its start first, and
+    // again after a seek back into what was dropped to make room, or far
+    // ahead of what's converted.
+    function startStream(job, start) {
       if (job.id) {
-        post({ type: 'close', sb: job.id });
-        delete conversions[job.id];
+        unregister(job.id, job);
       }
-      var fetching = job.fetch = new AbortController();
       job.sent = 0;
       job.received = 0;
       job.out = [];
       job.read = false;
       job.drained = false;
       job.sentSize = null;
-      var id = job.id = register({
-        reply: function (data) {
-          if (job.id !== id) {
-            return;
-          }
-          if (data.type === 'error') {
-            debug('MBGA could not convert ' + job.url + ': ' + data.message);
-            giveUp(job);
-            return;
-          }
-          job.received++;
-          job.mime = data.mime || job.mime;
-          var held = Array.isArray(data.held) ? data.held.map(function (group) {
-            return group && group.bytes;
-          }) : [data.held];
-          held.concat([data.bytes]).forEach(function (bytes) {
-            if (bytes && bytes.byteLength) {
-              job.out.push(bytes);
-            }
-          });
-          if (data.natural) {
-            job.natural = data.natural;
-            if (job.opened) {
-              setNatural(job.el, job.natural);
-            }
-          }
-          if (!job.ms && job.out.length) {
-            attach(job);
-          }
-          feed(job);
-          wake(job);
-        },
-        fail: function (message) {
-          if (job.id === id) {
-            debug('MBGA could not convert ' + job.url + ': ' + message);
-            giveUp(job);
-          }
-        },
-      });
-      post({ type: 'open', sb: id, mime: 'progressive' });
+      var id = job.id = register(job, streamReply, streamFailed);
+      post({ type: 'open', sb: id, mime: 'progressive', start: start });
       sendJobSize(job);
+      download(job, id, 0);
+    }
+
+    // Handlers of a job's conversion: only the job's current id is its own.
+    function streamFailed(job, message, id) {
+      if (job.id === id) {
+        debug('MBGA could not convert ' + job.url + ': ' + message);
+        giveUp(job);
+      }
+    }
+
+    function streamReply(job, data, id) {
+      if (job.id !== id || job.done) {
+        return;
+      }
+      if (data.type === 'error') {
+        debug('MBGA could not convert ' + job.url + ': ' + data.message);
+        giveUp(job);
+        return;
+      }
+      job.received++;
+      job.mime = data.mime || job.mime;
+      var held = Array.isArray(data.held) ? data.held.map(function (group) {
+        return group && group.bytes;
+      }) : [data.held];
+      held.concat([data.bytes]).forEach(function (bytes) {
+        if (bytes && bytes.byteLength) {
+          job.out.push(bytes);
+        }
+      });
+      if (data.natural) {
+        job.natural = data.natural;
+        if (job.opened) {
+          addNatural(job.el, data.natural, data.natural.at);
+        }
+      }
+      // The converter wants the file from elsewhere: the moov at the end
+      // of a big file, or where the samples from |start| on are.
+      if (typeof data.need === 'number' && data.need >= 0 && data.need !== job.offset) {
+        download(job, id, data.need);
+      }
+      if (!job.ms && job.out.length) {
+        attach(job);
+      }
+      feed(job);
+      wake(job);
+    }
+
+    // Downloads the file from byte |from| on, with a Range request; a
+    // server that ignores it sends the whole file, and what comes before
+    // |from| is skipped. The converter takes appends that go on from where
+    // it wants, and drops (and answers) ones sent before it said otherwise.
+    function download(job, id, from) {
+      if (job.fetch) {
+        job.fetch.abort();
+      }
+      var fetching = job.fetch = new AbortController();
+      job.offset = from;
+      job.read = false;
+      job.drained = false;
       // An earlier download waiting for room ends now.
       wake(job);
-      var credentials = job.el.crossOrigin === 'use-credentials' ? 'include' : 'same-origin';
-      fetch(job.url, { credentials: credentials, signal: fetching.signal }).then(function (response) {
+      var init = {
+        credentials: job.el.crossOrigin === 'use-credentials' ? 'include' : 'same-origin',
+        signal: fetching.signal,
+      };
+      if (from > 0 && job.ranges !== false) {
+        init.headers = { Range: 'bytes=' + from + '-' };
+      }
+      fetch(job.url, init).then(function (response) {
         if (!response.ok || !response.body) {
           throw new Error('HTTP ' + response.status);
         }
+        var skip = 0;
+        if (response.status === 206) {
+          // Content-Range isn't readable cross-origin without CORS saying so.
+          var m = /^bytes (\d+)-/.exec(response.headers.get('Content-Range') || '');
+          if (m && +m[1] !== from) {
+            throw new Error('the server sent another range');
+          }
+          job.ranges = true;
+        } else if (from > 0) {
+          job.ranges = false;
+          skip = from;
+        } else if (/bytes/i.test(response.headers.get('Accept-Ranges') || '')) {
+          job.ranges = true;
+        }
         var reader = response.body.getReader();
+        var ours = function () {
+          return !job.done && job.id === id && job.fetch === fetching;
+        };
         return (function next() {
           return room(job).then(function () {
-            return job.done || job.id !== id ? null : reader.read();
+            return ours() ? reader.read() : null;
           }).then(function (chunk) {
-            if (!chunk || job.done || job.id !== id) {
+            if (!chunk || !ours()) {
               return;
             }
             if (chunk.done) {
@@ -2728,21 +3389,33 @@
               feed(job);
               return;
             }
-            var bytes = chunk.value.byteOffset || chunk.value.byteLength !== chunk.value.buffer.byteLength
-              ? chunk.value.slice().buffer : chunk.value.buffer;
-            post({ type: 'append', sb: id, seq: ++job.sent, bytes: bytes }, [bytes]);
+            var view = chunk.value;
+            if (skip) {
+              if (view.byteLength <= skip) {
+                skip -= view.byteLength;
+                return next();
+              }
+              view = view.subarray(skip);
+              skip = 0;
+            }
+            var bytes = view.byteOffset || view.byteLength !== view.buffer.byteLength ? view.slice().buffer : view.buffer;
+            var offset = job.offset;
+            job.offset += bytes.byteLength;
+            post({ type: 'append', sb: id, seq: ++job.sent, offset: offset, bytes: bytes }, [bytes]);
             return next();
           });
         })();
       }).catch(function () {
         // A site that doesn't allow reading the file (CORS) keeps its error.
-        if (job.id === id && !fetching.signal.aborted) {
+        if (job.id === id && job.fetch === fetching && !fetching.signal.aborted) {
           giveUp(job);
         }
       });
     }
 
-    // Waits while plenty is converted ahead of the playhead.
+    // Waits while plenty is converted ahead of the playhead: less for a
+    // video out of view, whose frames are fewer. The converter hears that
+    // the stream is still wanted while the video plays.
     function room(job) {
       return new Promise(function check(resolve) {
         var buffered = 0;
@@ -2756,7 +3429,8 @@
             }
           }
         }
-        if (job.done || (job.sent - job.received < 2 && job.out.length < 4 && buffered < LOOKAHEAD)) {
+        var lookahead = capped(job.el) ? LOOKAHEAD_SHORT : LOOKAHEAD;
+        if (job.done || (job.sent - job.received < 2 && job.out.length < 4 && buffered < lookahead)) {
           resolve();
           return;
         }
@@ -2764,7 +3438,29 @@
           job.wake = null;
           check(resolve);
         };
+        keepAlive(job);
       });
+    }
+
+    function keepAlive(job) {
+      if (job.keepalive) {
+        return;
+      }
+      // Weakly: a job whose element is gone isn't kept for this.
+      var ref = new WeakRef(job);
+      var timer = job.keepalive = G.setInterval(function () {
+        var it = ref.deref();
+        if (!it || it.done || !it.wake || it.keepalive !== timer) {
+          G.clearInterval(timer);
+          if (it && it.keepalive === timer) {
+            it.keepalive = 0;
+          }
+          return;
+        }
+        if (!it.el.paused) {
+          post({ type: 'keepalive', sb: it.id });
+        }
+      }, KEEPALIVE);
     }
 
     function wake(job) {
@@ -2773,8 +3469,9 @@
       }
     }
 
-    // A seek back into what was dropped to make room converts the file
-    // again, keeping what's from a little before the playhead on.
+    // A seek back into what was dropped to make room, or well past what's
+    // converted, converts the file again from there: with Range requests,
+    // only the bytes from there on are fetched.
     function seeked(job) {
       var sb = job.sb;
       if (!sb || job.done) {
@@ -2787,12 +3484,12 @@
           return;
         }
       }
-      if (time >= job.reached - 1) {
-        // Ahead of what's converted: it's on its way.
+      if (time >= job.reached - 1 && !(job.ranges !== false && time > job.reached + 30)) {
+        // Just ahead of what's converted: it's on its way.
         return;
       }
-      job.windowStart = Math.max(0, time - 10);
-      startStream(job);
+      job.reached = time;
+      startStream(job, time);
     }
 
     // Plays the converted stream on the element, which keeps its settings.
@@ -2824,7 +3521,7 @@
         }
         job.opened = true;
         if (job.natural) {
-          setNatural(el, job.natural);
+          addNatural(el, job.natural, job.natural.at);
         }
         job.sb.addEventListener('updateend', function () {
           var ranges = job.sb ? job.sb.buffered : null;
