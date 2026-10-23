@@ -5,6 +5,22 @@
 #include "include/cef_sandbox_mac.h"
 #endif
 
+namespace {
+
+class HelperApp : public CefApp {
+ public:
+  void OnBeforeCommandLineProcessing(
+      const CefString& process_type,
+      CefRefPtr<CefCommandLine> command_line) override {
+    command_line->RemoveSwitch("remote-debugging-pipe");
+  }
+
+ private:
+  IMPLEMENT_REFCOUNTING(HelperApp);
+};
+
+}
+
 int main(int argc, char* argv[]) {
 #if defined(CEF_USE_SANDBOX)
   CefScopedSandboxContext sandbox_context;
@@ -19,5 +35,6 @@ int main(int argc, char* argv[]) {
   }
 
   CefMainArgs main_args(argc, argv);
-  return CefExecuteProcess(main_args, nullptr, nullptr);
+  CefRefPtr<HelperApp> app(new HelperApp);
+  return CefExecuteProcess(main_args, app, nullptr);
 }
