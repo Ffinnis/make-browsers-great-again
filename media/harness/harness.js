@@ -1,6 +1,7 @@
 // Runs each case in cases.json through worker.js in the real engine and
 // appends the output to a real MediaSource, the way shim.js does: `held`
-// bytes first, then the append's own, and a `drain` before endOfStream().
+// groups first, then the append's own bytes, and a `drain` before
+// endOfStream().
 // Results land in window.results; ?case=a,b runs some cases, ?save=1 posts
 // each SourceBuffer's converted bytes to serve.py for ffprobe,
 // ?tune={...} hands the worker encoder settings to compare (self.mbgaTune),
@@ -29,10 +30,17 @@ class Converter {
     this.waiting = new Map();
     this.seq = new Map();
     this.fatal = null;
+    this.ready = new Promise((resolve) => {
+      this.onReady = resolve;
+    });
     worker.onmessage = (e) => {
       const msg = e.data;
       if (msg.type === 'fatal') {
         this.fatal = msg.message;
+        return;
+      }
+      if (msg.type === 'ready') {
+        this.onReady(performance.now());
         return;
       }
       const key = msg.type === 'stats' ? 'stats' : msg.sb + ':' + msg.seq;
@@ -57,6 +65,11 @@ class Converter {
 
   append(sb, bytes) {
     return this.request(sb, { type: 'append', bytes }, [bytes]);
+  }
+
+  // The seq the next append or drain on `sb` gets.
+  next(sb) {
+    return (this.seq.get(sb) || 0) + 1;
   }
 
   drain(sb) {
@@ -132,6 +145,20 @@ function patch(data, patches) {
   return data;
 }
 
+// The init, then each moof with its mdat.
+function units(data) {
+  const out = [];
+  let start = 0;
+  for (const [type, at] of walk(data)) {
+    if (type === 'moof') {
+      if (at > start) out.push(data.slice(start, at));
+      start = at;
+    }
+  }
+  out.push(data.slice(start));
+  return out;
+}
+
 // The vp09 sample entries' sizes in some output.
 function vp09Sizes(data) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -144,6 +171,7 @@ async function runCase(conv, c, sbBase, expected) {
     result.ok = false;
     result.problems.push(msg);
   };
+  if (c.tune) conv.post({ type: 'tune', tune: c.tune });
   const before = await conv.stats();
   const video = document.createElement('video');
   video.muted = true;
@@ -159,7 +187,17 @@ async function runCase(conv, c, sbBase, expected) {
     const id = sbBase + i;
     conv.post({ type: 'open', sb: id, mime: spec.mime });
     const out = spec.mime === 'progressive' ? null : mapMime(spec.mime);
-    return { spec, id, mime: out, sb: out ? ms.addSourceBuffer(out) : null, times: [], bytes: [], sizes: [], helds: 0 };
+    return {
+      spec,
+      id,
+      mime: out,
+      sb: out ? ms.addSourceBuffer(out) : null,
+      times: [],
+      bytes: [],
+      sizes: [],
+      helds: 0,
+      natural: null,
+    };
   });
   if (states.some((s) => !s.sb) && states.length > 1) throw new Error('one progressive SourceBuffer per case');
 
@@ -168,9 +206,20 @@ async function runCase(conv, c, sbBase, expected) {
       s.mime = reply.mime;
       s.sb = ms.addSourceBuffer(reply.mime);
     }
-    for (const part of [reply.held, reply.bytes]) {
+    if (reply.natural) s.natural = [reply.natural.width, reply.natural.height];
+    const parts = [];
+    for (const g of reply.held || []) {
+      // Each group is an earlier append's, with that append's settings (the
+      // same throughout here), and a time range within the input's.
+      if (!(g.seq < reply.seq) || !(g.end > g.start) || !(g.bytes.byteLength > 0)) {
+        fail(`${label}: bad held group ${JSON.stringify({ seq: g.seq, start: g.start, end: g.end })} in ${reply.seq}`);
+      }
+      s.helds++;
+      parts.push(g.bytes);
+    }
+    parts.push(reply.bytes);
+    for (const part of parts) {
       if (!part || !part.byteLength) continue;
-      if (part === reply.held) s.helds++;
       const bytes = new Uint8Array(part);
       s.bytes.push(bytes);
       s.sizes.push(...vp09Sizes(bytes));
@@ -184,13 +233,35 @@ async function runCase(conv, c, sbBase, expected) {
 
   await Promise.all(states.map(async (s) => {
     const actions = s.spec.actions || {};
-    for (const [index, file] of s.spec.files.entries()) {
-      const action = actions[index] || {};
-      if (action.size) conv.post({ type: 'size', sb: s.id, width: action.size[0], height: action.size[1] });
+    // `units`: the files' moof+mdat units, appended in this order (indices,
+    // 0 the init), as players that load a fragment again do.
+    const fetched = async (file) => {
       // a+b: both in one append.
       const parts = await Promise.all(file.split('+').map(async (f) => new Uint8Array(await (await fetch(url(f))).arrayBuffer())));
-      let data = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      const data = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
       parts.reduce((at, p) => (data.set(p, at), at + p.length), 0);
+      return data;
+    };
+    let appends = s.spec.files;
+    let pieces = null;
+    if (s.spec.units) {
+      const all = units(await fetched(s.spec.files.join('+')));
+      pieces = s.spec.units.map((i) => all[i]);
+      appends = s.spec.units.map((i) => `unit ${i}`);
+    }
+    for (const [index, file] of appends.entries()) {
+      const action = actions[index] || {};
+      if (action.wait) await new Promise((r) => setTimeout(r, action.wait));
+      if (action.drain) {
+        // As before endOfStream(), and then the page carries on.
+        const reply = await conv.drain(s.id);
+        if (reply.type === 'error') fail(`drain: ${reply.message}`);
+        else await deliver(s, 'drain', reply);
+      }
+      if (action.size) {
+        conv.post({ type: 'size', sb: s.id, width: action.size[0], height: action.size[1], fps: action.size[2] || 0 });
+      }
+      let data = pieces ? pieces[index] : await fetched(file);
       if (action.patch) data = patch(data, action.patch);
       const step = s.spec.split || data.length;
       for (let at = 0; at < data.length; at += step) {
@@ -209,8 +280,9 @@ async function runCase(conv, c, sbBase, expected) {
           return;
         }
         s.times.push({ file, bytes: size, ms: Math.round(took) });
+        const held = (reply.held || []).map((g) => `${g.bytes.byteLength}@${g.seq}`).join(',');
         log(`  ${file} @${at}: ${reply.type} ${reply.bytes ? reply.bytes.byteLength : reply.message}` +
-          `${reply.held ? ' held ' + reply.held.byteLength : ''} in ${Math.round(took)} ms`);
+          `${held ? ' held ' + held : ''} in ${Math.round(took)} ms`);
         if (action.expect === 'error') {
           if (reply.type !== 'error') fail(`${file}: converted, expected an error`);
           continue;
@@ -232,6 +304,7 @@ async function runCase(conv, c, sbBase, expected) {
   if (conv.fatal) fail('fatal: ' + conv.fatal);
   if (c.errorsOnly) {
     for (const s of states) conv.post({ type: 'close', sb: s.id });
+    if (c.tune) conv.post({ type: 'tune', tune: {} });
     video.remove();
     return result;
   }
@@ -261,6 +334,9 @@ async function runCase(conv, c, sbBase, expected) {
       }
     } else if (!got.length) {
       fail(`sb ${i}: nothing buffered`);
+    }
+    if (s.spec.natural && JSON.stringify(s.natural) !== JSON.stringify(s.spec.natural)) {
+      fail(`sb ${i}: natural size ${JSON.stringify(s.natural)}, expected ${JSON.stringify(s.spec.natural)}`);
     }
     if (s.spec.lastSize) {
       const last = s.sizes[s.sizes.length - 1];
@@ -327,6 +403,11 @@ async function runCase(conv, c, sbBase, expected) {
   for (const key of Object.keys(after)) {
     if (typeof after[key] === 'number') result.worker[key] = after[key] - (before[key] || 0);
   }
+  // Counters that have to have moved, such as {"recycled": 1}: at least.
+  for (const [key, least] of Object.entries(c.expectStats || {})) {
+    if (!(result.worker[key] >= least)) fail(`worker ${key} ${result.worker[key]}, expected at least ${least}`);
+  }
+  if (c.tune) conv.post({ type: 'tune', tune: {} });
   video.pause();
   video.remove();
   return result;
@@ -335,7 +416,10 @@ async function runCase(conv, c, sbBase, expected) {
 async function main() {
   const cases = await (await fetch('/media/harness/cases.json')).json();
   const expected = await fetch('/out/expected.json').then((r) => (r.ok ? r.json() : {}));
+  const t0 = performance.now();
   const conv = await startWorker();
+  const readyMs = Math.round((await conv.ready) - t0);
+  log('worker ready in', readyMs, 'ms');
   const only = params.get('case');
   const results = [];
   let sbBase = 1;
@@ -355,6 +439,7 @@ async function main() {
     log(last.ok ? 'ok' : 'FAILED', c.name, (last.problems || []).join('; '));
   }
   window.results = results;
+  window.readyMs = readyMs;
   document.title = 'done';
 }
 

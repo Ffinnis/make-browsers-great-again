@@ -15,7 +15,8 @@ crate, built to WebAssembly:
   H.264 is unsupported), which carries on from one fragment to the next,
   and encodes the frames it puts out with a `VideoEncoder`: a VP9 keyframe
   wherever the input has an IDR picture, at the size the page shows the
-  video at (never larger than the input's), at the input's bitrate.
+  video at (never larger than the input's), at the input's bitrate, and at
+  most at the frame rate the shim caps it to.
 - AAC becomes FLAC, decoded with symphonia (MPL-2.0) and written by a
   small FLAC encoder here: one FLAC frame per AAC frame, so timestamps and
   durations stay as they were. HE-AAC plays its AAC-LC core at half the
@@ -67,25 +68,38 @@ From the page (`ArrayBuffer`s are transferred):
 | `{type: 'open', sb, mime}`          | A new stream on `sb`, with the type given to `addSourceBuffer()` or `changeType()`. `mime: 'progressive'` takes a whole MP4 file instead of MSE segments.              |
 | `{type: 'append', sb, seq, bytes}`  | What the page appended: any mix of init and media segments, or part of one.                                                                                            |
 | `{type: 'drain', sb, seq}`          | Put out every frame the decoder still holds. `seq` counts on from the appends'. Send it before `endOfStream()` and before `open` for a `changeType()`.                 |
-| `{type: 'size', sb, width, height}` | The element showing `sb` is this big, in device pixels. Any time, as often as it changes; the next keyframe is encoded to fit it (aspect kept, never above the input). |
+| `{type: 'size', sb, width, height, fps?}` | The element showing `sb` is this big, in device pixels, and needs at most `fps` frames a second (0 or absent: all). Any time, as often as it changes; the next keyframe is encoded to fit (aspect kept, never above the input), and the cap applies at once. |
 | `{type: 'reset', sb}`               | The page aborted: drop partial input and decoder state, keep the init.                                                                                                 |
 | `{type: 'close', sb}`               | Done with `sb`.                                                                                                                                                        |
 
-Every append and every drain gets exactly one reply, in order:
-`{type: 'output', sb, seq, bytes, held?, mime?}`, or `{type: 'error', sb,
-seq, message}` when the input can't be converted.
+`{type: 'ready'}` comes once, when the module is compiled and an instance
+of it made (the shim times startup by it). Every append and every drain
+gets exactly one reply, in order: `{type: 'output', sb, seq, bytes, held?,
+mime?, natural?}`, or `{type: 'error', sb, seq, message}` when the input
+can't be converted.
 
 - `bytes` is the append's converted output: empty while nothing is
   complete. The converted init comes with the append that held the
   original, and again before the first output after a `reset`, in case
   the page dropped the aborted append's output with the init in it.
-- `held`, when there is one, holds frames of earlier appends that the
-  decoder put out only now. Append it first, with the settings
-  (`timestampOffset`, append window, mode) the previous append had, then
-  `bytes` with the current ones. A drain's reply has everything in `held`
-  and `bytes` empty, so settings changed since the last append don't apply
-  to it. A drain isn't needed when settings change: `held` takes care of
-  that.
+- `held`, when there is one, is an array of groups `{seq, bytes, start,
+  end}`, in append order: frames of earlier appends that the decoder put
+  out only now, each group from the append numbered `seq`. Append each
+  first, with the settings (`timestampOffset`, append window, mode) append
+  `seq` had, then `bytes` with the current ones. `start` and `end` are the
+  group's presentation times in seconds on the stream's own timeline
+  (after the init's edit list, as the engine reads it, before
+  `timestampOffset`), so the shim can drop a group that overlaps what the
+  page `remove()`d since. A group may begin with the converted init, when
+  it has to come again. A drain's reply has everything in `held` and
+  `bytes` empty, so settings changed since the last append don't apply to
+  it. A drain isn't needed when settings change: `held` takes care of that.
+- `natural`, `{width, height}`, comes whenever the output or `held` has a
+  converted init: the input video's display size (its sample entry's size
+  stretched by its pasp, or else to its track header's aspect, as the
+  engine's MP4 parser works it out). The engine reports the encoded size,
+  which is smaller when the element is (see Limitations), so the shim shows
+  this as `videoWidth`/`videoHeight` instead.
 - `mime`, on an output whose converted init has a new type, such as
   `video/mp4; codecs="vp09.00.41.08,flac"`: progressive files need it to
   make their SourceBuffer. The page's codecs map as `avc1.*`/`avc3.*` →
@@ -93,8 +107,13 @@ seq, message}` when the input can't be converted.
   `mp4a.6B`, `mp4a.40.34`) isn't converted and fails.
 
 `{type: 'fatal', message}` comes once if the module can't be compiled;
-every append and drain then gets an `error`. The worker also answers
-`{type: 'stats'}` with counters for the harness.
+every append and drain then gets an `error`. For the harness only, the
+worker answers `{type: 'stats'}` with counters and takes `{type: 'tune',
+tune}` to change its settings (see worker.js).
+
+A video-only SourceBuffer's type maps as before, `avc1`/`avc3` →
+`video/mp4; codecs="vp09.00.41.08"`; VP8 in WebM was measured and isn't
+worth it (see Cost).
 
 A progressive file that turns out to be fragmented (X's fallback MP4s are)
 is read as MSE segments. Otherwise the moov's sample tables become an init
@@ -115,19 +134,24 @@ into buffers the converter reserves, so nothing is copied twice.
 | Export                                                             | Does                                                                                                |
 | ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
 | `mm_create(progressive) → h`, `mm_destroy(h)`                      | A converter per SourceBuffer.                                                                       |
-| `mm_begin(h)`                                                      | Starts an append or a drain: frames of earlier ones go in `held` from now on.                       |
+| `mm_begin(h, seq)`                                                 | Starts an append or a drain, the page's `seq`: frames of earlier ones go in `held` from now on.     |
 | `mm_reserve(h, len) → ptr`, `mm_commit(h, len)`                    | Room for input (null past 192 MB waiting), then takes what JS wrote there.                          |
 | `mm_poll(h) → 0 / 1 / -1`                                          | Converts what's complete: 0 done, 1 a video job waits, -1 failed (`mm_error_ptr/len`).              |
 | `mm_job_len(h)`, `mm_job_samples(h)`, `mm_job_data(h)`             | The job: `JobSample` records (40 bytes) and the Annex-B data their offsets point into.              |
-| `mm_frame(h, track, timestamp) → 0 / 1`                            | The decoder put this frame out: 1 to encode it, 0 to drop it (decode order would go back).          |
+| `mm_frame(h, track, timestamp, skip) → 0 / 1 / 2`                  | The decoder put this frame out: 1 encode, 2 encode as a keyframe, 0 drop. `skip` asks to leave it out for the frame-rate cap: the frame before then lasts longer (not for keyframes, nor without one to stretch: then 1). |
 | `mm_chunk_buffer(h, len) → ptr`                                    | Room for an encoded chunk.                                                                          |
 | `mm_chunk(h, track, timestamp, key, width, height, len)`           | The VP9 chunk written there, its frame's timestamp and its coded size (a new size gets a new init). |
 | `mm_flushed(h, track)`                                             | The decoder was flushed and all chunks are in; the next job starts at a keyframe or replays.        |
 | `mm_restart(h)`                                                    | The codecs were lost (an error, or the engine reclaimed them).                                      |
 | `mm_write(h)`                                                      | Ends the job, if any, and writes fragments with every chunk so far; poll again.                     |
 | `mm_output_ptr/len(h)`, `mm_held_ptr/len(h)`, `mm_output_clear(h)` | Converted bytes so far, and frames of earlier appends.                                              |
+| `mm_held_count(h)`, `mm_held_groups(h)`                            | `held`'s groups: `HeldGroup` records (32 bytes).                                                    |
+| `mm_output_discard(h)`                                             | Drops a failed append's output; the converted init comes again before the next.                    |
+| `mm_inits(h)`, `mm_natural_width/height(h)`                        | Converted inits in the output and `held`; the input's display size.                                 |
 | `mm_reset(h)`                                                      | After `abort()`.                                                                                    |
-| `mm_recyclable(h) → 0 / 1`                                         | Nothing waits in the converter, so a fresh instance primed with the init would carry on the same.   |
+| `mm_recyclable(h) → 0 / 1`                                         | A fresh instance primed with the init and this one's state would carry on the same.                 |
+| `mm_save_state(h) → len`, `mm_state_ptr(h)`                        | That state: where each track is, the GOP it may replay, the counters.                               |
+| `mm_state_buffer(h, len) → ptr`, `mm_load_state(h, len) → 0 / -1`  | A fresh instance takes it over, after the init.                                                     |
 | `mm_mime_ptr/len(h)`                                               | The converted init's type.                                                                          |
 | `mm_init_ptr/len(h)`, `mm_init_generation(h)`                      | The last input init, to prime a new instance with.                                                  |
 
@@ -136,16 +160,53 @@ timestamp f64 (µs), duration f64 (µs), codec u32 (profile, constraints and
 level for "avc1.PPCCLL"), bitrate u32 (the input's so far)`. Flags: 1 key
 (an IDR picture), 2 decode only (after a flush, a fragment that continues
 mid-GOP replays the GOP so far, since the decoder needs a keyframe), 4
-flush the decoder after this job.
+flush the decoder after this job. `HeldGroup`: `seq f64, start f64, end f64
+(seconds), offset u32, len u32` (into `held`).
 
 The worker runs a module instance per SourceBuffer, so a trap on bad input
 costs one stream one append. An instance whose memory grew past 64 MB is
-replaced at the next moment nothing waits in it: WebAssembly memory never
-shrinks.
+replaced at the next moment nothing waits in it (WebAssembly memory never
+shrinks): a fresh one is primed with the init and takes over the old one's
+state, GOP included, so a fragment that continues mid-GOP after a flush
+still replays it. An AAC decoder's overlap can't move, so a stream with
+AAC is replaced only before its first frame or right after a reset.
+
+A stream that gets nothing for 8 seconds (a paused, hidden or finished
+player) flushes its codecs and closes them, since a VP9 encoder holds tens
+of MB; their last frames go out with the next reply, in `held`, and the
+next append opens new ones (replaying the GOP if it continues one).
 
 The worker feeds the decoder only while the decoder and encoder each have
 at most 4 requests queued, so decoded frames (3 MB each at 1080p) don't
 pile up, and every codec wait times out after 20 seconds with an `error`.
+
+## Cost
+
+Profiled with `sample` in a test copy (CEF's symbols are on Spotify's CDN,
+`…_release_symbols.tar.bz2`), converting Tears of Steel 720p30 H.264 shown
+at its own size: libvpx's VP9 encoder takes 98% of the renderer's time
+(its row threads 70%, `vpx_codec_encode` 27%), this module and worker.js
+about 1%, and mapping VideoToolbox's frames for the encoder doesn't show.
+The engine encodes VP9 at speed 7 (`cpu_used` is fixed in
+`vpx_video_encoder.cc`; no WebCodecs option changes it). So the cost per
+frame is libvpx's, and what helps is giving it fewer pixels or frames.
+CPU seconds (renderer + GPU process) per 60 s of 720p converted, M1 Max:
+
+| Encode                                      | CPU-s | Notes                                         |
+| ------------------------------------------- | ----- | --------------------------------------------- |
+| VP9, 1280×720, 30 fps (as before)           | 21    | VideoToolbox decoding is 2.3 of it            |
+| `latencyMode: 'quality'`                    | 21    | Same speed; no frame dropping                 |
+| `bitrateMode: 'constant'`                   | 19–21 | −0.2 dB PSNR; within noise, not taken         |
+| `scalabilityMode: 'L1T2'`                   | 21    | Twice the bytes                               |
+| Half the bitrate                            | 19    | Less quality for 8%                           |
+| VP8 (WebM needed)                           | 14    | Decoding it takes 2.2 more than VP9 (in hardware); 17% less overall, not taken |
+| Cap at 15 fps                               | 12    | Bitrate scaled with the frame rate            |
+| Cap at 5 fps (hidden)                       | 5     |                                               |
+| 640×360 (element half the size)             | 7     |                                               |
+| 640×360, 15 fps                             | 4.5   |                                               |
+
+1080p: 43. Playing the VP9 the converter puts out costs 3.7 more (decoded
+by VideoToolbox), the same as a native VP9 stream.
 
 ## Tests
 
@@ -170,7 +231,11 @@ and files (`v.mp4`, `gif.mp4`) to run those too.
 MediaSource the way shim.js does (`held` first, a `drain` at the end) and
 checks the buffered ranges against the input's timeline, that frames and
 audio decode, and A/V start alignment. Cases can also abort an append,
-damage the input (and expect an `error`), and send `size` messages.
+damage the input (and expect an `error`), send `size` messages (with a
+frame-rate cap), wait or drain between appends, append a file's fragments
+in any order (`units`, to append one again), check the `natural` size, run
+with other worker settings (`tune`, such as a 1-byte memory limit to
+recycle at every chance) and expect worker counters to move.
 
 ```sh
 python3 media/harness/expect.py <samples> /tmp/mbga-media-harness
@@ -207,9 +272,12 @@ quantizer mode at q48, 42.6 dB at 3.6 times the size and 20% more time.
   frames or 32 MB back, past which it's dropped too; and B-frames shown
   before a frame the drain already put out are dropped.
 - Without a `drain`, the last few frames the decoder holds never come out.
-- When the video is encoded smaller, `videoWidth` and `videoHeight` follow
-  the encoded size (the aspect ratio stays): the engine takes them from the
-  frames, not from the track header, which keeps the input's size.
+- When the video is encoded smaller, the engine's `videoWidth` and
+  `videoHeight` follow the encoded size (the aspect ratio stays): it takes
+  them from the frames' size and the container's aspect ratio, which only
+  ever stretches one side. VP9's render_size doesn't help: the engine's
+  hardware path clamps it to the frame size (`vp9_decoder.cc`), and libvpx
+  ignores it. So the shim shows `natural` instead.
 - A converter takes at most 192 MB of input waiting at once (a progressive
   file whose moov comes after that, or that isn't interleaved), a fragment
   at most 131,072 samples, a track of a progressive file at most a million.

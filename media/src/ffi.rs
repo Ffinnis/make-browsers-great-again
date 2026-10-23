@@ -12,7 +12,7 @@
 //! the reason in `mm_error_*`.
 #![allow(unsafe_code)]
 
-use crate::conv::{Converter, JobSample, Poll};
+use crate::conv::{Converter, HeldGroup, JobSample, Poll};
 
 fn status(c: &mut Converter, r: crate::bytes::Result<i32>) -> i32 {
     r.unwrap_or_else(|e| {
@@ -61,16 +61,16 @@ pub unsafe extern "C" fn mm_destroy(h: *mut Converter) {
     }
 }
 
-/// Starts an append or a drain: frames from earlier ones come out in
-/// `held` from now on.
+/// Starts an append or a drain, the page's `seq`: frames from earlier ones
+/// come out in `held` from now on, grouped by theirs.
 ///
 /// # Safety
 /// See `conv`.
 #[no_mangle]
-pub unsafe extern "C" fn mm_begin(h: *mut Converter) {
+pub unsafe extern "C" fn mm_begin(h: *mut Converter, seq: f64) {
     // SAFETY: forwarded contract.
     if let Some(c) = unsafe { conv(h) } {
-        c.begin();
+        c.begin(seq);
     }
 }
 
@@ -152,15 +152,16 @@ pub unsafe extern "C" fn mm_job_data(h: *mut Converter) -> *const u8 {
     unsafe { conv(h) }.and_then(|c| c.job()).map_or(std::ptr::null(), |j| j.data.as_ptr())
 }
 
-/// The decoder put out the frame with `timestamp`: 1 to encode it, 0 to
-/// drop it.
+/// The decoder put out the frame with `timestamp`: 1 to encode it, 2 to
+/// encode it as a keyframe, 0 to drop it. `skip` != 0 asks to leave it out
+/// to cap the frame rate, which the converter allows unless it can't.
 ///
 /// # Safety
 /// See `conv`.
 #[no_mangle]
-pub unsafe extern "C" fn mm_frame(h: *mut Converter, track: u32, timestamp: f64) -> u32 {
+pub unsafe extern "C" fn mm_frame(h: *mut Converter, track: u32, timestamp: f64, skip: u32) -> u32 {
     // SAFETY: forwarded contract.
-    unsafe { conv(h) }.map_or(0, |c| u32::from(c.frame(track, timestamp)))
+    unsafe { conv(h) }.map_or(0, |c| c.frame(track, timestamp, skip != 0))
 }
 
 /// Room for an encoded chunk of `len` bytes, for `mm_chunk`.
@@ -260,8 +261,8 @@ pub unsafe extern "C" fn mm_reset(h: *mut Converter) {
     }
 }
 
-/// 1 if nothing waits in the converter, so a fresh one primed with the
-/// init would carry on the same.
+/// 1 if a fresh converter primed with the init and this one's state
+/// (`mm_save_state`) would carry on the same.
 ///
 /// # Safety
 /// See `conv`.
@@ -269,6 +270,65 @@ pub unsafe extern "C" fn mm_reset(h: *mut Converter) {
 pub unsafe extern "C" fn mm_recyclable(h: *mut Converter) -> u32 {
     // SAFETY: forwarded contract.
     unsafe { conv(h) }.map_or(0, |c| u32::from(c.recyclable()))
+}
+
+/// Writes the state a fresh converter needs to carry on from this one;
+/// returns its length. The bytes are at `mm_state_ptr`.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_save_state(h: *mut Converter) -> usize {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(0, |c| {
+        c.save_state();
+        c.state.len()
+    })
+}
+
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_state_ptr(h: *mut Converter) -> *const u8 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(std::ptr::null(), |c| c.state.as_ptr())
+}
+
+/// Room for `len` bytes of another converter's state, for `mm_load_state`.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_state_buffer(h: *mut Converter, len: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
+        return std::ptr::null_mut();
+    };
+    c.state.clear();
+    if c.state.try_reserve(len).is_err() {
+        return std::ptr::null_mut();
+    }
+    c.state.spare_capacity_mut().as_mut_ptr().cast()
+}
+
+/// Takes over the state written to `mm_state_buffer`, after the init
+/// primed this converter. 0, or -1 if it doesn't fit (nothing changed).
+///
+/// # Safety
+/// See `conv` and `grow`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_load_state(h: *mut Converter, len: usize) -> i32 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
+        return -1;
+    };
+    // SAFETY: forwarded contract.
+    if !unsafe { grow(&mut c.state, len) } {
+        return -1;
+    }
+    let state = std::mem::take(&mut c.state);
+    let r = c.load_state(&state).map(|()| 0);
+    status(c, r)
 }
 
 /// # Safety
@@ -285,6 +345,26 @@ pub unsafe extern "C" fn mm_output_ptr(h: *mut Converter) -> *const u8 {
 pub unsafe extern "C" fn mm_output_len(h: *mut Converter) -> usize {
     // SAFETY: forwarded contract.
     unsafe { conv(h) }.map_or(0, |c| c.output.len())
+}
+
+/// How many groups `held` has: frames of one earlier append each.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_held_count(h: *mut Converter) -> usize {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(0, |c| c.held_groups.len())
+}
+
+/// The groups, `mm_held_count` records of `HeldGroup`.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_held_groups(h: *mut Converter) -> *const HeldGroup {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(std::ptr::null(), |c| c.held_groups.as_ptr())
 }
 
 /// Frames of earlier appends, for the page to append before the output.
@@ -313,14 +393,50 @@ pub unsafe extern "C" fn mm_held_len(h: *mut Converter) -> usize {
 pub unsafe extern "C" fn mm_output_clear(h: *mut Converter) {
     // SAFETY: forwarded contract.
     if let Some(c) = unsafe { conv(h) } {
-        for buf in [&mut c.output, &mut c.held] {
-            buf.clear();
-            // A big append's output needn't stay allocated.
-            if buf.capacity() > 16 << 20 {
-                *buf = Vec::new();
-            }
-        }
+        c.clear_output();
     }
+}
+
+/// Drops the output of an append that failed; the converted init comes
+/// again before the next output.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_output_discard(h: *mut Converter) {
+    // SAFETY: forwarded contract.
+    if let Some(c) = unsafe { conv(h) } {
+        c.discard_output();
+    }
+}
+
+/// How many converted inits the output and `held` have.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_inits(h: *mut Converter) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(0, |c| c.inits_out)
+}
+
+/// The input video's display width and height, as the engine would show
+/// it unconverted; 0 without video.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_natural_width(h: *mut Converter) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.natural()).map_or(0, |n| n.0)
+}
+
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_natural_height(h: *mut Converter) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.and_then(|c| c.natural()).map_or(0, |n| n.1)
 }
 
 /// # Safety

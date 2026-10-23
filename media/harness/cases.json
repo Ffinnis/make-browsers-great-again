@@ -218,6 +218,10 @@
         "lastSize": [
           360,
           640
+        ],
+        "natural": [
+          720,
+          1280
         ]
       }
     ]
@@ -252,6 +256,10 @@
         "lastSize": [
           180,
           320
+        ],
+        "natural": [
+          720,
+          1280
         ]
       }
     ]
@@ -372,6 +380,211 @@
                 }
               }
             ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "x-fps",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              360,
+              640,
+              10
+            ]
+          }
+        },
+        "natural": [
+          720,
+          1280
+        ]
+      }
+    ],
+    "expectStats": {
+      "capped": 100
+    }
+  },
+  {
+    "name": "reappend",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          3,
+          4
+        ]
+      }
+    ]
+  },
+  {
+    "name": "rest",
+    "tune": {
+      "rest": 300
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "2": {
+            "wait": 1000
+          },
+          "4": {
+            "wait": 1000
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rested": 2
+    }
+  },
+  {
+    "name": "x-rest",
+    "tune": {
+      "rest": 300
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "3": {
+            "wait": 1000
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rested": 1
+    }
+  },
+  {
+    "name": "recycle",
+    "tune": {
+      "bigMemory": 1
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "samples/ainit.mp4",
+          "samples/a0.m4s",
+          "samples/a1.m4s",
+          "samples/a2.m4s",
+          "samples/a3.m4s",
+          "samples/a4.m4s",
+          "samples/a5.m4s"
+        ]
+      }
+    ],
+    "expectStats": {
+      "recycled": 4
+    }
+  },
+  {
+    "name": "recycle-midgop",
+    "tune": {
+      "bigMemory": 1
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "2": {
+            "drain": true
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "recycled": 1,
+      "decodeOnly": 1
+    }
+  },
+  {
+    "name": "huge-duration",
+    "errorsOnly": true,
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "actions": {
+          "0": {
+            "patch": [
+              {
+                "box": "mdhd",
+                "set": {
+                  "20": 1
+                }
+              },
+              {
+                "box": "stts",
+                "set": {
+                  "20": 4294967295
+                }
+              }
+            ],
+            "expect": "error"
           }
         }
       }

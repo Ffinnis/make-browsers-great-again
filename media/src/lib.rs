@@ -13,4 +13,6 @@ mod init;
 mod progressive;
 
 pub use bytes::Error;
-pub use conv::{Converter, Job, JobSample, Poll, DECODE_ONLY, FLUSH, KEY, MAX_INPUT};
+pub use conv::{
+    Converter, HeldGroup, Job, JobSample, Poll, DECODE_ONLY, DROP, ENCODE, ENCODE_KEY, FLUSH, KEY, MAX_INPUT,
+};

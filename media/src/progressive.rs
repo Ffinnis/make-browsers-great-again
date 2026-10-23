@@ -240,24 +240,52 @@ fn pairs_of_three(data: Option<&[u8]>) -> Result<Vec<(u32, u32)>> {
 /// `FRAGMENT_SECONDS`, moved to a video keyframe if one comes within
 /// `KEYFRAME_SLACK` after that, so that fragments start on keyframes where
 /// the file allows and sparse keyframes don't make one huge fragment.
-pub fn cut_times(video: Option<(&[FileSample], u32)>, end: f64) -> Vec<f64> {
-    let keys: Vec<f64> = video.map_or_else(Vec::new, |(samples, timescale)| {
-        samples.iter().filter(|s| s.sync).map(|s| s.dts as f64 / f64::from(timescale)).collect()
-    });
-    let mut cuts = Vec::new();
-    let mut start = 0.0;
-    let mut next_key = 0;
-    // The last fragment runs longer rather than leave a short one after it.
-    while end - (start + FRAGMENT_SECONDS) > KEYFRAME_SLACK {
-        let due = start + FRAGMENT_SECONDS;
-        while keys.get(next_key).is_some_and(|&k| k < due) {
-            next_key += 1;
-        }
-        start = keys.get(next_key).copied().filter(|&k| k <= due + KEYFRAME_SLACK).unwrap_or(due);
-        cuts.push(start);
+///
+/// Planned one fragment at a time from where the samples still to go out
+/// start, so a span without samples (a sample whose duration claims years)
+/// is skipped rather than cut into two-second pieces, and every fragment
+/// takes at least one sample: the work is bounded by the sample count.
+pub struct Cuts {
+    /// Video keyframes' decode times in seconds, in order.
+    keys: Vec<f64>,
+    next_key: usize,
+    /// Where the file's last sample ends.
+    end: f64,
+}
+
+impl Cuts {
+    pub fn new(video: Option<(&[FileSample], u32)>, end: f64) -> Self {
+        let keys = video.map_or_else(Vec::new, |(samples, timescale)| {
+            samples.iter().filter(|s| s.sync).map(|s| s.dts as f64 / f64::from(timescale)).collect()
+        });
+        Cuts { keys, next_key: 0, end }
     }
-    cuts.push(f64::INFINITY);
-    cuts
+
+    /// The end of the fragment after `start`, the decode time of the first
+    /// sample still to go out.
+    pub fn next(&mut self, start: f64) -> f64 {
+        let due = start + FRAGMENT_SECONDS;
+        // The last fragment runs longer rather than leave a short one after it.
+        if self.end - due <= KEYFRAME_SLACK || !due.is_finite() {
+            return f64::INFINITY;
+        }
+        while self.keys.get(self.next_key).is_some_and(|&k| k < due) {
+            self.next_key += 1;
+        }
+        self.keys.get(self.next_key).copied().filter(|&k| k <= due + KEYFRAME_SLACK).unwrap_or(due)
+    }
+}
+
+/// For each sample, the lowest file offset of it and every sample after
+/// it: where the bytes still needed start, without rescanning the table.
+pub fn suffix_min_offsets(samples: &[FileSample]) -> Vec<u64> {
+    let mut out = vec![0; samples.len()];
+    let mut min = u64::MAX;
+    for (i, s) in samples.iter().enumerate().rev() {
+        min = min.min(s.offset);
+        out[i] = min;
+    }
+    out
 }
 
 /// The top-level boxes of a file so far: the moov's range once it's all
@@ -283,5 +311,40 @@ pub fn find_moov(data: &[u8]) -> Result<Scan> {
             return Ok(Scan::Moov(pos + header..pos + size));
         }
         pos = pos.saturating_add(size);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::float_cmp)]
+mod tests {
+    use super::*;
+
+    fn sample(dts: i64, sync: bool, offset: u64) -> FileSample {
+        FileSample { dts, cto: 0, duration: 1, sync, offset, size: 1 }
+    }
+
+    #[test]
+    fn cuts_follow_keyframes_within_the_slack() {
+        // Keyframes every 2.5 s at timescale 10.
+        let samples: Vec<FileSample> = (0..100).map(|i| sample(i, i % 25 == 0, 0)).collect();
+        let mut cuts = Cuts::new(Some((&samples, 10)), 10.0);
+        assert_eq!(cuts.next(0.0), 2.5);
+        assert_eq!(cuts.next(2.5), 5.0);
+        assert_eq!(cuts.next(5.0), 7.5);
+        // Less than the slack would be left after the next one.
+        assert_eq!(cuts.next(7.5), f64::INFINITY);
+    }
+
+    #[test]
+    fn a_sample_lasting_years_makes_one_cut_not_billions() {
+        let mut cuts = Cuts::new(None, f64::from(u32::MAX));
+        assert_eq!(cuts.next(0.0), 2.0);
+        assert_eq!(cuts.next(1e9), 1e9 + 2.0);
+    }
+
+    #[test]
+    fn suffix_minima() {
+        let samples: Vec<FileSample> = [5, 3, 9, 4, 8].iter().map(|&o| sample(0, true, o)).collect();
+        assert_eq!(suffix_min_offsets(&samples), [3, 3, 4, 4, 8]);
     }
 }

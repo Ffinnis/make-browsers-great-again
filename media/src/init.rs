@@ -27,6 +27,11 @@ pub struct Track {
     pub timescale: u32,
     pub codec: Codec,
     pub defaults: Defaults,
+    /// What the engine takes off presentation times: the media time of the
+    /// edit list's first entry, if it isn't an empty edit.
+    pub edit_offset: i64,
+    /// The track header's width and height, for the display aspect.
+    header_size: (f64, f64),
     /// The original sample description, for tracks that pass through and
     /// for building the converted one.
     entry: Vec<u8>,
@@ -55,6 +60,51 @@ impl Track {
     pub fn size(&self) -> Option<(u16, u16)> {
         let at = self.entry.get(8 + 24..8 + 28)?;
         Some((u16::from_be_bytes([at[0], at[1]]), u16::from_be_bytes([at[2], at[3]])))
+    }
+
+    /// The size the engine would show an H.264 track at, worked out as its
+    /// MP4 parser does: the sample entry's size, wider or taller by the
+    /// pasp box's pixel aspect ratio, or else by the track header's aspect.
+    pub fn natural(&self) -> Option<(u32, u32)> {
+        if !self.is_video() {
+            return None;
+        }
+        let (width, height) = self.size()?;
+        let (mut w, mut h) = (f64::from(width), f64::from(height));
+        if w < 1.0 || h < 1.0 {
+            return Some((u32::from(width), u32::from(height)));
+        }
+        let pasp = self.entry.get(8 + 78..).and_then(|rest| child(rest, *b"pasp").ok().flatten());
+        let pixel = pasp.and_then(|p| {
+            let mut r = Reader::new(p);
+            Some((r.u32().ok()?, r.u32().ok()?))
+        });
+        match pixel {
+            Some((hs, vs)) if (hs, vs) != (1, 1) && hs > 0 && vs > 0 => {
+                let par = f64::from(hs) / f64::from(vs);
+                if par >= 1.0 {
+                    w *= par;
+                } else {
+                    h /= par;
+                }
+            }
+            _ => {
+                let (tw, th) = self.header_size;
+                if tw > 0.0 && th > 0.0 {
+                    let dar = tw / th;
+                    if dar >= w / h {
+                        w = h * dar;
+                    } else {
+                        h = w / dar;
+                    }
+                }
+            }
+        }
+        let (w, h) = (w.round(), h.round());
+        if !(1.0..=65535.0).contains(&w) || !(1.0..=65535.0).contains(&h) {
+            return Some((u32::from(width), u32::from(height)));
+        }
+        Some((w as u32, h as u32))
     }
 }
 
@@ -153,6 +203,39 @@ fn track_id(trak: &[u8]) -> Result<u32> {
     r.u32()
 }
 
+/// The track header's width and height (16.16 fixed point).
+fn header_size(trak: &[u8]) -> Result<(f64, f64)> {
+    let Some(tkhd) = child(trak, *b"tkhd")? else {
+        return Ok((0.0, 0.0));
+    };
+    let mut r = Reader::new(tkhd);
+    let (version, _) = r.full_header()?;
+    // Times, ids, layer and so on, and the matrix.
+    r.skip(if version == 1 { 84 } else { 72 })?;
+    Ok((f64::from(r.u32()?) / 65536.0, f64::from(r.u32()?) / 65536.0))
+}
+
+/// The media time of the first edit, which the engine takes off every
+/// presentation time (it ignores the rest of an edit list).
+fn edit_offset(trak: &[u8]) -> Result<i64> {
+    let Some(elst) = path(trak, &[b"edts", b"elst"])? else {
+        return Ok(0);
+    };
+    let mut r = Reader::new(elst);
+    let (version, _) = r.full_header()?;
+    if r.u32()? == 0 {
+        return Ok(0);
+    }
+    let media_time = if version == 1 {
+        r.skip(8)?;
+        r.u64()? as i64
+    } else {
+        r.skip(4)?;
+        i64::from(r.u32()? as i32)
+    };
+    Ok(media_time.max(0))
+}
+
 fn parse_trak(trak: &[u8]) -> Result<Track> {
     let id = track_id(trak)?;
     let Some(mdhd) = path(trak, &[b"mdia", b"mdhd"])? else {
@@ -190,7 +273,17 @@ fn parse_trak(trak: &[u8]) -> Result<Track> {
     };
     let mut raw = Writer::new();
     raw.boxed(entry.kind, entry.body);
-    Ok(Track { id, timescale, codec, defaults: Defaults::default(), entry: raw.buf, entry_kind: entry.kind })
+    Ok(Track {
+        id,
+        timescale,
+        codec,
+        defaults: Defaults::default(),
+        // Broken ones only lose what they'd tell.
+        edit_offset: edit_offset(trak).unwrap_or(0),
+        header_size: header_size(trak).unwrap_or((0.0, 0.0)),
+        entry: raw.buf,
+        entry_kind: entry.kind,
+    })
 }
 
 /// The `AudioSpecificConfig` inside an mp4a entry's esds.

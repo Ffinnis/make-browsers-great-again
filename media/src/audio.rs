@@ -106,6 +106,8 @@ pub struct AacToFlac {
     /// mdhd timescale of the track, to number FLAC frames by time.
     timescale: u32,
     planes: Vec<Vec<i16>>,
+    /// Nothing decoded since it was made or reset: no overlap carried.
+    fresh: bool,
 }
 
 impl AacToFlac {
@@ -117,7 +119,7 @@ impl AacToFlac {
             Ok(d) => d,
             Err(e) => return err(format!("AAC decoder: {e}")),
         };
-        Ok(AacToFlac { config, decoder, timescale, planes: Vec::new() })
+        Ok(AacToFlac { config, decoder, timescale, planes: Vec::new(), fresh: true })
     }
 
     /// The dfLa payload after its full-box header: one STREAMINFO block.
@@ -130,6 +132,7 @@ impl AacToFlac {
     /// One AAC frame in, one FLAC frame out. A frame that fails to decode
     /// becomes silence, so the timeline has no hole.
     pub fn convert(&mut self, aac: &[u8], dts: i64) -> Vec<u8> {
+        self.fresh = false;
         let channels = self.config.channels as usize;
         let packet = PacketRef::new(0, Timestamp::new(dts), Duration::new(FRAME as u64), aac);
         let decoded = match self.decoder.decode_ref(&packet) {
@@ -150,6 +153,13 @@ impl AacToFlac {
     /// Forgets the overlap carried from the last frame, after a seek.
     pub fn reset(&mut self) {
         self.decoder.reset();
+        self.fresh = true;
+    }
+
+    /// Whether a new decoder would carry on the same: nothing decoded since
+    /// it was made or reset.
+    pub fn fresh(&self) -> bool {
+        self.fresh
     }
 }
 

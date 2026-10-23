@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
 #include <memory>
@@ -187,8 +188,8 @@ constexpr char kConverterWorker[] = "MBGA video converter";
 constexpr char kAutoAttachFrames[] =
     "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
     "true,\"filter\":[{\"type\":\"iframe\"}]}";
-// How long a worker's session stays, for the workers it starts.
-constexpr int64_t kNestedWorkerSeconds = 10;
+// How long a worker may wait for the shim before it's resumed without.
+constexpr int64_t kWorkerResumeSeconds = 5;
 constexpr char kAutoAttachWorkers[] =
     "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":"
     "true,\"filter\":[{\"type\":\"worker\"}]}";
@@ -296,8 +297,10 @@ void ReleaseCodecReplyLater() {
 
 // Hands the converter to the documents of a browser that ask for it. A
 // page could ask over and over, so the engine asks its frames at most once
-// a second, sends each document the converter at most every few seconds,
-// and a tab at most a few times in ten seconds.
+// a second, each with a word of its own that its answer has to carry (a
+// frame can't answer for another), and sends a tab's documents the
+// converter at most 8 times in ten seconds, each document at most every
+// few seconds: the rest wait their turn, one place per frame, in order.
 class CodecDelivery {
  public:
   // A document asked: asks every frame which document it was.
@@ -323,36 +326,49 @@ class CodecDelivery {
     Probe(browser);
   }
 
-  // A frame answered with "<frame>:<document>".
+  // A frame answered with "<frame>:<document>:<word>".
   void Answered(CefRefPtr<CefBrowser> browser, const std::string& answer) {
-    size_t colon = answer.rfind(':');
-    if (colon == std::string::npos) {
+    size_t word_at = answer.rfind(':');
+    if (word_at == std::string::npos || word_at == 0) {
       return;
     }
-    CefRefPtr<CefFrame> frame =
-        browser->GetFrameByIdentifier(answer.substr(0, colon));
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    std::erase_if(recent_, [&](CFAbsoluteTime t) { return now - t > 10; });
-    auto sent = sent_.find(answer);
-    if (!frame || recent_.size() >= 8 ||
-        (sent != sent_.end() && now - sent->second < 5)) {
+    size_t document_at = answer.rfind(':', word_at - 1);
+    if (document_at == std::string::npos) {
       return;
     }
-    recent_.push_back(now);
-    if (sent_.size() > 64) {
-      std::erase_if(sent_,
-                    [&](const auto& item) { return now - item.second > 60; });
+    std::string frame_id = answer.substr(0, document_at);
+    auto probe = probes_.find(frame_id);
+    if (probe == probes_.end() || probe->second != answer.substr(word_at + 1)) {
+      return;
     }
-    sent_[answer] = now;
-    frame->ExecuteJavaScript(*CodecReply(), "", 0);
+    probes_.erase(probe);
+    std::string document = answer.substr(0, word_at);
+    auto sent = sent_.find(document);
+    if (sent != sent_.end() && CFAbsoluteTimeGetCurrent() - sent->second < 5) {
+      return;
+    }
+    auto queued =
+        std::find_if(queue_.begin(), queue_.end(),
+                     [&](const auto& item) { return item.first == frame_id; });
+    if (queued != queue_.end()) {
+      queued->second = document;
+    } else {
+      queue_.emplace_back(frame_id, document);
+    }
+    Serve(browser);
   }
 
   // A new page: its documents are new.
-  void Reset() { sent_.clear(); }
+  void Reset() {
+    sent_.clear();
+    queue_.clear();
+    probes_.clear();
+  }
 
  private:
   void Probe(CefRefPtr<CefBrowser> browser) {
     last_probe_ = CFAbsoluteTimeGetCurrent();
+    probes_.clear();
     std::vector<CefString> frames;
     browser->GetFrameIdentifiers(frames);
     for (const CefString& id : frames) {
@@ -360,15 +376,60 @@ class CodecDelivery {
       if (!frame) {
         continue;
       }
+      char word[17];
+      snprintf(word, sizeof(word), "%08x%08x", arc4random(), arc4random());
+      probes_[id.ToString()] = word;
       std::string probe =
           "typeof __mbgaCodecReady==='function'&&__mbgaCodecReady.who('" +
-          std::string(kCodecFramePrefix) + id.ToString() + "')";
+          std::string(kCodecFramePrefix) + id.ToString() + "','" + word + "')";
       frame->ExecuteJavaScript(probe, "", 0);
     }
   }
 
+  // Sends the converter to the documents waiting, as many as the budget
+  // allows, and comes back for the rest when it allows more.
+  void Serve(CefRefPtr<CefBrowser> browser) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    std::erase_if(recent_, [&](CFAbsoluteTime t) { return now - t > 10; });
+    while (!queue_.empty() && recent_.size() < 8) {
+      auto [frame_id, document] = queue_.front();
+      queue_.pop_front();
+      CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(frame_id);
+      if (!frame) {
+        continue;
+      }
+      recent_.push_back(now);
+      if (sent_.size() > 64) {
+        std::erase_if(sent_,
+                      [&](const auto& item) { return now - item.second > 60; });
+      }
+      sent_[document] = now;
+      frame->ExecuteJavaScript(*CodecReply(), "", 0);
+    }
+    if (queue_.empty() || serve_pending_) {
+      return;
+    }
+    serve_pending_ = true;
+    double wait = std::max(0.05, 10.05 - (now - recent_.front()));
+    std::weak_ptr<bool> alive = alive_;
+    CodecDelivery* delivery = this;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, int64_t(wait * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          if (alive.lock()) {
+            delivery->serve_pending_ = false;
+            delivery->Serve(browser);
+          }
+        });
+  }
+
   CFAbsoluteTime last_probe_ = 0;
   bool probe_pending_ = false;
+  bool serve_pending_ = false;
+  // The word each frame was asked with, by frame.
+  std::map<std::string, std::string> probes_;
+  // Frames waiting for the converter, with the document that asked.
+  std::deque<std::pair<std::string, std::string>> queue_;
   std::map<std::string, CFAbsoluteTime> sent_;
   std::vector<CFAbsoluteTime> recent_;
   std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
@@ -856,6 +917,10 @@ class BrowserApp : public CefApp {
     // Smaller caches and heap budgets throughout Blink and V8.
     AppendDefaultSwitch(command_line, "enable-low-end-device-mode");
     AppendDefaultSwitch(command_line, "js-flags", "--optimize-for-size");
+    // Except Media Source audio, which low-end mode keeps to about 2 MB: the
+    // FLAC that converted AAC becomes (shell/resources/media) is eight times
+    // the size, so that's only 20 seconds. 12 MB is the desktop default.
+    AppendDefaultSwitch(command_line, "mse-audio-buffer-size-limit-mb", "12");
 
     if (g_pipe_write >= 0) {
       // Extension support (see shell/app/Extensions.swift): the browser
@@ -1125,17 +1190,24 @@ class PopupMedia : public CefDevToolsMessageObserver {
            nullptr);
     }
     CefRefPtr<PopupMedia> media(this);
-    Send(browser, "Runtime.runIfWaitingForDebugger", "", session,
-         [media, browser, session, parent, shim](NSDictionary*) {
-           dispatch_after(
-               dispatch_time(DISPATCH_TIME_NOW,
-                             (shim ? kNestedWorkerSeconds : 0) * NSEC_PER_SEC),
-               dispatch_get_main_queue(), ^{
-                 media->Send(browser, "Target.detachFromTarget",
-                             "{\"sessionId\":\"" + session + "\"}", parent,
-                             nullptr);
-               });
-         });
+    auto resumed = std::make_shared<bool>(false);
+    Send(
+        browser, "Runtime.runIfWaitingForDebugger", "", session,
+        [media, browser, session, parent, shim, resumed](NSDictionary* result) {
+          *resumed = result != nil;
+          if (!shim) {
+            media->Send(browser, "Target.detachFromTarget",
+                        "{\"sessionId\":\"" + session + "\"}", parent, nullptr);
+          }
+        });
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, kWorkerResumeSeconds * NSEC_PER_SEC),
+        dispatch_get_main_queue(), ^{
+          if (!*resumed) {
+            media->Send(browser, "Target.detachFromTarget",
+                        "{\"sessionId\":\"" + session + "\"}", parent, nullptr);
+          }
+        });
   }
 
   // Sends a command to |session| (empty for the popup's page); |then| gets
@@ -2002,7 +2074,11 @@ class WebClient : public BaseClient,
   bool OnDevToolsMessage(CefRefPtr<CefBrowser> browser,
                          const void* message,
                          size_t message_size) override {
-    if (session_replies_.empty() && !following_frames_ && !media_shim_) {
+    // A worker's attach always counts: it waits until it's resumed.
+    static const char kAttached[] = "Target.attachedToTarget";
+    if (session_replies_.empty() && !following_frames_ && !media_shim_ &&
+        shim_workers_.empty() &&
+        !memmem(message, message_size, kAttached, strlen(kAttached))) {
       return false;
     }
     // The page's own messages, the most of them, carry no session.
@@ -2075,30 +2151,40 @@ class WebClient : public BaseClient,
       }
       if (![info[@"type"] isEqualToString:@"iframe"]) {
         // A worker may play media too (MediaSource in workers): it gets the
-        // shim before its script, then goes on without the engine, which
-        // keeps no session on it. Workers it starts right away get the shim
-        // too; later ones don't. The converter's own worker needs nothing.
+        // shim before its script. The engine keeps its session for as long
+        // as the worker lives, so the workers it starts get the shim too;
+        // the converter's own worker needs nothing and is let go. Whatever
+        // happens to the commands before, a worker waiting for the
+        // debugger is resumed, if need be by letting it go.
         bool shim = [info[@"type"] isEqualToString:@"worker"] && media_shim_ &&
                     ![info[@"title"] isEqualToString:@(kConverterWorker)];
         std::string child = session.UTF8String;
         std::string parent = from ? from.UTF8String : "";
         if (shim) {
+          shim_workers_[child] = parent;
           SendInSession(browser, "Runtime.evaluate", WorkerShimParams(), child,
                         ignore);
           SendInSession(browser, "Target.setAutoAttach", kAutoAttachWorkers,
                         child, ignore);
         }
         CefRefPtr<WebClient> client(this);
-        SendInSession(
-            browser, "Runtime.runIfWaitingForDebugger", "", child,
-            [client, browser, child, parent, shim](bool, const std::string&) {
-              dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                           (shim ? kNestedWorkerSeconds : 0) *
-                                               NSEC_PER_SEC),
-                             dispatch_get_main_queue(), ^{
-                               client->Detach(browser, child, parent);
-                             });
-            });
+        auto resumed = std::make_shared<bool>(false);
+        SendInSession(browser, "Runtime.runIfWaitingForDebugger", "", child,
+                      [client, browser, child, parent, shim, resumed](
+                          bool ok, const std::string&) {
+                        *resumed = ok;
+                        if (!shim) {
+                          client->Detach(browser, child, parent);
+                        }
+                      });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     kWorkerResumeSeconds * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+                         if (!*resumed) {
+                           client->shim_workers_.erase(child);
+                           client->Detach(browser, child, parent);
+                         }
+                       });
         return;
       }
       [view_ engineFrameAttached:info[@"targetId"] session:session];
@@ -2117,6 +2203,7 @@ class WebClient : public BaseClient,
       if (NSString* session = params[@"sessionId"]) {
         [view_ engineFrameDetached:session];
         std::erase(worker_sessions_, std::string(session.UTF8String));
+        shim_workers_.erase(session.UTF8String);
       }
     } else if (recording_network_ && [method hasPrefix:@"Network."]) {
       [view_ engineNetworkEvent:method params:params];
@@ -2183,6 +2270,10 @@ class WebClient : public BaseClient,
   // Stops following workers, when the shim is turned off.
   void UnfollowWorkers(CefRefPtr<CefBrowser> browser) {
     following_workers_ = false;
+    for (const auto& [session, parent] : shim_workers_) {
+      Detach(browser, session, parent);
+    }
+    shim_workers_.clear();
     for (const std::string& session : worker_sessions_) {
       SendInSession(browser, "Target.detachFromTarget",
                     "{\"sessionId\":\"" + session + "\"}", "",
@@ -2764,6 +2855,9 @@ class WebClient : public BaseClient,
   // own still to be announced.
   bool following_workers_ = false;
   std::vector<std::string> worker_sessions_;
+  // Workers' sessions, kept while they live for the workers they start,
+  // with the sessions they came through.
+  std::map<std::string, std::string> shim_workers_;
   std::map<std::string, int> own_attaches_;
   std::string media_script_;
   CodecDelivery codec_;

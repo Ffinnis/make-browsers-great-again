@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use mbga_media::{Converter, Poll, DECODE_ONLY, FLUSH, KEY};
+use mbga_media::{Converter, HeldGroup, Poll, DECODE_ONLY, DROP, ENCODE_KEY, FLUSH, KEY};
 
 fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures").join(name)).unwrap()
@@ -21,13 +21,15 @@ fn fixture(name: &str) -> Vec<u8> {
 /// What worker.js keeps per video track.
 #[derive(Default)]
 struct Decoder {
-    /// Decoded frames the decoder hasn't put out yet, by timestamp.
-    waiting: BTreeSet<i64>,
-    /// Decode-only frames, keyframes, and whether decoding started.
-    skip: BTreeSet<i64>,
-    keys: BTreeSet<i64>,
+    /// Decoded frames the decoder hasn't put out yet, in presentation
+    /// order, with the order they went in to keep equal timestamps apart.
+    waiting: BTreeSet<(i64, u64)>,
+    fed: u64,
+    /// Whether decoding started.
     started: bool,
     encoder_started: bool,
+    /// With a frame-rate cap, when the next frame may go to the encoder.
+    next_kept: i64,
 }
 
 /// The worker: decoders that put frames out in presentation order once
@@ -38,34 +40,54 @@ struct Worker {
     decoders: BTreeMap<u32, Decoder>,
     decode_only: usize,
     jobs: usize,
+    /// Chunks encoded.
+    encoded: usize,
     /// The coded size of each chunk, and from which timestamp on to use
     /// another (as when the page's video gets smaller).
     size: (u16, u16),
     resize: Option<(i64, (u16, u16))>,
+    /// A frame-rate cap: the least time between frames, in microseconds.
+    cap: Option<i64>,
+    /// The page's number for appends and drains.
+    seq: f64,
 }
 
 impl Worker {
     fn new() -> Self {
-        Worker { reorder: 4, decoders: BTreeMap::new(), decode_only: 0, jobs: 0, size: (320, 180), resize: None }
+        Worker {
+            reorder: 4,
+            decoders: BTreeMap::new(),
+            decode_only: 0,
+            jobs: 0,
+            encoded: 0,
+            size: (320, 180),
+            resize: None,
+            cap: None,
+            seq: 0.0,
+        }
     }
 
-    fn put_out(&mut self, c: &mut Converter, track: u32, ts: i64) {
+    fn put_out(&mut self, c: &mut Converter, track: u32, frame: (i64, u64)) {
         let d = self.decoders.get_mut(&track).unwrap();
-        d.waiting.remove(&ts);
-        if d.skip.remove(&ts) {
+        d.waiting.remove(&frame);
+        let ts = frame.0;
+        let skip = self.cap.is_some() && ts < d.next_kept;
+        let r = c.frame(track, ts as f64, skip);
+        if r == DROP {
             return;
         }
-        let key = d.keys.remove(&ts) || !d.encoder_started;
+        if let Some(cap) = self.cap {
+            d.next_kept = ts + cap - 1000;
+        }
+        let key = r == ENCODE_KEY || !d.encoder_started;
         // Sizes change at keyframes only.
         if let Some((from, size)) = self.resize.filter(|&(from, _)| ts >= from && key) {
             let _ = from;
             self.size = size;
             self.resize = None;
         }
-        if !c.frame(track, ts as f64) {
-            return;
-        }
         d.encoder_started = true;
+        self.encoded += 1;
         c.chunk(track, ts as f64, key, self.size, format!("vp9 {ts}").into_bytes()).unwrap();
     }
 
@@ -75,19 +97,16 @@ impl Worker {
         d.started = true;
         if flags & KEY != 0 {
             // An IDR picture: everything before it comes out first.
-            let before: Vec<i64> = d.waiting.iter().copied().collect();
-            for ts in before {
-                self.put_out(c, track, ts);
+            let before: Vec<(i64, u64)> = d.waiting.iter().copied().collect();
+            for frame in before {
+                self.put_out(c, track, frame);
             }
         }
         let d = self.decoders.get_mut(&track).unwrap();
-        d.waiting.insert(ts);
+        d.fed += 1;
+        d.waiting.insert((ts, d.fed));
         if flags & DECODE_ONLY != 0 {
-            d.skip.insert(ts);
             self.decode_only += 1;
-        }
-        if flags & KEY != 0 {
-            d.keys.insert(ts);
         }
         while self.decoders[&track].waiting.len() > self.reorder {
             let first = *self.decoders[&track].waiting.first().unwrap();
@@ -96,10 +115,10 @@ impl Worker {
     }
 
     fn flush(&mut self, c: &mut Converter, track: u32) {
-        let waiting: Vec<i64> =
+        let waiting: Vec<(i64, u64)> =
             self.decoders.get(&track).map(|d| d.waiting.iter().copied().collect()).unwrap_or_default();
-        for ts in waiting {
-            self.put_out(c, track, ts);
+        for frame in waiting {
+            self.put_out(c, track, frame);
         }
         if let Some(d) = self.decoders.get_mut(&track) {
             d.started = false;
@@ -133,7 +152,8 @@ impl Worker {
 
     /// One append: the bytes it gives back, `held` first.
     fn append(&mut self, c: &mut Converter, bytes: &[u8]) -> Output {
-        c.begin();
+        self.seq += 1.0;
+        c.begin(self.seq);
         c.push(bytes);
         loop {
             match c.poll() {
@@ -143,24 +163,40 @@ impl Worker {
             }
         }
         c.write().unwrap();
-        Output { held: std::mem::take(&mut c.held), bytes: std::mem::take(&mut c.output) }
+        take(c)
     }
 
     /// Before `endOfStream()`: everything the decoders still hold.
     fn drain(&mut self, c: &mut Converter) -> Output {
-        c.begin();
+        self.seq += 1.0;
+        c.begin(self.seq);
         let tracks: Vec<u32> = self.decoders.keys().copied().collect();
         for track in tracks {
             self.flush(c, track);
         }
         c.write().unwrap();
-        Output { held: std::mem::take(&mut c.held), bytes: std::mem::take(&mut c.output) }
+        take(c)
     }
 }
 
 struct Output {
     held: Vec<u8>,
+    groups: Vec<HeldGroup>,
     bytes: Vec<u8>,
+    inits: u32,
+}
+
+fn take(c: &mut Converter) -> Output {
+    let o = Output { held: c.held.clone(), groups: c.held_groups.clone(), bytes: c.output.clone(), inits: c.inits_out };
+    // The groups tile `held`.
+    let mut at = 0;
+    for g in &o.groups {
+        assert_eq!(g.offset as usize, at);
+        at += g.len as usize;
+    }
+    assert_eq!(at, o.held.len());
+    c.clear_output();
+    o
 }
 
 /// Feeds `input` in `step`-byte appends and drains at the end, the way the
@@ -176,6 +212,21 @@ fn convert(c: &mut Converter, w: &mut Worker, input: &[u8], step: usize) -> Vec<
     out.extend(o.held);
     out.extend(o.bytes);
     out
+}
+
+/// The init, then each moof and its mdat, as low-latency players append.
+fn units(input: &[u8]) -> Vec<Vec<u8>> {
+    let mut units: Vec<Vec<u8>> = Vec::new();
+    let mut pos = 0;
+    while pos < input.len() {
+        let size = u32::from_be_bytes(input[pos..pos + 4].try_into().unwrap()) as usize;
+        if units.is_empty() || &input[pos + 4..pos + 8] == b"moof" {
+            units.push(Vec::new());
+        }
+        units.last_mut().unwrap().extend_from_slice(&input[pos..pos + size]);
+        pos += size;
+    }
+    units
 }
 
 fn has_ffmpeg() -> bool {
@@ -313,16 +364,7 @@ fn frames_held_by_the_decoder_come_out_with_the_next_append() {
     let mut c = Converter::new(false);
     let mut w = Worker::new();
     // A moof+mdat at a time, as low-latency players append.
-    let mut units: Vec<Vec<u8>> = Vec::new();
-    let mut pos = 0;
-    while pos < input.len() {
-        let size = u32::from_be_bytes(input[pos..pos + 4].try_into().unwrap()) as usize;
-        if units.is_empty() || &input[pos + 4..pos + 8] == b"moof" {
-            units.push(Vec::new());
-        }
-        units.last_mut().unwrap().extend_from_slice(&input[pos..pos + size]);
-        pos += size;
-    }
+    let units = units(&input);
     let mut out = Vec::new();
     let mut helds = 0;
     for unit in &units {
@@ -332,6 +374,13 @@ fn frames_held_by_the_decoder_come_out_with_the_next_append() {
             helds += 1;
             // What belongs to an earlier append comes before this one's.
             assert!(held.iter().max() < own.iter().min().or(Some(&i64::MAX)), "{held:?} then {own:?}");
+            // Grouped by the append they came in, with their time range.
+            for g in &o.groups {
+                assert!(g.seq < w.seq, "group of append {} in append {}", g.seq, w.seq);
+                let times = chunk_times(&o.held[g.offset as usize..(g.offset + g.len) as usize]);
+                let span = (g.end - g.start) * 30.0;
+                assert!((span - times.len() as f64).abs() < 0.01, "{} frames over {span}", times.len());
+            }
         }
         out.extend(o.held);
         out.extend(o.bytes);
@@ -821,4 +870,298 @@ fn local_samples() {
         let dst = write_temp(&format!("local-out-{name}"), &out);
         assert_eq!(relative(packet_times(&src)), relative(packet_times(&dst)), "{name}");
     }
+}
+
+// ------------------------------------------------------------- round two
+
+/// What worker.js does when a module instance grew too big: a fresh one,
+/// primed with the init and given the old one's state.
+fn recycle(c: &mut Converter) -> bool {
+    if !c.recyclable() {
+        return false;
+    }
+    c.save_state();
+    let state = c.state.clone();
+    let mut fresh = Converter::new(false);
+    fresh.push(&c.init);
+    assert_eq!(fresh.poll().unwrap(), Poll::Idle);
+    fresh.clear_output();
+    fresh.load_state(&state).unwrap();
+    *c = fresh;
+    true
+}
+
+/// The midgop fixture's first half, a drain, and the rest, recycling the
+/// converter after the drain if `recycling`.
+fn drain_midway(recycling: bool) -> (Vec<u8>, usize, bool) {
+    let input = fixture("midgop.mp4");
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    let second = input.windows(4).enumerate().filter(|(_, w)| w == b"moof").nth(1).unwrap().0 - 4;
+    let mut out = Vec::new();
+    let o = w.append(&mut c, &input[..second]);
+    out.extend(o.held);
+    out.extend(o.bytes);
+    let o = w.drain(&mut c);
+    out.extend(o.held);
+    let recycled = recycling && recycle(&mut c);
+    let o = w.append(&mut c, &input[second..]);
+    out.extend(o.held);
+    out.extend(o.bytes);
+    let o = w.drain(&mut c);
+    out.extend(o.held);
+    (out, w.decode_only, recycled)
+}
+
+#[test]
+fn a_recycled_converter_carries_on_mid_gop() {
+    let (want, want_replayed, _) = drain_midway(false);
+    let (got, replayed, recycled) = drain_midway(true);
+    assert!(recycled, "not recyclable after a drain");
+    // The fresh converter replays the GOP as the old one would have, rather
+    // than dropping the fragment's frames up to the next keyframe.
+    assert!(want_replayed > 0);
+    assert_eq!(replayed, want_replayed);
+    assert_eq!(chunk_times(&got), chunk_times(&want));
+    assert_eq!(got, want);
+}
+
+#[test]
+fn recycling_keeps_segments_and_sizes() {
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    w.append(&mut c, &fixture("video-init.mp4"));
+    // Smaller frames from the start: the converted init says so.
+    w.size = (160, 90);
+    let mut times = Vec::new();
+    let mut moovs = 0;
+    for i in 0..3 {
+        let o = w.append(&mut c, &fixture(&format!("video-{i}.m4s")));
+        moovs += count(&o.bytes, *b"moov");
+        times.extend(chunk_times(&o.bytes));
+        // Every segment starts with a keyframe and is flushed, so nothing
+        // waits.
+        assert!(recycle(&mut c), "segment {i}");
+    }
+    // The size carried over: no new init after recycling.
+    assert_eq!(moovs, 1);
+    assert_eq!(times.len(), 90);
+}
+
+#[test]
+fn aac_streams_recycle_only_before_decoding() {
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    w.append(&mut c, &fixture("aac-init.mp4"));
+    assert!(c.recyclable());
+    w.append(&mut c, &fixture("aac-0.m4s"));
+    // The AAC decoder's overlap can't move to a new one: it would click.
+    assert!(!c.recyclable());
+    c.reset();
+    assert!(c.recyclable());
+}
+
+#[test]
+fn a_fragment_appended_again_keeps_its_frames() {
+    // hls.js switching levels at once: remove() the current fragment, then
+    // append it again, without abort(). The decoder still holds the first
+    // copy's last frames, with the same timestamps as the second's.
+    let units = units(&fixture("midgop.mp4"));
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    for u in &units[..4] {
+        w.append(&mut c, u);
+    }
+    let first_copy = w.seq;
+    // units[3] runs from the keyframe at 1 s (shown at 1.067 s) for half a
+    // second.
+    let range = 1_060_000..1_560_000;
+    let mut again = Vec::new();
+    let mut late = Vec::new();
+    let mut collect = |o: &Output, seq: f64| {
+        for g in &o.groups {
+            let times = chunk_times(&o.held[g.offset as usize..(g.offset + g.len) as usize]);
+            if g.seq.to_bits() == first_copy.to_bits() {
+                late.extend(times);
+            } else {
+                again.extend(times.into_iter().filter(|t| range.contains(t)));
+            }
+        }
+        if seq > first_copy {
+            again.extend(chunk_times(&o.bytes).into_iter().filter(|t| range.contains(t)));
+        }
+    };
+    let o = w.append(&mut c, &units[3]);
+    collect(&o, w.seq);
+    for u in &units[4..] {
+        let o = w.append(&mut c, u);
+        collect(&o, w.seq);
+    }
+    let o = w.drain(&mut c);
+    collect(&o, w.seq);
+    // The first copy's held frames come out for it, and the second copy
+    // has every one of its frames.
+    assert!(!late.is_empty());
+    assert!(late.iter().all(|t| range.contains(t)));
+    again.sort_unstable();
+    again.dedup();
+    assert_eq!(again.len(), 15, "{again:?}");
+}
+
+#[test]
+fn a_frame_rate_cap_stretches_the_frames_kept() {
+    let input = fixture("midgop.mp4");
+    let mut c = Converter::new(false);
+    let mut w = Worker::new();
+    // 15 fps from 30.
+    w.cap = Some(66_667);
+    let out = convert(&mut c, &mut w, &input, input.len());
+    let times = chunk_times(&out);
+    assert!((29..=32).contains(&times.len()), "{} frames", times.len());
+    // Keyframes are always kept (the first frame is shown at 1024/15360 s).
+    assert!(times.contains(&66_667) && times.contains(&1_066_667), "{times:?}");
+    // The kept frames last as long as all of them did, with no holes: each
+    // fragment starts where the one before ended.
+    let mut end = None;
+    let mut total = 0;
+    for (base, durations) in fragment_spans(&out) {
+        assert!(end.is_none_or(|e| e == base), "hole before {base}");
+        let sum: i64 = durations.iter().map(|&d| i64::from(d)).sum();
+        end = Some(base + sum);
+        total += sum;
+    }
+    assert_eq!(total, 60 * 512);
+    if has_ffmpeg() {
+        assert_decode_order(&write_temp("cap-out.mp4", &out));
+    }
+}
+
+/// Each fragment's base decode time and sample durations, as written here
+/// (one track, tfdt version 1, trun with every field).
+fn fragment_spans(data: &[u8]) -> Vec<(i64, Vec<u32>)> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(at) = data[pos..].windows(4).position(|w| w == b"tfdt") {
+        let tfdt = pos + at + 4;
+        let base = u64::from_be_bytes(data[tfdt + 4..tfdt + 12].try_into().unwrap()) as i64;
+        let trun = tfdt + data[tfdt..].windows(4).position(|w| w == b"trun").unwrap() + 4;
+        let count = u32::from_be_bytes(data[trun + 4..trun + 8].try_into().unwrap()) as usize;
+        let durations = (0..count)
+            .map(|i| u32::from_be_bytes(data[trun + 12 + i * 16..trun + 16 + i * 16].try_into().unwrap()))
+            .collect();
+        out.push((base, durations));
+        pos = trun;
+    }
+    out
+}
+
+#[test]
+fn natural_size_is_the_inputs_display_size() {
+    let mut c = Converter::new(false);
+    let o = Worker::new().append(&mut c, &fixture("video-init.mp4"));
+    assert_eq!(o.inits, 1);
+    assert_eq!(c.natural(), Some((320, 180)));
+    // Wide pixels, 4:3, in the entry's pasp: wider. Narrow ones: taller.
+    for (h, v, natural) in [(4, 3, (427, 180)), (3, 4, (320, 240))] {
+        let mut init = fixture("video-init.mp4");
+        let pasp = init.windows(4).position(|w| w == b"pasp").unwrap() + 4;
+        set_u32(&mut init, pasp, h);
+        set_u32(&mut init, pasp + 4, v);
+        let mut c = Converter::new(false);
+        Worker::new().append(&mut c, &init);
+        assert_eq!(c.natural(), Some(natural));
+    }
+}
+
+/// A progressive file with one Opus track of `count` one-byte samples,
+/// `delta` ticks apart at `timescale`, the last lasting `last` ticks.
+#[allow(clippy::similar_names)]
+fn opus_file(count: u32, delta: u32, timescale: u32, last: u32) -> Vec<u8> {
+    let full = |kind: [u8; 4], body: &[u8]| make_box(kind, &[&[0u8; 4][..], body].concat());
+    let ftyp = make_box(*b"ftyp", b"isom\0\0\0\0isom");
+    let mdat_header = 8;
+    let data_at = (ftyp.len() + mdat_header) as u32;
+    let mdat = make_box(*b"mdat", &vec![0x55; count as usize]);
+    // Version 0: the track id, and the timescale, 12 bytes into the body.
+    let mut tkhd = [0u8; 84];
+    tkhd[12..16].copy_from_slice(&1u32.to_be_bytes());
+    let mut mdhd = [0u8; 24];
+    mdhd[12..16].copy_from_slice(&timescale.to_be_bytes());
+    let hdlr = full(*b"hdlr", &[&[0u8; 4][..], b"soun", &[0u8; 13]].concat());
+    let mut entry = vec![0u8; 28];
+    entry[7] = 1;
+    entry[17] = 2;
+    entry[19] = 16;
+    entry[24..28].copy_from_slice(&(48000u32 << 16).to_be_bytes());
+    entry.extend(make_box(*b"dOps", &[0, 2, 0x01, 0x38, 0, 0, 0xbb, 0x80, 0, 0, 0]));
+    let stsd = full(*b"stsd", &[&1u32.to_be_bytes()[..], &make_box(*b"Opus", &entry)].concat());
+    let mut stts = 2u32.to_be_bytes().to_vec();
+    for (n, d) in [(count - 1, delta), (1, last)] {
+        stts.extend(n.to_be_bytes());
+        stts.extend(d.to_be_bytes());
+    }
+    let stts = full(*b"stts", &stts);
+    let stsc = full(*b"stsc", &[1u32, 1, count, 1].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
+    let stsz = full(*b"stsz", &[1u32, count].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
+    let stco = full(*b"stco", &[1u32, data_at].iter().flat_map(|v| v.to_be_bytes()).collect::<Vec<u8>>());
+    let stbl = make_box(*b"stbl", &[stsd, stts, stsc, stsz, stco].concat());
+    let minf = make_box(*b"minf", &stbl);
+    let mdia = make_box(*b"mdia", &[full(*b"mdhd", &mdhd[4..]), hdlr, minf].concat());
+    let trak = make_box(*b"trak", &[full(*b"tkhd", &tkhd[4..]), mdia].concat());
+    let moov = make_box(*b"moov", &[full(*b"mvhd", &[0u8; 96]), trak].concat());
+    [ftyp, mdat, moov].concat()
+}
+
+#[test]
+fn a_sample_lasting_years_doesnt_plan_billions_of_fragments() {
+    // At a timescale of 1, the last sample claims 136 years.
+    let input = opus_file(100, 1, 1, u32::MAX);
+    let started = Instant::now();
+    let mut c = Converter::new(true);
+    let out = convert(&mut c, &mut Worker::new(), &input, input.len());
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert_eq!(c.mime, "audio/mp4; codecs=\"opus\"");
+    // Fragments of about two seconds, and the last.
+    assert!((45..=55).contains(&count(&out, *b"moof")), "{} fragments", count(&out, *b"moof"));
+}
+
+#[test]
+fn long_files_stream_in_linear_time() {
+    // Half a million samples, 50 a second: 5,000 fragments.
+    let input = opus_file(500_000, 1, 50, 1);
+    let started = Instant::now();
+    let mut c = Converter::new(true);
+    let out = convert(&mut c, &mut Worker::new(), &input, 1 << 20);
+    assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
+    assert!((4900..=5000).contains(&count(&out, *b"moof")), "{} fragments", count(&out, *b"moof"));
+}
+
+#[test]
+fn an_init_lost_with_a_failed_append_comes_again() {
+    // A file whose timestamps run out of range a few fragments in: the
+    // append fails, and the page never gets its output, init and all.
+    let mut input = fixture("progressive.mp4");
+    let mdhd = find_path(&input, &[b"moov", b"trak", b"mdia", b"mdhd"]).last().unwrap().0;
+    set_u32(&mut input, mdhd + 20, 1);
+    let stts = find_path(&input, &[b"moov", b"trak", b"mdia", b"minf", b"stbl", b"stts"]).last().unwrap().0;
+    set_u32(&mut input, stts + 20, u32::MAX);
+    let mut c = Converter::new(true);
+    let mut w = Worker::new();
+    w.seq += 1.0;
+    c.begin(w.seq);
+    c.push(&input);
+    let e = loop {
+        match c.poll() {
+            Ok(Poll::Job) => w.run_job(&mut c),
+            Ok(Poll::Idle) => panic!("converted"),
+            Err(e) => break e.0,
+        }
+    };
+    assert!(e.contains("out of range") && w.jobs > 0, "{e} after {} jobs", w.jobs);
+    c.discard_output();
+    // The frames the decoder still held come with the init before them.
+    let o = w.drain(&mut c);
+    assert!(!o.held.is_empty());
+    let at = |kind: &[u8]| o.held.windows(4).position(|w| w == kind).unwrap();
+    assert!(at(b"moov") < at(b"moof"));
 }

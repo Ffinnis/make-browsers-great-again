@@ -13,18 +13,32 @@
 //! Audio and other tracks are converted here and wait in the job for the
 //! video, so fragments come out whole and in order.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::ops::Range;
 
-use crate::bytes::{box_extent, err, Error, Result, Writer};
+use crate::bytes::{box_extent, err, Error, Reader, Result, Writer};
 use crate::frag::{self, OutSample, OutTrack, Run, Sample, NOT_SYNC, SYNC};
 use crate::init::{self, Codec, Track};
-use crate::progressive::{self, FileSample, Scan};
+use crate::progressive::{self, Cuts, FileSample, Scan};
 
 /// How many frames back, and how many bytes, a GOP is kept for replaying.
 /// Streams whose keyframes aren't IDR pictures would otherwise keep all.
 const MAX_GOP: usize = 1200;
 const MAX_GOP_BYTES: usize = 32 << 20;
+
+/// Changes whenever `save_state`'s layout does.
+const STATE_VERSION: u32 = 1;
+
+fn put_opt(w: &mut Writer, v: Option<i64>) {
+    w.u8(u8::from(v.is_some()));
+    w.u64(v.unwrap_or(0) as u64);
+}
+
+fn get_opt(r: &mut Reader<'_>) -> Result<Option<i64>> {
+    let some = r.u8()? != 0;
+    let v = r.u64()? as i64;
+    Ok(some.then_some(v))
+}
 
 /// The most input that may wait to be converted: a fragment, or the part of
 /// a progressive file between its earliest and latest unconverted samples.
@@ -62,6 +76,27 @@ pub struct JobSample {
     pub codec: u32,
     /// The input's bits per second so far.
     pub bitrate: u32,
+}
+
+/// What `frame` says to do with a decoded frame.
+pub const DROP: u32 = 0;
+pub const ENCODE: u32 = 1;
+/// Encode it as a keyframe: it's an IDR picture of the input.
+pub const ENCODE_KEY: u32 = 2;
+
+/// Frames of one earlier append in `held`, laid out for reading from JS.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeldGroup {
+    /// The append (`begin`'s `seq`) whose input held these frames.
+    pub seq: f64,
+    /// Their presentation times in seconds, on the stream's own timeline
+    /// (after the edit list, before the page's `timestampOffset`).
+    pub start: f64,
+    pub end: f64,
+    /// Their bytes in `held`.
+    pub offset: u32,
+    pub len: u32,
 }
 
 #[derive(Default)]
@@ -186,7 +221,7 @@ struct Stream {
     aligned: bool,
     /// Counts the times decoding started over. Frames of an earlier run
     /// still in the decoder come out before any of a later one.
-    run: u32,
+    run: u64,
     /// The latest presentation time of a frame handed out on this timeline.
     last_pts: Option<i64>,
     bytes: u64,
@@ -196,10 +231,14 @@ struct Stream {
 /// A frame in a job whose chunk hasn't come back yet.
 struct Frame {
     pts: i64,
+    /// Grows to cover frames after it left out to cap the frame rate.
     duration: u32,
-    /// The append whose input held the frame.
+    /// The append whose input held the frame, and the page's number for it.
     epoch: u32,
-    run: u32,
+    seq: f64,
+    run: u64,
+    /// An IDR picture: encoded as a keyframe.
+    key: bool,
 }
 
 /// An encoded frame waiting to be written.
@@ -207,6 +246,7 @@ struct Chunk {
     pts: i64,
     duration: u32,
     epoch: u32,
+    seq: f64,
     key: bool,
     size: (u16, u16),
     data: Vec<u8>,
@@ -215,10 +255,13 @@ struct Chunk {
 /// A converted video track's frames between the job and the output.
 #[derive(Default)]
 struct VideoOut {
-    /// Frames not decoded yet, by microsecond timestamp.
-    frames: BTreeMap<i64, Frame>,
-    /// Frames being encoded.
-    encoding: HashMap<i64, Frame>,
+    /// Frames not decoded yet, by run and microsecond timestamp: the same
+    /// timestamps come again when a page appends a fragment once more, and
+    /// the decoder puts out an earlier run's frames first.
+    frames: BTreeMap<(u64, i64), Frame>,
+    /// Frames being encoded, in the order they went to the encoder, with
+    /// their microsecond timestamps.
+    encoding: VecDeque<(i64, Frame)>,
     /// Encoded frames in the order they were decoded, which is
     /// presentation order within a run.
     ready: Vec<Chunk>,
@@ -227,13 +270,16 @@ struct VideoOut {
     /// The coded size in the converted init, if the encoder's differs from
     /// the input's.
     size: Option<(u16, u16)>,
+    /// The run and presentation time of the last frame sent to the encoder,
+    /// which a frame left out to cap the frame rate extends.
+    last_kept: Option<(u64, i64)>,
 }
 
 impl VideoOut {
     /// Whether a run's frames waiting have a gap in presentation order: a
     /// fragment that ends mid-GOP can end on a frame whose B-frames come in
     /// the next one.
-    fn has_hole(&self, run: u32) -> bool {
+    fn has_hole(&self, run: u64) -> bool {
         let mut frames: Vec<(i64, u32)> =
             self.frames.values().filter(|f| f.run == run).map(|f| (f.pts, f.duration)).collect();
         frames.sort_unstable();
@@ -241,6 +287,28 @@ impl VideoOut {
             let duration = i64::from(w[0].1);
             w[1].0.saturating_sub(w[0].0.saturating_add(duration)) > duration / 2
         })
+    }
+
+    /// Makes the frame last sent to the encoder last until `f` ends, so
+    /// `f` can be left out. False if there's no such frame of `f`'s run
+    /// left to change: then `f` has to be encoded.
+    fn stretch(&mut self, f: &Frame) -> bool {
+        let Some((run, pts)) = self.last_kept.filter(|&(run, pts)| run == f.run && pts < f.pts) else {
+            return false;
+        };
+        let Ok(duration) = u32::try_from(f.pts.saturating_add(i64::from(f.duration)).saturating_sub(pts)) else {
+            return false;
+        };
+        let _ = run;
+        if let Some((_, g)) = self.encoding.iter_mut().rev().find(|(_, g)| g.pts == pts && g.run == f.run) {
+            g.duration = g.duration.max(duration);
+            return true;
+        }
+        if let Some(c) = self.ready.last_mut().filter(|c| c.pts == pts) {
+            c.duration = c.duration.max(duration);
+            return true;
+        }
+        false
     }
 
     /// Frames that will never come back: those of a run when frames of a
@@ -253,13 +321,35 @@ impl VideoOut {
     }
 }
 
+/// A progressive file's samples of one stream.
+struct Table {
+    samples: Vec<FileSample>,
+    /// The lowest offset of each sample and all after it.
+    keep: Vec<u64>,
+    /// How many went out.
+    done: usize,
+}
+
 struct Progressive {
     /// Absolute file offset of the input's first byte.
     base: u64,
-    /// Per stream: its samples in the file, and how many went out.
-    tables: Vec<(Vec<FileSample>, usize)>,
-    cuts: Vec<f64>,
-    next_cut: usize,
+    tables: Vec<Table>,
+    cuts: Cuts,
+    /// Where the fragment being gathered ends, once planned, and where the
+    /// last one ended.
+    cut: Option<f64>,
+    last_cut: f64,
+}
+
+impl Progressive {
+    /// A file that's all out, or broken: no more input is read.
+    fn closed() -> Self {
+        Progressive { base: 0, tables: Vec::new(), cuts: Cuts::new(None, 0.0), cut: None, last_cut: 0.0 }
+    }
+
+    fn finished(&self) -> bool {
+        self.tables.iter().all(|t| t.done >= t.samples.len())
+    }
 }
 
 #[derive(Default)]
@@ -276,12 +366,19 @@ pub struct Converter {
     job: Option<Job>,
     prog: Option<Progressive>,
     video: HashMap<u32, VideoOut>,
-    /// Counts appends (and drains), so frames know which they came in.
+    /// Counts appends (and drains), so frames know which they came in, and
+    /// the page's number for the current one.
     epoch: u32,
+    seq: f64,
     /// What the worker takes after each append: the output, and frames of
-    /// earlier appends to append before it.
+    /// earlier appends to append before it, a group per append.
     pub output: Vec<u8>,
     pub held: Vec<u8>,
+    pub held_groups: Vec<HeldGroup>,
+    /// Converted inits written to `output` or `held` since they were taken.
+    pub inits_out: u32,
+    /// What a fresh converter needs to carry on from this one (`save_state`).
+    pub state: Vec<u8>,
     /// Where the worker puts an encoded chunk for `chunk`.
     pub chunk_buffer: Vec<u8>,
     pub error: String,
@@ -318,18 +415,49 @@ impl Converter {
 
     /// Starts an append (or a drain): what comes out from here on belongs to
     /// it, and frames of earlier ones go in `held`.
-    pub fn begin(&mut self) {
+    pub fn begin(&mut self, seq: f64) {
         if self.reinit_done.iter().any(|&d| d) {
             self.reinit = false;
         }
         self.reinit_done = [false; 2];
         self.epoch = self.epoch.wrapping_add(1);
+        self.seq = seq;
     }
 
     /// Whether input is still read: a progressive file that's all out has
     /// only trailing boxes left.
     pub fn wants_input(&self) -> bool {
-        self.prog.as_ref().is_none_or(|p| p.next_cut < p.cuts.len())
+        self.prog.as_ref().is_none_or(|p| !p.finished())
+    }
+
+    /// Takes the output, `held` and its groups, once JS has copied them.
+    pub fn clear_output(&mut self) {
+        for buf in [&mut self.output, &mut self.held] {
+            buf.clear();
+            // A big append's output needn't stay allocated.
+            if buf.capacity() > 16 << 20 {
+                *buf = Vec::new();
+            }
+        }
+        self.held_groups.clear();
+        self.inits_out = 0;
+    }
+
+    /// Drops the output of an append that failed: the page never gets it,
+    /// so the converted init in it, if any, comes again before the next.
+    pub fn discard_output(&mut self) {
+        self.clear_output();
+        if !self.out_init.is_empty() {
+            self.reinit = true;
+            self.reinit_done = [false; 2];
+        }
+    }
+
+    /// The first video track's display size, as the engine would show the
+    /// input: its sample entry's size, stretched by its pixel aspect ratio,
+    /// or else to its track header's aspect.
+    pub fn natural(&self) -> Option<(u32, u32)> {
+        self.streams.iter().find(|s| s.track.is_video()).and_then(|s| s.track.natural())
     }
 
     pub fn push(&mut self, bytes: &[u8]) {
@@ -368,7 +496,7 @@ impl Converter {
         if r.is_err() {
             // A broken file stays broken; stop reading it.
             self.input.clear();
-            self.prog = Some(Progressive { base: 0, tables: Vec::new(), cuts: Vec::new(), next_cut: 0 });
+            self.prog = Some(Progressive::closed());
         }
         r
     }
@@ -387,36 +515,62 @@ impl Converter {
         let Some(v) = self.video.get_mut(&track) else {
             return Ok(());
         };
-        let Some(f) = v.encoding.remove(&(timestamp.round() as i64)) else {
+        // The encoder puts chunks out in the order it got the frames.
+        let ts = timestamp.round() as i64;
+        let Some(f) = v.encoding.iter().position(|(t, _)| *t == ts).and_then(|i| v.encoding.remove(i)).map(|(_, f)| f)
+        else {
             return Ok(());
         };
-        v.ready.push(Chunk { pts: f.pts, duration: f.duration, epoch: f.epoch, key, size, data });
+        v.ready.push(Chunk { pts: f.pts, duration: f.duration, epoch: f.epoch, seq: f.seq, key, size, data });
         Ok(())
     }
 
     /// The decoder put out the frame with `timestamp`: whether to encode
-    /// it. Frames no job has, and frames that would go back in time (the
+    /// it (`ENCODE`, or `ENCODE_KEY` at an IDR picture) or `DROP` it.
+    /// Frames no job has, and frames that would go back in time (the
     /// decoder puts frames out in presentation order within a run, unless
-    /// the input's timestamps are wrong), are left out, so that what the
-    /// encoder gets is exactly what's written.
-    pub fn frame(&mut self, track: u32, timestamp: f64) -> bool {
+    /// the input's timestamps are wrong), are dropped, so that what the
+    /// encoder gets is exactly what's written. `skip` asks to leave the
+    /// frame out to cap the frame rate: then the frame before it lasts
+    /// until the next, unless it's a keyframe or there's no frame before it
+    /// to stretch, and then it's encoded after all.
+    pub fn frame(&mut self, track: u32, timestamp: f64, skip: bool) -> u32 {
         let Some(v) = self.video.get_mut(&track) else {
-            return false;
+            return DROP;
         };
         if !timestamp.is_finite() {
-            return false;
+            return DROP;
         }
         let ts = timestamp.round() as i64;
-        let Some(f) = v.frames.remove(&ts) else {
-            return false;
+        // The oldest run with a frame at this time: runs are few.
+        let mut found = None;
+        let mut next = v.frames.keys().next().map(|k| k.0);
+        while let Some(run) = next {
+            if v.frames.contains_key(&(run, ts)) {
+                found = Some(run);
+                break;
+            }
+            next = v.frames.range((run.saturating_add(1), i64::MIN)..).next().map(|(k, _)| k.0).filter(|&r| r > run);
+        }
+        let Some(f) = found.and_then(|run| v.frames.remove(&(run, ts))) else {
+            return DROP;
         };
         // The run's earlier frames, and earlier runs, have all come out.
-        v.frames.retain(|_, g| g.run > f.run || (g.run == f.run && g.pts > f.pts));
+        v.frames = v.frames.split_off(&(f.run, ts));
+        if skip && !f.key && v.stretch(&f) {
+            return DROP;
+        }
         if v.encoding.len() >= MAX_FRAMES {
             v.encoding.clear();
         }
-        v.encoding.insert(ts, f);
-        true
+        let key = f.key;
+        v.last_kept = Some((f.run, f.pts));
+        v.encoding.push_back((ts, f));
+        if key {
+            ENCODE_KEY
+        } else {
+            ENCODE
+        }
     }
 
     /// The worker flushed `track`'s decoder and every chunk is in: frames
@@ -428,6 +582,7 @@ impl Converter {
         if let Some(v) = self.video.get_mut(&track) {
             v.frames.clear();
             v.encoding.clear();
+            v.last_kept = None;
         }
     }
 
@@ -442,6 +597,7 @@ impl Converter {
             v.frames.clear();
             v.encoding.clear();
             v.ready.clear();
+            v.last_kept = None;
         }
     }
 
@@ -471,18 +627,143 @@ impl Converter {
             v.frames.clear();
             v.encoding.clear();
             v.ready.clear();
+            v.last_kept = None;
         }
         self.reinit = !self.out_init.is_empty();
     }
 
-    /// Whether a fresh converter primed with `init` would carry on the same:
-    /// nothing waits in this one.
+    /// Whether a fresh converter primed with `init` and given this one's
+    /// `save_state` would carry on the same: nothing waits in this one
+    /// (no input, no frames in the codecs), and the state that matters fits
+    /// in `save_state`. An AAC decoder carries the overlap of its last
+    /// frame, which can't be moved, so streams with AAC are recycled only
+    /// before their first frame or right after a reset.
     pub fn recyclable(&self) -> bool {
         !self.progressive
             && self.prog.is_none()
             && self.job.is_none()
             && self.input.is_empty()
+            && !self.init.is_empty()
             && self.video.values().all(|v| v.frames.is_empty() && v.encoding.is_empty() && v.ready.is_empty())
+            && self.streams.iter().all(|s| match &s.track.codec {
+                Codec::Aac(a) => a.fresh(),
+                _ => true,
+            })
+    }
+
+    /// Writes what a fresh converter needs to carry on from this one into
+    /// `state`: where each stream is, the GOP it may replay, and the
+    /// counters that order frames and fragments.
+    pub fn save_state(&mut self) {
+        let mut w = Writer::new();
+        w.u32(STATE_VERSION);
+        w.u32(self.epoch);
+        w.u32(self.sequence);
+        w.u32(self.streams.len() as u32);
+        for s in &self.streams {
+            w.u32(s.track.id);
+            w.u64(s.next_dts as u64);
+            put_opt(&mut w, s.end_dts);
+            w.u8(u8::from(s.needs_key));
+            w.u8(u8::from(s.aligned));
+            w.u64(s.run);
+            put_opt(&mut w, s.last_pts);
+            w.u64(s.bytes);
+            w.u64(s.ticks);
+            w.u8(u8::from(s.gop.lost));
+            w.u32(s.gop.samples.len() as u32);
+            for (pts, duration, range) in &s.gop.samples {
+                w.u64(*pts as u64);
+                w.u32(*duration);
+                w.u32(range.len() as u32);
+            }
+            w.bytes(&s.gop.data);
+            let v = self.video.get(&s.track.id);
+            w.u32(v.map_or(0, |v| v.main_epoch));
+            let size = v.and_then(|v| v.size);
+            w.u8(u8::from(size.is_some()));
+            let (width, height) = size.unwrap_or_default();
+            w.u16(width);
+            w.u16(height);
+        }
+        self.state = w.buf;
+    }
+
+    /// Takes over a converter's `save_state`, after the same init primed
+    /// this one. Fails, changing nothing, if they don't match.
+    pub fn load_state(&mut self, state: &[u8]) -> Result<()> {
+        let mut r = Reader::new(state);
+        if r.u32()? != STATE_VERSION {
+            return err("state from another version");
+        }
+        let epoch = r.u32()?;
+        let sequence = r.u32()?;
+        if r.u32()? as usize != self.streams.len() {
+            return err("state for other tracks");
+        }
+        let mut loaded = Vec::with_capacity(self.streams.len());
+        for s in &self.streams {
+            if r.u32()? != s.track.id {
+                return err("state for other tracks");
+            }
+            let next_dts = r.u64()? as i64;
+            let end_dts = get_opt(&mut r)?;
+            let needs_key = r.u8()? != 0;
+            let aligned = r.u8()? != 0;
+            let run = r.u64()?;
+            let last_pts = get_opt(&mut r)?;
+            let (bytes, ticks) = (r.u64()?, r.u64()?);
+            let mut gop = Gop { lost: r.u8()? != 0, ..Gop::default() };
+            let count = r.u32()? as usize;
+            if count > MAX_GOP || count > r.remaining() / 16 {
+                return err("bad state");
+            }
+            let mut total = 0usize;
+            for _ in 0..count {
+                let pts = r.u64()? as i64;
+                let duration = r.u32()?;
+                let len = r.u32()? as usize;
+                gop.samples.push((pts, duration, total..total + len));
+                total += len;
+            }
+            gop.data = r.bytes(total)?.to_vec();
+            let main_epoch = r.u32()?;
+            let has_size = r.u8()? != 0;
+            let size = (r.u16()?, r.u16()?);
+            loaded.push((
+                next_dts,
+                end_dts,
+                needs_key,
+                aligned,
+                run,
+                last_pts,
+                bytes,
+                ticks,
+                gop,
+                main_epoch,
+                has_size.then_some(size),
+            ));
+        }
+        for (s, l) in self.streams.iter_mut().zip(loaded) {
+            let (next_dts, end_dts, needs_key, aligned, run, last_pts, bytes, ticks, gop, main_epoch, size) = l;
+            s.next_dts = next_dts;
+            s.end_dts = end_dts;
+            s.needs_key = needs_key;
+            s.aligned = aligned;
+            s.run = run;
+            s.last_pts = last_pts;
+            s.bytes = bytes;
+            s.ticks = ticks;
+            s.gop = gop;
+            if s.track.is_video() {
+                let v = self.video.entry(s.track.id).or_default();
+                v.main_epoch = main_epoch;
+                v.size = size;
+            }
+        }
+        self.epoch = epoch;
+        self.sequence = sequence;
+        Ok(())
     }
 
     pub fn fail(&mut self, e: &Error) {
@@ -497,8 +778,12 @@ impl Converter {
         if self.reinit && !self.reinit_done[i] {
             if !is_init {
                 buf.extend_from_slice(&self.out_init);
+                self.inits_out += 1;
             }
             self.reinit_done[i] = true;
+        }
+        if is_init && bytes.get(4..8) == Some(b"moov") {
+            self.inits_out += 1;
         }
         buf.extend_from_slice(bytes);
     }
@@ -541,10 +826,48 @@ impl Converter {
                 v.main_epoch = self.epoch;
             }
             let main = ready.split_off(held);
-            self.write_video(id, ready, true, &mut Vec::new())?;
+            // A group per earlier append, in the order they came.
+            let mut rest = ready;
+            while let Some(first) = rest.first() {
+                let epoch = first.epoch;
+                let n = rest.iter().take_while(|c| c.epoch == epoch).count();
+                let tail = rest.split_off(n);
+                let group = std::mem::replace(&mut rest, tail);
+                self.write_held(id, group)?;
+            }
             self.write_video(id, main, false, &mut parts)?;
         }
         self.write_fragment(false, &parts);
+        Ok(())
+    }
+
+    /// Writes chunks of one earlier append to `held`, as a group of their
+    /// own with that append's number and their time range.
+    fn write_held(&mut self, id: u32, chunks: Vec<Chunk>) -> Result<()> {
+        let Some(first) = chunks.first() else {
+            return Ok(());
+        };
+        let seq = first.seq;
+        let (timescale, edit) =
+            self.streams.iter().find(|s| s.track.id == id).map_or((1, 0), |s| (s.track.timescale, s.track.edit_offset));
+        let seconds = |ticks: i64| ticks.saturating_sub(edit) as f64 / f64::from(timescale.max(1));
+        let start = seconds(chunks.iter().map(|c| c.pts).min().unwrap_or(0));
+        let end = seconds(chunks.iter().map(|c| c.pts.saturating_add(i64::from(c.duration))).max().unwrap_or(0));
+        let at = self.held.len();
+        self.write_video(id, chunks, true, &mut Vec::new())?;
+        let len = self.held.len() - at;
+        if len == 0 {
+            return Ok(());
+        }
+        match self.held_groups.last_mut() {
+            // The same append's frames once more, right after: one group.
+            Some(g) if g.seq.to_bits() == seq.to_bits() && g.offset as usize + g.len as usize == at => {
+                g.len += len as u32;
+                g.start = g.start.min(start);
+                g.end = g.end.max(end);
+            }
+            _ => self.held_groups.push(HeldGroup { seq, start, end, offset: at as u32, len: len as u32 }),
+        }
         Ok(())
     }
 
@@ -700,7 +1023,7 @@ impl Converter {
     /// after this one starts with a keyframe.
     fn convert_runs(&mut self, runs: Vec<Run>, data: &[u8], next_key: &[(u32, bool)]) -> Result<bool> {
         let mut job = Job::default();
-        let epoch = self.epoch;
+        let (epoch, seq) = (self.epoch, self.seq);
         for run in runs {
             let Some(stream) = self.streams.iter_mut().find(|s| s.track.id == run.track_id) else {
                 continue;
@@ -711,7 +1034,7 @@ impl Converter {
             if stream.track.is_video() {
                 let out = self.video.entry(stream.track.id).or_default();
                 let next_key = next_key.iter().find(|(id, _)| *id == run.track_id).map(|&(_, key)| key);
-                stream.video(&run.samples, data, &mut job, out, epoch, next_key)?;
+                stream.video(&run.samples, data, &mut job, out, (epoch, seq), next_key)?;
                 out.trim();
             } else {
                 job.parts.push(stream.convert(&run.samples, data)?);
@@ -738,16 +1061,31 @@ impl Converter {
             let Some(prog) = self.prog.as_mut() else {
                 return Ok(Poll::Idle);
             };
-            let have = prog.base + self.input.len() as u64;
-            let Some(&cut) = prog.cuts.get(prog.next_cut) else {
+            if prog.finished() {
                 return Ok(Poll::Idle);
+            }
+            let have = prog.base + self.input.len() as u64;
+            let cut = if let Some(cut) = prog.cut {
+                cut
+            } else {
+                // From the first sample still to go out, so spans
+                // without samples are skipped, not cut up.
+                let first = self
+                    .streams
+                    .iter()
+                    .zip(&prog.tables)
+                    .filter_map(|(s, t)| t.samples.get(t.done).map(|x| x.dts as f64 / f64::from(s.track.timescale)))
+                    .fold(f64::INFINITY, f64::min);
+                let cut = prog.cuts.next(prog.last_cut.max(first));
+                prog.cut = Some(cut);
+                cut
             };
             // Each stream's samples up to the cut, if all their bytes are here.
             let mut picks = Vec::new();
-            for (stream, (table, done)) in self.streams.iter().zip(&prog.tables) {
+            for (stream, t) in self.streams.iter().zip(&prog.tables) {
                 let timescale = f64::from(stream.track.timescale);
-                let n = table[*done..].iter().take_while(|s| (s.dts as f64 / timescale) < cut).count();
-                let end = table[*done..*done + n].iter().map(FileSample::end).max().unwrap_or(0);
+                let n = t.samples[t.done..].iter().take_while(|s| (s.dts as f64 / timescale) < cut).count();
+                let end = t.samples[t.done..t.done + n].iter().map(FileSample::end).max().unwrap_or(0);
                 if end == u64::MAX {
                     return err("sample past the end of any file");
                 }
@@ -763,16 +1101,17 @@ impl Converter {
             let len = self.input.len();
             let mut runs = Vec::new();
             let mut next_key = Vec::new();
-            for ((stream, (table, done)), n) in self.streams.iter().zip(&mut prog.tables).zip(picks) {
+            for ((stream, t), n) in self.streams.iter().zip(&mut prog.tables).zip(picks) {
                 let samples =
-                    table[*done..*done + n].iter().map(|s| s.at(base, len)).collect::<Result<Vec<Sample>>>()?;
-                *done += n;
+                    t.samples[t.done..t.done + n].iter().map(|s| s.at(base, len)).collect::<Result<Vec<Sample>>>()?;
+                t.done += n;
                 runs.push(Run { track_id: stream.track.id, samples });
-                next_key.push((stream.track.id, table.get(*done).is_none_or(|s| s.sync)));
+                next_key.push((stream.track.id, t.samples.get(t.done).is_none_or(|s| s.sync)));
             }
-            prog.next_cut += 1;
+            prog.cut = None;
+            prog.last_cut = cut;
             // Bytes before every remaining sample aren't needed again.
-            let keep_from = prog.tables.iter().filter_map(|(t, done)| t[*done..].iter().map(|s| s.offset).min()).min();
+            let keep_from = prog.tables.iter().filter_map(|t| t.keep.get(t.done).copied()).min();
             let input = std::mem::take(&mut self.input);
             let became_job = self.convert_runs(runs, input.data(), &next_key);
             self.input = input;
@@ -803,16 +1142,18 @@ impl Converter {
         let mut tracks = Vec::new();
         let mut tables = Vec::new();
         for (track, trak) in init::parse_progressive(&moov)? {
-            tables.push((progressive::samples(trak)?, 0));
+            let samples = progressive::samples(trak)?;
+            let keep = progressive::suffix_min_offsets(&samples);
+            tables.push(Table { samples, keep, done: 0 });
             tracks.push(track);
         }
         let end = tracks
             .iter()
             .zip(&tables)
-            .map(|(t, (s, _))| s.last().map_or(0.0, |s| s.end_time() / f64::from(t.timescale)))
+            .map(|(t, s)| s.samples.last().map_or(0.0, |s| s.end_time() / f64::from(t.timescale)))
             .fold(0.0, f64::max);
-        let video = tracks.iter().zip(&tables).find(|(t, _)| t.is_video()).map(|(t, (s, _))| (&s[..], t.timescale));
-        let cuts = progressive::cut_times(video, end);
+        let video = tracks.iter().zip(&tables).find(|(t, _)| t.is_video()).map(|(t, s)| (&s.samples[..], t.timescale));
+        let cuts = Cuts::new(video, end);
         let mut ftyp = Writer::new();
         ftyp.begin(*b"ftyp");
         ftyp.bytes(b"iso6");
@@ -827,7 +1168,7 @@ impl Converter {
         self.moov_progressive = true;
         self.write_init(false)?;
         self.reinit = false;
-        self.prog = Some(Progressive { base: 0, tables, cuts, next_cut: 0 });
+        self.prog = Some(Progressive { base: 0, tables, cuts, cut: None, last_cut: 0.0 });
         Ok(true)
     }
 }
@@ -875,7 +1216,7 @@ impl Stream {
         data: &[u8],
         job: &mut Job,
         out: &mut VideoOut,
-        epoch: u32,
+        (epoch, seq): (u32, f64),
         next_key: Option<bool>,
     ) -> Result<()> {
         let Codec::Avc(avc) = &self.track.codec else {
@@ -899,6 +1240,10 @@ impl Stream {
         }
         let codec = avc.codec_word();
         let timescale = self.track.timescale;
+        // WebCodecs takes timestamps up to 2^53 microseconds (285 years).
+        if samples.iter().any(|s| micros(s.pts(), timescale).unsigned_abs() > 1 << 53) {
+            return err("timestamps out of range");
+        }
         let bitrate = self.bitrate();
         let push = |job: &mut Job, flags: u32, pts: i64, duration: u32, bytes: Range<usize>| {
             job.samples.push(JobSample {
@@ -956,8 +1301,8 @@ impl Stream {
                 continue;
             }
             flags.push(key);
-            let frame = Frame { pts: s.pts(), duration: s.duration, epoch, run: self.run };
-            out.frames.insert(micros(s.pts(), timescale), frame);
+            let frame = Frame { pts: s.pts(), duration: s.duration, epoch, seq, run: self.run, key: key != 0 };
+            out.frames.insert((self.run, micros(s.pts(), timescale)), frame);
             self.last_pts = Some(self.last_pts.map_or(s.pts(), |last| last.max(s.pts())));
         }
         // Flushing puts out every frame decoded so far, so not while one
