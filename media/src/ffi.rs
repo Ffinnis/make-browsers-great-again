@@ -1,17 +1,16 @@
 //! The C ABI worker.js calls. This is the only module with `unsafe`: it
 //! turns the handles and buffers JS passes back into Rust references.
 //!
-//! JS owns nothing here. It copies input into a buffer from `mm_alloc`,
-//! passes it in and frees it; it reads results straight out of memory
-//! through the pointer and length getters, and must copy them before the
-//! next call into the module, which may move them. A handle is a pointer to
-//! a boxed `Converter`, valid from `mm_create` until `mm_destroy`.
+//! JS owns nothing here. It writes input and encoded chunks straight into
+//! buffers the converter reserves (`mm_reserve`, `mm_chunk_buffer`) and
+//! says how much it wrote; it reads results straight out of memory through
+//! the pointer and length getters, and must copy them before the next call
+//! into the module, which may move them. A handle is a pointer to a boxed
+//! `Converter`, valid from `mm_create` until `mm_destroy`.
 //!
 //! Status codes: 0 done, 1 a job waits (`mm_poll` only), -1 failed, with
 //! the reason in `mm_error_*`.
 #![allow(unsafe_code)]
-
-use std::slice;
 
 use crate::conv::{Converter, JobSample, Poll};
 
@@ -30,32 +29,19 @@ unsafe fn conv<'a>(h: *mut Converter) -> Option<&'a mut Converter> {
     unsafe { h.as_mut() }
 }
 
+/// Marks `len` bytes JS wrote into `buf`'s spare capacity as part of it.
+/// False if they don't fit, which JS can't do through the pointers it got.
+///
 /// # Safety
-/// `ptr` and `len` describe a buffer from `mm_alloc`, or `len` is 0.
-unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
-    if ptr.is_null() || len == 0 {
-        return &[];
+/// JS wrote `len` bytes from `buf.as_ptr() + buf.len()` on, through a
+/// pointer this module returned for that capacity.
+unsafe fn grow(buf: &mut Vec<u8>, len: usize) -> bool {
+    if buf.capacity() - buf.len() < len {
+        return false;
     }
-    // SAFETY: per the function's contract.
-    unsafe { slice::from_raw_parts(ptr, len) }
-}
-
-#[no_mangle]
-pub extern "C" fn mm_alloc(len: usize) -> *mut u8 {
-    let mut v = Vec::<u8>::with_capacity(len.max(1));
-    let ptr = v.as_mut_ptr();
-    std::mem::forget(v);
-    ptr
-}
-
-/// # Safety
-/// `ptr` came from `mm_alloc(len)`.
-#[no_mangle]
-pub unsafe extern "C" fn mm_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() {
-        // SAFETY: rebuilds the Vec mm_alloc leaked, with its capacity.
-        drop(unsafe { Vec::from_raw_parts(ptr, 0, len.max(1)) });
-    }
+    // SAFETY: within capacity, and the bytes are initialized: JS wrote them.
+    unsafe { buf.set_len(buf.len() + len) };
+    true
 }
 
 /// A converter for one `SourceBuffer`; `progressive` != 0 for a whole MP4
@@ -75,17 +61,51 @@ pub unsafe extern "C" fn mm_destroy(h: *mut Converter) {
     }
 }
 
-/// Appends input bytes. Converting happens in `mm_poll`.
+/// Starts an append or a drain: frames from earlier ones come out in
+/// `held` from now on.
 ///
 /// # Safety
-/// See `conv` and `bytes`.
+/// See `conv`.
 #[no_mangle]
-pub unsafe extern "C" fn mm_push(h: *mut Converter, ptr: *const u8, len: usize) -> i32 {
+pub unsafe extern "C" fn mm_begin(h: *mut Converter) {
     // SAFETY: forwarded contract.
-    let (Some(c), data) = (unsafe { conv(h) }, unsafe { bytes(ptr, len) }) else {
+    if let Some(c) = unsafe { conv(h) } {
+        c.begin();
+    }
+}
+
+/// Room for `len` bytes of input: where to write them before `mm_commit`.
+/// Null if that's more input than a converter takes at once.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_reserve(h: *mut Converter, len: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
+        return std::ptr::null_mut();
+    };
+    // Past the limit, the next poll fails.
+    c.input.room(len).map_or(std::ptr::null_mut(), |buf| buf.spare_capacity_mut().as_mut_ptr().cast())
+}
+
+/// Takes the `len` bytes written where `mm_reserve` said. Converting
+/// happens in `mm_poll`.
+///
+/// # Safety
+/// See `conv` and `grow`: `len` is at most what was reserved, and nothing
+/// was called in between.
+#[no_mangle]
+pub unsafe extern "C" fn mm_commit(h: *mut Converter, len: usize) -> i32 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
         return -1;
     };
-    c.push(data);
+    // SAFETY: forwarded contract.
+    if !unsafe { grow(c.input.buffer(), len) } {
+        return -1;
+    }
+    c.committed(len);
     0
 }
 
@@ -122,7 +142,7 @@ pub unsafe extern "C" fn mm_job_samples(h: *mut Converter) -> *const JobSample {
     unsafe { conv(h) }.and_then(|c| c.job()).map_or(std::ptr::null(), |j| j.samples.as_ptr())
 }
 
-/// Where the job samples' offsets point into.
+/// Where the job samples' offsets point into. Stays put until `mm_write`.
 ///
 /// # Safety
 /// See `conv`.
@@ -132,38 +152,99 @@ pub unsafe extern "C" fn mm_job_data(h: *mut Converter) -> *const u8 {
     unsafe { conv(h) }.and_then(|c| c.job()).map_or(std::ptr::null(), |j| j.data.as_ptr())
 }
 
-/// An encoded VP9 chunk for the job, with the timestamp of its frame.
+/// The decoder put out the frame with `timestamp`: 1 to encode it, 0 to
+/// drop it.
 ///
 /// # Safety
-/// See `conv` and `bytes`.
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_frame(h: *mut Converter, track: u32, timestamp: f64) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(0, |c| u32::from(c.frame(track, timestamp)))
+}
+
+/// Room for an encoded chunk of `len` bytes, for `mm_chunk`.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_chunk_buffer(h: *mut Converter, len: usize) -> *mut u8 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
+        return std::ptr::null_mut();
+    };
+    c.chunk_buffer.clear();
+    if c.chunk_buffer.try_reserve(len).is_err() {
+        return std::ptr::null_mut();
+    }
+    c.chunk_buffer.spare_capacity_mut().as_mut_ptr().cast()
+}
+
+/// The VP9 chunk of `len` bytes written to `mm_chunk_buffer`, for the frame
+/// with `timestamp`, encoded at `width` × `height`.
+///
+/// # Safety
+/// See `conv` and `grow`.
 #[no_mangle]
 pub unsafe extern "C" fn mm_chunk(
     h: *mut Converter,
     track: u32,
     timestamp: f64,
     key: u32,
-    ptr: *const u8,
+    width: u32,
+    height: u32,
     len: usize,
 ) -> i32 {
-    // SAFETY: forwarded contract.
-    let (Some(c), data) = (unsafe { conv(h) }, unsafe { bytes(ptr, len) }) else {
-        return -1;
-    };
-    let r = c.chunk(track, timestamp, key != 0, data).map(|()| 0);
-    status(c, r)
-}
-
-/// Ends the job and writes its fragment. Poll again afterwards.
-///
-/// # Safety
-/// See `conv`.
-#[no_mangle]
-pub unsafe extern "C" fn mm_finish(h: *mut Converter) -> i32 {
     // SAFETY: forwarded contract.
     let Some(c) = (unsafe { conv(h) }) else {
         return -1;
     };
-    let r = c.finish().map(|()| 0);
+    // SAFETY: forwarded contract.
+    if !unsafe { grow(&mut c.chunk_buffer, len) } {
+        return -1;
+    }
+    let data = std::mem::take(&mut c.chunk_buffer);
+    let size = (width.min(0xffff) as u16, height.min(0xffff) as u16);
+    let r = c.chunk(track, timestamp, key != 0, size, data).map(|()| 0);
+    status(c, r)
+}
+
+/// The worker flushed `track`'s decoder, and its chunks are all in.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_flushed(h: *mut Converter, track: u32) {
+    // SAFETY: forwarded contract.
+    if let Some(c) = unsafe { conv(h) } {
+        c.flushed(track);
+    }
+}
+
+/// The worker's codecs started over; frames in flight are lost.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_restart(h: *mut Converter) {
+    // SAFETY: forwarded contract.
+    if let Some(c) = unsafe { conv(h) } {
+        c.restart();
+    }
+}
+
+/// Ends the job, if any, and writes fragments with every chunk so far.
+/// Poll again afterwards.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_write(h: *mut Converter) -> i32 {
+    // SAFETY: forwarded contract.
+    let Some(c) = (unsafe { conv(h) }) else {
+        return -1;
+    };
+    let r = c.write().map(|()| 0);
     status(c, r)
 }
 
@@ -177,6 +258,17 @@ pub unsafe extern "C" fn mm_reset(h: *mut Converter) {
     if let Some(c) = unsafe { conv(h) } {
         c.reset();
     }
+}
+
+/// 1 if nothing waits in the converter, so a fresh one primed with the
+/// init would carry on the same.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_recyclable(h: *mut Converter) -> u32 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(0, |c| u32::from(c.recyclable()))
 }
 
 /// # Safety
@@ -195,7 +287,25 @@ pub unsafe extern "C" fn mm_output_len(h: *mut Converter) -> usize {
     unsafe { conv(h) }.map_or(0, |c| c.output.len())
 }
 
-/// Empties the output once JS has copied it.
+/// Frames of earlier appends, for the page to append before the output.
+///
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_held_ptr(h: *mut Converter) -> *const u8 {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(std::ptr::null(), |c| c.held.as_ptr())
+}
+
+/// # Safety
+/// See `conv`.
+#[no_mangle]
+pub unsafe extern "C" fn mm_held_len(h: *mut Converter) -> usize {
+    // SAFETY: forwarded contract.
+    unsafe { conv(h) }.map_or(0, |c| c.held.len())
+}
+
+/// Empties the output and `held` once JS has copied them.
 ///
 /// # Safety
 /// See `conv`.
@@ -203,7 +313,13 @@ pub unsafe extern "C" fn mm_output_len(h: *mut Converter) -> usize {
 pub unsafe extern "C" fn mm_output_clear(h: *mut Converter) {
     // SAFETY: forwarded contract.
     if let Some(c) = unsafe { conv(h) } {
-        c.output.clear();
+        for buf in [&mut c.output, &mut c.held] {
+            buf.clear();
+            // A big append's output needn't stay allocated.
+            if buf.capacity() > 16 << 20 {
+                *buf = Vec::new();
+            }
+        }
     }
 }
 

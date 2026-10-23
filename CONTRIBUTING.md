@@ -75,21 +75,22 @@ fixes. To run only the core's tests:
 cargo test --manifest-path core/Cargo.toml
 ```
 
-| Code                                             | Formatter                                      | Linter                                                    |
-| ------------------------------------------------ | ---------------------------------------------- | --------------------------------------------------------- |
-| Rust (`core/`)                                   | rustfmt (`core/rustfmt.toml`)                  | clippy, pedantic, warnings are errors (`core/Cargo.toml`) |
-| Swift (`shell/`, `bench/`)                       | SwiftFormat (`.swiftformat`)                   | SwiftLint `--strict` (`.swiftlint.yml`)                   |
-| Objective-C++ (`shell/engine/`, `shell/helper/`) | clang-format, Chromium style (`.clang-format`) |                                                           |
-| Python (`bench/`)                                | ruff (`ruff.toml`)                             | ruff                                                      |
-| Shell (`scripts/`)                               | shfmt (`.editorconfig`)                        | ShellCheck (`.shellcheckrc`)                              |
+| Code                                             | Formatter                                      | Linter                                                                           |
+| ------------------------------------------------ | ---------------------------------------------- | -------------------------------------------------------------------------------- |
+| Rust (`core/`)                                   | rustfmt (`core/rustfmt.toml`)                  | clippy, pedantic, warnings are errors (`core/Cargo.toml`)                        |
+| Rust (`media/`)                                  | rustfmt (`media/rustfmt.toml`)                 | clippy, pedantic, warnings are errors, also for WebAssembly (`media/Cargo.toml`) |
+| Swift (`shell/`, `bench/`)                       | SwiftFormat (`.swiftformat`)                   | SwiftLint `--strict` (`.swiftlint.yml`)                                          |
+| Objective-C++ (`shell/engine/`, `shell/helper/`) | clang-format, Chromium style (`.clang-format`) |                                                                                  |
+| Python (`bench/`)                                | ruff (`ruff.toml`)                             | ruff                                                                             |
+| Shell (`scripts/`, `media/tests/fixtures/`)      | shfmt (`.editorconfig`)                        | ShellCheck (`.shellcheckrc`)                                                     |
 
 Beyond style, the checks hold the architecture in place:
 
 - Only `shell/engine/` and `shell/helper/` include CEF; the rest of the shell
   goes through `MBEngine`.
 - The shell is AppKit: SwiftUI isn't imported.
-- `unsafe` Rust is confined to `core/src/crypto.rs`, and each block says
-  why it's sound.
+- `unsafe` Rust is confined to `core/src/crypto.rs` and `media/src/ffi.rs`
+  (the WebAssembly module's exports), and each block says why it's sound.
 - The core doesn't print, panic on `unwrap()` or leave `todo!()` behind.
 - Files, types and functions have size and complexity limits (SwiftLint's
   `file_length`, `type_body_length`, `function_body_length` and

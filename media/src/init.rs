@@ -50,10 +50,73 @@ impl Track {
     fn visual(&self) -> bool {
         matches!(&self.entry_kind, b"avc1" | b"avc3" | b"vp09" | b"av01" | b"hvc1" | b"hev1")
     }
+
+    /// The coded size in the sample entry, for a visual track.
+    pub fn size(&self) -> Option<(u16, u16)> {
+        let at = self.entry.get(8 + 24..8 + 28)?;
+        Some((u16::from_be_bytes([at[0], at[1]]), u16::from_be_bytes([at[2], at[3]])))
+    }
 }
 
 /// The tracks a moov describes, in order.
 pub fn parse_moov(moov: &[u8]) -> Result<Vec<Track>> {
+    let tracks = parse_traks(moov)?;
+    if tracks.is_empty() {
+        return err("moov has no tracks");
+    }
+    Ok(tracks)
+}
+
+/// The tracks of a progressive file worth delivering: video and audio the
+/// engine can play once converted, and Opus and FLAC, which it plays as
+/// they are. Timecode, metadata and text tracks (iPhone movies have them),
+/// and audio that can't be converted (MP3, AC-3), are left out, so the
+/// rest still plays. Video that can't be converted fails the file: playing
+/// its sound alone would pass for a picture that never shows up.
+pub fn parse_progressive(moov: &[u8]) -> Result<Vec<(Track, &[u8])>> {
+    let mut out = Vec::new();
+    let mut lost_video = false;
+    for b in boxes(moov)? {
+        if &b.kind != b"trak" {
+            continue;
+        }
+        let handler = handler(b.body)?;
+        if !matches!(&handler, b"vide" | b"soun") {
+            continue;
+        }
+        let keep = match parse_trak(b.body) {
+            Ok(track) => match (&track.codec, &track.entry_kind) {
+                (Codec::Avc(_) | Codec::Aac(_), _) | (Codec::Other, b"Opus" | b"fLaC") => Some(track),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        match keep {
+            Some(track) => out.push((track, b.body)),
+            None => lost_video |= &handler == b"vide",
+        }
+    }
+    if lost_video && !out.iter().any(|(t, _)| t.is_video()) {
+        return err("no H.264 video");
+    }
+    if out.is_empty() {
+        return err("no H.264 or AAC track");
+    }
+    Ok(out)
+}
+
+fn handler(trak: &[u8]) -> Result<[u8; 4]> {
+    let Some(hdlr) = path(trak, &[b"mdia", b"hdlr"])? else {
+        return Ok([0; 4]);
+    };
+    let mut r = Reader::new(hdlr);
+    r.full_header()?;
+    r.u32()?;
+    let b = r.bytes(4)?;
+    Ok([b[0], b[1], b[2], b[3]])
+}
+
+fn parse_traks(moov: &[u8]) -> Result<Vec<Track>> {
     let mut defaults = Vec::new();
     if let Some(mvex) = child(moov, *b"mvex")? {
         for b in boxes(mvex)? {
@@ -76,9 +139,6 @@ pub fn parse_moov(moov: &[u8]) -> Result<Vec<Track>> {
             }
             tracks.push(track);
         }
-    }
-    if tracks.is_empty() {
-        return err("moov has no tracks");
     }
     Ok(tracks)
 }
@@ -146,7 +206,12 @@ fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
     let Some(children) = entry.get(28 + extra..) else {
         return err("truncated mp4a");
     };
-    let Some(esds) = child(children, *b"esds")? else {
+    // QuickTime puts it inside a wave box.
+    let esds = match child(children, *b"esds")? {
+        Some(esds) => Some(esds),
+        None => child(children, *b"wave")?.map(|wave| child(wave, *b"esds")).transpose()?.flatten(),
+    };
+    let Some(esds) = esds else {
         return err("mp4a without esds");
     };
     let mut r = Reader::new(esds);
@@ -192,9 +257,16 @@ fn mp4a_config(entry: &[u8]) -> Result<Vec<u8>> {
     err("esds without AudioSpecificConfig")
 }
 
-/// The moov the engine gets. A progressive file's moov also loses its
-/// sample tables and gains an mvex, since its samples arrive as fragments.
-pub fn write_moov(moov: &[u8], tracks: &[Track], progressive: bool) -> Result<Vec<u8>> {
+/// The moov the engine gets, with the traks of `tracks` only. A progressive
+/// file's moov also loses its sample tables and gains an mvex, since its
+/// samples arrive as fragments. `size` gives a video track's coded size
+/// once the encoder's differs from the input's.
+pub fn write_moov(
+    moov: &[u8],
+    tracks: &[&Track],
+    progressive: bool,
+    size: &dyn Fn(u32) -> Option<(u16, u16)>,
+) -> Result<Vec<u8>> {
     let mut w = Writer::new();
     w.begin(*b"moov");
     for b in boxes(moov)? {
@@ -202,12 +274,13 @@ pub fn write_moov(moov: &[u8], tracks: &[Track], progressive: bool) -> Result<Ve
             b"trak" => {
                 let id = track_id(b.body)?;
                 let Some(track) = tracks.iter().find(|t| t.id == id) else {
-                    return err("trak missing from the parsed tracks");
+                    continue;
                 };
-                rewrite(&mut w, &b, &mut |w, b| match &b.kind {
+                let size = size(id);
+                rewrite(&mut w, &b, 0, &mut |w, b| match &b.kind {
                     b"mdia" | b"minf" | b"stbl" => Ok(false),
                     b"stsd" => {
-                        write_stsd(w, track)?;
+                        write_stsd(w, track, size)?;
                         Ok(true)
                     }
                     kind if progressive && is_sample_table(*kind) => {
@@ -242,12 +315,21 @@ pub fn write_moov(moov: &[u8], tracks: &[Track], progressive: bool) -> Result<Ve
 }
 
 /// Copies a container box, letting `f` write any child itself (returning
-/// true) or have it descended into (false).
-fn rewrite(w: &mut Writer, b: &Mp4Box<'_>, f: &mut dyn FnMut(&mut Writer, &Mp4Box<'_>) -> Result<bool>) -> Result<()> {
+/// true) or have it descended into (false). trak, mdia, minf, stbl is as
+/// deep as a moov goes; boxes nested deeper than that are broken input.
+fn rewrite(
+    w: &mut Writer,
+    b: &Mp4Box<'_>,
+    depth: usize,
+    f: &mut dyn FnMut(&mut Writer, &Mp4Box<'_>) -> Result<bool>,
+) -> Result<()> {
+    if depth > 4 {
+        return err("boxes nested too deep");
+    }
     w.begin(b.kind);
     for c in boxes(b.body)? {
         if !f(w, &c)? {
-            rewrite(w, &c, f)?;
+            rewrite(w, &c, depth + 1, f)?;
         }
     }
     w.end();
@@ -295,7 +377,7 @@ fn write_empty_table(w: &mut Writer, kind: [u8; 4]) {
     }
 }
 
-fn write_stsd(w: &mut Writer, track: &Track) -> Result<()> {
+fn write_stsd(w: &mut Writer, track: &Track, size: Option<(u16, u16)>) -> Result<()> {
     w.begin_full(*b"stsd", 0, 0);
     w.u32(1);
     let entry = boxes(&track.entry)?;
@@ -303,7 +385,7 @@ fn write_stsd(w: &mut Writer, track: &Track) -> Result<()> {
         return err("missing sample entry");
     };
     match &track.codec {
-        Codec::Avc(_) => write_vp09(w, entry.body)?,
+        Codec::Avc(_) => write_vp09(w, entry.body, size)?,
         Codec::Aac(conv) => {
             w.begin(*b"fLaC");
             w.bytes(&[0; 6]);
@@ -324,15 +406,25 @@ fn write_stsd(w: &mut Writer, track: &Track) -> Result<()> {
     Ok(())
 }
 
-/// A vp09 entry with the avc1's size and pixel aspect, and its colour
-/// description if it had one: the pixels themselves don't change.
-fn write_vp09(w: &mut Writer, avc1: &[u8]) -> Result<()> {
+/// A vp09 entry with the avc1's pixel aspect, and its colour description if
+/// it had one, and its size unless the encoder scaled the frames. The track
+/// header keeps the input's size, which is what the page sees as the
+/// video's size either way.
+fn write_vp09(w: &mut Writer, avc1: &[u8], size: Option<(u16, u16)>) -> Result<()> {
     let Some(header) = avc1.get(..78) else {
         return err("truncated avc1");
     };
     let children = boxes(&avc1[78..])?;
     w.begin(*b"vp09");
-    w.bytes(header);
+    match size {
+        Some((width, height)) => {
+            w.bytes(&header[..24]);
+            w.u16(width);
+            w.u16(height);
+            w.bytes(&header[28..]);
+        }
+        None => w.bytes(header),
+    }
     // Unspecified, unless colr says otherwise.
     let (mut primaries, mut transfer, mut matrix, mut full) = (2u8, 2u8, 2u8, 0u8);
     for c in &children {

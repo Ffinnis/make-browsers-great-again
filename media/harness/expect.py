@@ -161,11 +161,16 @@ def main():
     OUT.mkdir(parents=True, exist_ok=True)
     expected = {}
     for case in json.loads((HERE / "cases.json").read_text()):
+        # Cases that change their input (aborts, damage) say what to expect
+        # themselves, if anything.
+        if case.get("noExpect") or case.get("errorsOnly"):
+            continue
         result = []
         for sb in case["sbs"]:
             data = b"".join(
                 ((FIXTURES if f.startswith("fixtures/") else SAMPLES) / f.split("/", 1)[1]).read_bytes()
-                for f in sb["files"]
+                for name in sb["files"]
+                for f in name.split("+")
             )
             moov = find(data, 0, None, [b"moov"])
             if sb["mime"] != "progressive" or find(data, *moov, [b"mvex"]):

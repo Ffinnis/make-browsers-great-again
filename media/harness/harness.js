@@ -1,7 +1,10 @@
 // Runs each case in cases.json through worker.js in the real engine and
-// appends the output to a real MediaSource, the way shim.js will. Results
-// land in window.results; ?case=name runs one case, ?save=1 posts each
-// SourceBuffer's converted bytes to serve.py for ffprobe.
+// appends the output to a real MediaSource, the way shim.js does: `held`
+// bytes first, then the append's own, and a `drain` before endOfStream().
+// Results land in window.results; ?case=a,b runs some cases, ?save=1 posts
+// each SourceBuffer's converted bytes to serve.py for ffprobe,
+// ?tune={...} hands the worker encoder settings to compare (self.mbgaTune),
+// and ?repeat=N runs everything N times, for timing.
 'use strict';
 
 const params = new URLSearchParams(location.search);
@@ -24,25 +27,46 @@ class Converter {
   constructor(worker) {
     this.worker = worker;
     this.waiting = new Map();
-    this.seq = 0;
+    this.seq = new Map();
+    this.fatal = null;
     worker.onmessage = (e) => {
       const msg = e.data;
-      const key = msg.sb + ':' + msg.seq;
+      if (msg.type === 'fatal') {
+        this.fatal = msg.message;
+        return;
+      }
+      const key = msg.type === 'stats' ? 'stats' : msg.sb + ':' + msg.seq;
       const done = this.waiting.get(key);
       this.waiting.delete(key);
       if (done) done(msg);
     };
   }
 
-  open(sb, mime) {
-    this.worker.postMessage({ type: 'open', sb, mime });
+  post(msg, transfer) {
+    this.worker.postMessage(msg, transfer || []);
+  }
+
+  request(sb, msg, transfer) {
+    const seq = (this.seq.get(sb) || 0) + 1;
+    this.seq.set(sb, seq);
+    return new Promise((resolve) => {
+      this.waiting.set(sb + ':' + seq, resolve);
+      this.post({ ...msg, sb, seq }, transfer);
+    });
   }
 
   append(sb, bytes) {
-    const seq = ++this.seq;
+    return this.request(sb, { type: 'append', bytes }, [bytes]);
+  }
+
+  drain(sb) {
+    return this.request(sb, { type: 'drain' });
+  }
+
+  stats() {
     return new Promise((resolve) => {
-      this.waiting.set(sb + ':' + seq, resolve);
-      this.worker.postMessage({ type: 'append', sb, seq, bytes }, [bytes]);
+      this.waiting.set('stats', resolve);
+      this.post({ type: 'stats' });
     });
   }
 }
@@ -52,10 +76,12 @@ async function startWorker() {
     fetch('/shell/resources/media/worker.js').then((r) => r.text()),
     fetch('/media/target/wasm32-unknown-unknown/release/mbga_media.wasm').then((r) => r.arrayBuffer()),
   ]);
-  const worker = new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' })));
+  const tune = params.get('tune');
+  const prefix = tune ? `self.mbgaTune = ${tune};\n` : '';
+  const worker = new Worker(URL.createObjectURL(new Blob([prefix + source], { type: 'text/javascript' })));
   const conv = new Converter(worker);
-  // Like the shim: the module may come as bytes or compiled.
-  worker.postMessage({ type: 'wasm', module: params.has('bytes') ? wasm : await WebAssembly.compile(wasm) });
+  // Like the shim: the module comes as bytes (?compiled=1 sends it compiled).
+  worker.postMessage({ type: 'wasm', module: params.has('compiled') ? await WebAssembly.compile(wasm) : wasm });
   return conv;
 }
 
@@ -73,12 +99,52 @@ function appendTo(sb, bytes) {
   });
 }
 
+// Every box of `data` (recursing into containers), as [type, start, end].
+function* walk(data, start = 0, end = data.length) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const containers = ['moov', 'trak', 'mdia', 'minf', 'stbl', 'moof', 'traf', 'mvex', 'edts'];
+  let pos = start;
+  while (pos + 8 <= end) {
+    let size = view.getUint32(pos);
+    const type = String.fromCharCode(...data.subarray(pos + 4, pos + 8));
+    let header = 8;
+    if (size === 1) {
+      size = Number(view.getBigUint64(pos + 8));
+      header = 16;
+    }
+    if (size < header || pos + size > end) return;
+    yield [type, pos, pos + size];
+    if (containers.includes(type)) yield* walk(data, pos + header, pos + size);
+    if (type === 'stsd') yield* walk(data, pos + 16, pos + size);
+    pos += size;
+  }
+}
+
+// Mutates the first box of a type: `set` maps offsets from the box's start
+// to u32 values. Malformed input built from good fixtures.
+function patch(data, patches) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  for (const p of patches) {
+    const box = [...walk(data)].find((b) => b[0] === p.box);
+    if (!box) throw new Error('no ' + p.box + ' to patch');
+    for (const [at, value] of Object.entries(p.set)) view.setUint32(box[1] + Number(at), value >>> 0);
+  }
+  return data;
+}
+
+// The vp09 sample entries' sizes in some output.
+function vp09Sizes(data) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  return [...walk(data)].filter((b) => b[0] === 'vp09').map((b) => [view.getUint16(b[1] + 32), view.getUint16(b[1] + 34)]);
+}
+
 async function runCase(conv, c, sbBase, expected) {
   const result = { name: c.name, ok: true, problems: [], sbs: [] };
   const fail = (msg) => {
     result.ok = false;
     result.problems.push(msg);
   };
+  const before = await conv.stats();
   const video = document.createElement('video');
   video.muted = true;
   video.width = 160;
@@ -91,50 +157,102 @@ async function runCase(conv, c, sbBase, expected) {
   // Every SourceBuffer is made before any append, as players do.
   const states = c.sbs.map((spec, i) => {
     const id = sbBase + i;
-    conv.open(id, spec.mime);
+    conv.post({ type: 'open', sb: id, mime: spec.mime });
     const out = spec.mime === 'progressive' ? null : mapMime(spec.mime);
-    return { spec, id, mime: out, sb: out ? ms.addSourceBuffer(out) : null, times: [], bytes: [] };
+    return { spec, id, mime: out, sb: out ? ms.addSourceBuffer(out) : null, times: [], bytes: [], sizes: [], helds: 0 };
   });
   if (states.some((s) => !s.sb) && states.length > 1) throw new Error('one progressive SourceBuffer per case');
 
+  const deliver = async (s, label, reply) => {
+    if (!s.sb && reply.mime) {
+      s.mime = reply.mime;
+      s.sb = ms.addSourceBuffer(reply.mime);
+    }
+    for (const part of [reply.held, reply.bytes]) {
+      if (!part || !part.byteLength) continue;
+      if (part === reply.held) s.helds++;
+      const bytes = new Uint8Array(part);
+      s.bytes.push(bytes);
+      s.sizes.push(...vp09Sizes(bytes));
+      try {
+        await appendTo(s.sb, part);
+      } catch (e) {
+        fail(`${label}: ${e.message}`);
+      }
+    }
+  };
+
   await Promise.all(states.map(async (s) => {
-    for (const file of s.spec.files) {
-      let data = new Uint8Array(await (await fetch(url(file))).arrayBuffer());
+    const actions = s.spec.actions || {};
+    for (const [index, file] of s.spec.files.entries()) {
+      const action = actions[index] || {};
+      if (action.size) conv.post({ type: 'size', sb: s.id, width: action.size[0], height: action.size[1] });
+      // a+b: both in one append.
+      const parts = await Promise.all(file.split('+').map(async (f) => new Uint8Array(await (await fetch(url(f))).arrayBuffer())));
+      let data = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      parts.reduce((at, p) => (data.set(p, at), at + p.length), 0);
+      if (action.patch) data = patch(data, action.patch);
       const step = s.spec.split || data.length;
       for (let at = 0; at < data.length; at += step) {
         const piece = data.slice(at, at + step);
         const size = piece.length;
         const t0 = performance.now();
-        const reply = await conv.append(s.id, piece.buffer);
+        const replied = conv.append(s.id, piece.buffer);
+        if (action.abort) {
+          // The page's abort(): the shim drops the reply and resets.
+          conv.post({ type: 'reset', sb: s.id });
+        }
+        const reply = await Promise.race([replied, new Promise((r) => setTimeout(() => r(null), 20000))]);
         const took = performance.now() - t0;
+        if (!reply) {
+          fail(`${file}: no reply in 20 s`);
+          return;
+        }
         s.times.push({ file, bytes: size, ms: Math.round(took) });
-        log(`  ${file} @${at}: ${reply.type} ${reply.bytes ? reply.bytes.byteLength : reply.message} in ${Math.round(took)} ms`);
+        log(`  ${file} @${at}: ${reply.type} ${reply.bytes ? reply.bytes.byteLength : reply.message}` +
+          `${reply.held ? ' held ' + reply.held.byteLength : ''} in ${Math.round(took)} ms`);
+        if (action.expect === 'error') {
+          if (reply.type !== 'error') fail(`${file}: converted, expected an error`);
+          continue;
+        }
         if (reply.type === 'error') {
           fail(`${file}: ${reply.message}`);
           continue;
         }
-        if (!s.sb && reply.mime) {
-          s.mime = reply.mime;
-          s.sb = ms.addSourceBuffer(reply.mime);
-        }
-        if (reply.bytes.byteLength) {
-          s.bytes.push(new Uint8Array(reply.bytes));
-          try {
-            await appendTo(s.sb, reply.bytes);
-          } catch (e) {
-            fail(`${file}: ${e.message}`);
-          }
-        }
+        if (action.abort) continue;
+        await deliver(s, file, reply);
       }
     }
+    if (!params.has('v1')) {
+      const reply = await conv.drain(s.id);
+      if (reply.type === 'error') fail(`drain: ${reply.message}`);
+      else await deliver(s, 'drain', reply);
+    }
   }));
+  if (conv.fatal) fail('fatal: ' + conv.fatal);
+  if (c.errorsOnly) {
+    for (const s of states) conv.post({ type: 'close', sb: s.id });
+    video.remove();
+    return result;
+  }
   if (ms.readyState === 'open' && !states.some((s) => s.sb && s.sb.updating)) ms.endOfStream();
+  for (const s of states) conv.post({ type: 'close', sb: s.id });
 
   // Timeline: one range, where the input's is.
   for (const [i, s] of states.entries()) {
     const got = s.sb ? ranges(s.sb.buffered) : [];
-    const want = expected && expected[i];
-    const info = { mime: s.mime, buffered: got, expected: want, appends: s.times };
+    const want = (c.expected && c.expected[i]) || (expected && expected[i]);
+    // Media appends only: the first is usually the init's.
+    const media = s.times.filter((t) => !/init/.test(t.file));
+    const info = {
+      mime: s.mime,
+      buffered: got,
+      expected: want,
+      appends: s.times,
+      mediaMs: media.reduce((sum, t) => sum + t.ms, 0),
+      held: s.helds,
+      sizes: s.sizes,
+    };
     result.sbs.push(info);
     if (want) {
       if (got.length !== 1) fail(`sb ${i}: ${got.length} buffered ranges`);
@@ -143,6 +261,12 @@ async function runCase(conv, c, sbBase, expected) {
       }
     } else if (!got.length) {
       fail(`sb ${i}: nothing buffered`);
+    }
+    if (s.spec.lastSize) {
+      const last = s.sizes[s.sizes.length - 1];
+      if (!last || last[0] !== s.spec.lastSize[0] || last[1] !== s.spec.lastSize[1]) {
+        fail(`sb ${i}: last init is ${JSON.stringify(last)}, expected ${JSON.stringify(s.spec.lastSize)}`);
+      }
     }
     if (params.has('save')) {
       const all = new Blob(s.bytes);
@@ -165,13 +289,13 @@ async function runCase(conv, c, sbBase, expected) {
       new Promise((r) => video.addEventListener('seeked', r, { once: true })),
       new Promise((r) => setTimeout(r, 3000)),
     ]);
-    seeks.push({ at: +video.currentTime.toFixed(3), readyState: video.readyState });
+    seeks.push({ at: +video.currentTime.toFixed(3), readyState: video.readyState, width: video.videoWidth });
     if (video.readyState < 2) fail(`readyState ${video.readyState} after seeking to ${video.currentTime.toFixed(2)}`);
   }
   // Muted media in a hidden tab doesn't play, but seeking prerolls audio.
   if (hasAudio && !(video.webkitAudioDecodedByteCount > 0)) fail('no audio decoded');
   try {
-    await video.play();
+    await Promise.race([video.play(), new Promise((r) => setTimeout(r, 3000))]);
     await new Promise((r) => setTimeout(r, 1000));
   } catch (e) {
     // Expected in a hidden tab; reported, not failed.
@@ -197,6 +321,12 @@ async function runCase(conv, c, sbBase, expected) {
     result.avStartDrift = +drift.toFixed(4);
     if (drift > 0.034) fail(`A/V starts drift by ${drift.toFixed(3)} s`);
   }
+  // What the worker's codecs did for this case.
+  const after = await conv.stats();
+  result.worker = {};
+  for (const key of Object.keys(after)) {
+    if (typeof after[key] === 'number') result.worker[key] = after[key] - (before[key] || 0);
+  }
   video.pause();
   video.remove();
   return result;
@@ -209,7 +339,10 @@ async function main() {
   const only = params.get('case');
   const results = [];
   let sbBase = 1;
-  for (const c of cases) {
+  // ?repeat=N runs the cases N times over, for timing.
+  const runs = [];
+  for (let i = 0; i < (Number(params.get('repeat')) || 1); i++) runs.push(...cases);
+  for (const c of runs) {
     if (only && !only.split(',').includes(c.name)) continue;
     log('running', c.name);
     try {

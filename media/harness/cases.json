@@ -92,7 +92,9 @@
     "sbs": [
       {
         "mime": "video/mp4; codecs=\"avc1.64000d,mp4a.40.2\"",
-        "files": ["fixtures/muxed.mp4"],
+        "files": [
+          "fixtures/muxed.mp4"
+        ],
         "split": 7001
       }
     ]
@@ -102,7 +104,9 @@
     "sbs": [
       {
         "mime": "video/mp4; codecs=\"avc1.64000d\"",
-        "files": ["fixtures/midgop.mp4"],
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
         "split": 9000
       }
     ]
@@ -112,7 +116,12 @@
     "sbs": [
       {
         "mime": "video/mp4; codecs=\"avc1.64000d\"",
-        "files": ["fixtures/video-init.mp4", "fixtures/video-0.m4s", "fixtures/video-1.m4s", "fixtures/video-2.m4s"]
+        "files": [
+          "fixtures/video-init.mp4",
+          "fixtures/video-0.m4s",
+          "fixtures/video-1.m4s",
+          "fixtures/video-2.m4s"
+        ]
       },
       {
         "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
@@ -146,7 +155,9 @@
     "sbs": [
       {
         "mime": "progressive",
-        "files": ["fixtures/gif.mp4"]
+        "files": [
+          "fixtures/gif.mp4"
+        ]
       }
     ]
   },
@@ -155,7 +166,9 @@
     "sbs": [
       {
         "mime": "progressive",
-        "files": ["fixtures/progressive.mp4"]
+        "files": [
+          "fixtures/progressive.mp4"
+        ]
       }
     ]
   },
@@ -164,7 +177,9 @@
     "sbs": [
       {
         "mime": "progressive",
-        "files": ["samples/gif.mp4"]
+        "files": [
+          "samples/gif.mp4"
+        ]
       }
     ]
   },
@@ -173,7 +188,192 @@
     "sbs": [
       {
         "mime": "progressive",
-        "files": ["samples/v.mp4"]
+        "files": [
+          "samples/v.mp4"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-half",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              360,
+              640
+            ]
+          }
+        },
+        "lastSize": [
+          360,
+          640
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-resize",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              1440,
+              2560
+            ]
+          },
+          "3": {
+            "size": [
+              180,
+              320
+            ]
+          }
+        },
+        "lastSize": [
+          180,
+          320
+        ]
+      }
+    ]
+  },
+  {
+    "name": "abort-after-init",
+    "noExpect": true,
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4+samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s"
+        ],
+        "actions": {
+          "0": {
+            "abort": true
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "sparse",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/sparse.mp4"
+        ],
+        "split": 20000
+      }
+    ]
+  },
+  {
+    "name": "hostile",
+    "noExpect": true,
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/video-init.mp4",
+          "fixtures/video-0.m4s",
+          "fixtures/video-1.m4s",
+          "fixtures/video-2.m4s"
+        ],
+        "actions": {
+          "1": {
+            "patch": [
+              {
+                "box": "trun",
+                "set": {
+                  "8": 1,
+                  "12": 4294967295
+                }
+              }
+            ],
+            "expect": "error"
+          },
+          "2": {
+            "patch": [
+              {
+                "box": "moof",
+                "set": {
+                  "0": 2147483632
+                }
+              }
+            ],
+            "expect": "error"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "hostile-progressive",
+    "errorsOnly": true,
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "actions": {
+          "0": {
+            "patch": [
+              {
+                "box": "stsz",
+                "set": {
+                  "12": 1,
+                  "16": 2147483647
+                }
+              }
+            ],
+            "expect": "error"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "hostile-ctts",
+    "noExpect": true,
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "actions": {
+          "0": {
+            "patch": [
+              {
+                "box": "ctts",
+                "set": {
+                  "16": 4294967295
+                }
+              }
+            ]
+          }
+        }
       }
     ]
   }

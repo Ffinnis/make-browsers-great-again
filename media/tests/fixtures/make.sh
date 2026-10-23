@@ -31,3 +31,8 @@ rm -f ./*.m3u8
 # audio and moov first.
 ff "${src[@]}" -t 2 -map 0:v -c:v libx264 -profile:v main -preset veryfast -b:v 100k -bf 2 -g 15 gif.mp4
 ff "${src[@]}" -t 2 "${x264[@]}" -c:a aac -b:a 64k -ac 2 -movflags +faststart progressive.mp4
+
+# A progressive file with one keyframe in six seconds, like screen
+# recordings: fragments can't wait for keyframes.
+ff "${src[@]}" -t 6 -c:v libx264 -profile:v high -preset veryfast -b:v 100k -bf 2 -g 1000 -keyint_min 1000 \
+  -sc_threshold 0 -pix_fmt yuv420p -c:a aac -b:a 48k -ac 2 -movflags +faststart sparse.mp4

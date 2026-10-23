@@ -142,8 +142,9 @@ impl AacToFlac {
         if !decoded || self.planes.len() != channels {
             self.planes = vec![vec![0; FRAME]; channels];
         }
-        let samples = u64::from(self.config.rate) * dts.max(0) as u64 / u64::from(self.timescale.max(1));
-        flac::encode_frame(&self.planes, self.config.rate, samples / FRAME as u64)
+        let samples = u128::from(self.config.rate) * dts.max(0) as u128 / u128::from(self.timescale.max(1));
+        let frame = u64::try_from(samples / FRAME as u128).unwrap_or(u64::MAX);
+        flac::encode_frame(&self.planes, self.config.rate, frame)
     }
 
     /// Forgets the overlap carried from the last frame, after a seek.

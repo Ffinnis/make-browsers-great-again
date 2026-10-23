@@ -22,7 +22,7 @@ pub struct Sample {
 
 impl Sample {
     pub fn pts(&self) -> i64 {
-        self.dts + self.cto
+        self.dts.saturating_add(self.cto)
     }
 }
 
@@ -35,6 +35,11 @@ pub struct Run {
 /// continues from.
 pub type TrackLookup<'a> = &'a dyn Fn(u32) -> Option<(Defaults, i64)>;
 
+/// The most samples one fragment may hold, all tracks together: about 36
+/// minutes of 60 fps video, or 45 of 48 kHz AAC. Bounds the work a trun
+/// whose samples take no bytes in it can ask for.
+pub const MAX_SAMPLES: usize = 1 << 17;
+
 /// The samples of each traf. `unit` is the moof and its mdat, laid out as
 /// they arrived.
 pub fn parse_moof(unit: &[u8], lookup: TrackLookup<'_>) -> Result<Vec<Run>> {
@@ -44,20 +49,23 @@ pub fn parse_moof(unit: &[u8], lookup: TrackLookup<'_>) -> Result<Vec<Run>> {
     let mut runs = Vec::new();
     // Without default-base-is-moof, each traf's data follows the previous one's.
     let mut data_end = 0usize;
+    let mut budget = MAX_SAMPLES;
     for traf in boxes(moof.body)? {
         if &traf.kind != b"traf" {
             continue;
         }
-        let run = parse_traf(traf.body, lookup, &mut data_end)?;
-        if run.samples.iter().any(|s| s.data.end > unit.len()) {
-            return err("sample data outside the mdat");
-        }
-        runs.push(run);
+        runs.push(parse_traf(traf.body, lookup, unit.len(), &mut data_end, &mut budget)?);
     }
     Ok(runs)
 }
 
-fn parse_traf(traf: &[u8], lookup: TrackLookup<'_>, data_end: &mut usize) -> Result<Run> {
+fn parse_traf(
+    traf: &[u8],
+    lookup: TrackLookup<'_>,
+    unit_len: usize,
+    data_end: &mut usize,
+    budget: &mut usize,
+) -> Result<Run> {
     let children = boxes(traf)?;
     let Some(tfhd) = children.iter().find(|b| &b.kind == b"tfhd") else {
         return err("traf without tfhd");
@@ -94,17 +102,23 @@ fn parse_traf(traf: &[u8], lookup: TrackLookup<'_>, data_end: &mut usize) -> Res
     for trun in children.iter().filter(|b| &b.kind == b"trun") {
         let mut r = Reader::new(trun.body);
         let (version, flags) = r.full_header()?;
-        let count = r.u32()?;
+        let count = r.u32()? as usize;
         if flags & 0x1 != 0 {
             let offset = r.u32()? as i32;
             pos = usize::try_from(offset).map_or_else(|_| err("negative data offset"), Ok)?;
         }
         let first_flags = if flags & 0x4 != 0 { Some(r.u32()?) } else { None };
-        // Each sample takes at least 4 bytes when its count can be trusted.
+        // Each sample takes at least 4 bytes when its count can be trusted;
+        // otherwise only the overall cap bounds it.
         let per_sample = [0x100, 0x200, 0x400, 0x800].iter().filter(|&&f| flags & f != 0).count() * 4;
-        if per_sample > 0 && count as usize > r.remaining() / per_sample {
+        if per_sample > 0 && count > r.remaining() / per_sample {
             return err("trun shorter than its sample count");
         }
+        if count > *budget {
+            return err("too many samples in one fragment");
+        }
+        *budget -= count;
+        samples.reserve(count);
         for i in 0..count {
             let duration = if flags & 0x100 != 0 { r.u32()? } else { defaults.duration };
             let size = if flags & 0x200 != 0 { r.u32()? } else { defaults.size } as usize;
@@ -117,10 +131,13 @@ fn parse_traf(traf: &[u8], lookup: TrackLookup<'_>, data_end: &mut usize) -> Res
                 _ if version == 0 => i64::from(r.u32()?),
                 _ => i64::from(r.u32()? as i32),
             };
-            let end = pos.checked_add(size).map_or_else(|| err("sample past the end"), Ok)?;
+            let end = pos.checked_add(size).filter(|&end| end <= unit_len);
+            let Some(end) = end else {
+                return err("sample data outside the mdat");
+            };
             samples.push(Sample { dts, cto, duration, flags: sample_flags, data: pos..end });
             pos = end;
-            dts += i64::from(duration);
+            dts = dts.checked_add(i64::from(duration)).map_or_else(|| err("timestamps out of range"), Ok)?;
         }
     }
     *data_end = pos;

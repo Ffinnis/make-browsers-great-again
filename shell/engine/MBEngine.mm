@@ -14,6 +14,7 @@
 #include <cstring>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -164,25 +165,40 @@ constexpr char kResumeMediaScript[] =
     "function(m){delete m.dataset.mbgaPaused;m.play();});})();";
 
 // The media shim (see shell/resources/media/shim.js) runs in every frame
-// before the page's scripts. The first time a frame needs to convert video
-// it reports kCodecRequest; the engine asks every frame of the tab whether
-// it was the one, each answering with its own identifier, and sends that
-// frame the converter's worker and WebAssembly module. They're too big to
-// put in every frame, and a page's Content-Security-Policy would keep the
-// shim from fetching them.
+// and dedicated worker before the page's scripts. The first time a document
+// needs to convert video it reports kCodecRequest; the engine asks every
+// frame of the tab whether it was the one, each answering with its own
+// identifier and its document's, and sends that document the converter's
+// worker and WebAssembly module. They're too big to put in every frame, and
+// a page's Content-Security-Policy would keep the shim from fetching them.
+// Workers ask the frame that started them (the shim relays it).
 constexpr char kCodecRequest[] = "__mbga_codec";
 constexpr char kCodecFramePrefix[] = "__mbga_codec_frame:";
-// Dedicated workers, whose console the engine doesn't see, call this
-// binding instead; it's added to each as it starts.
-constexpr char kCodecBinding[] = "__mbgaCodecLoad";
-// Cross-site frames and workers are attached to as they start, for the
-// shim. They don't wait for it: a frame waiting for a debugger never went
-// on loading in this engine, even once told to run. The shim reaches a
-// worker before its script, which has to be fetched first, and runs in a
-// frame's first document at once if that started already.
-constexpr char kAutoAttach[] =
+// The name the shim gives the converter's own worker, which the engine
+// leaves alone.
+constexpr char kConverterWorker[] = "MBGA video converter";
+// Cross-site frames and workers are attached to as they start, for the shim
+// and, frames, for agents. Workers wait for it: a blob: or cached worker
+// script would otherwise run first. Frames can't wait (one waiting for a
+// debugger never goes on loading in this engine), and get the shim in their
+// first document at once if that started already. So frames are attached
+// through the page's (or frame's) session, and workers through a second
+// session on the same target.
+constexpr char kAutoAttachFrames[] =
     "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
-    "true}";
+    "true,\"filter\":[{\"type\":\"iframe\"}]}";
+// How long a worker's session stays, for the workers it starts.
+constexpr int64_t kNestedWorkerSeconds = 10;
+constexpr char kAutoAttachWorkers[] =
+    "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":"
+    "true,\"filter\":[{\"type\":\"worker\"}]}";
+
+// A JSON object, or nil.
+NSDictionary* ParseObject(const std::string& json) {
+  NSData* data = [NSData dataWithBytes:json.data() length:json.size()];
+  id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+  return [object isKindOfClass:NSDictionary.class] ? object : nil;
+}
 
 // A file from the app's Resources/media, or nil.
 NSString* MediaResource(NSString* name) {
@@ -200,33 +216,163 @@ const std::string& MediaShim() {
   return shim;
 }
 
-// What a frame that asked for the converter runs: hands the worker's source
-// and the module, in base64, to the shim. Read once, when a page first needs
-// it.
-const std::string& CodecReply() {
-  static const std::string reply = [] {
-    NSString* worker = MediaResource(@"worker.js");
-    NSString* path = [NSBundle.mainBundle.resourcePath
-        stringByAppendingPathComponent:@"media/mbga_media.wasm"];
-    NSData* wasm = [NSData dataWithContentsOfFile:path];
-    NSString* args = @"null,null";
-    if (worker && wasm) {
-      NSData* json = [NSJSONSerialization dataWithJSONObject:@[
-        worker, [wasm base64EncodedStringWithOptions:0]
-      ]
-                                                     options:0
-                                                       error:nil];
-      args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
-      args = [args substringWithRange:NSMakeRange(1, args.length - 2)];
+// The shim as Runtime.evaluate's parameters, for workers. A worker has an
+// engine of its own, which keeps the source, so it gets the shim without
+// what only pages use (its last section, plain MP4 files), comments or
+// indentation: under half the size.
+const std::string& WorkerShimParams() {
+  static const std::string params = [] {
+    NSString* shim = @(MediaShim().c_str());
+    NSRange pages = [shim rangeOfString:@"// -------------------------"
+                                        @"----------------------------- "
+                                        @"plain MP4 files"];
+    if (pages.location != NSNotFound) {
+      shim = [[shim substringToIndex:pages.location]
+          stringByAppendingString:@"})();\n"];
     }
-    NSString* script = [NSString
-        stringWithFormat:@"(function(f){if(typeof f==='function')f(%@)})("
-                         @"globalThis.__mbgaCodecReady)",
-                         args];
-    return std::string(script.UTF8String);
+    NSMutableArray<NSString*>* lines = [NSMutableArray array];
+    for (NSString* line in [shim componentsSeparatedByString:@"\n"]) {
+      NSString* code =
+          [line stringByTrimmingCharactersInSet:NSCharacterSet
+                                                    .whitespaceCharacterSet];
+      if (code.length > 0 && ![code hasPrefix:@"//"]) {
+        [lines addObject:code];
+      }
+    }
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+      @"expression" : [lines componentsJoinedByString:@"\n"]
+    }
+                                                   options:0
+                                                     error:nil];
+    return std::string(static_cast<const char*>(json.bytes), json.length);
   }();
-  return reply;
+  return params;
 }
+
+// What a document that asked for the converter runs: hands the worker's
+// source and the module, in base64, to the shim. Made when a page first
+// needs it and let go a minute after the last use: it's half a megabyte.
+std::shared_ptr<const std::string> g_codec_reply;
+CFAbsoluteTime g_codec_reply_used = 0;
+void ReleaseCodecReplyLater();
+
+std::shared_ptr<const std::string> CodecReply() {
+  g_codec_reply_used = CFAbsoluteTimeGetCurrent();
+  if (g_codec_reply) {
+    return g_codec_reply;
+  }
+  NSString* worker = MediaResource(@"worker.js");
+  NSString* path = [NSBundle.mainBundle.resourcePath
+      stringByAppendingPathComponent:@"media/mbga_media.wasm"];
+  NSData* wasm = [NSData dataWithContentsOfFile:path];
+  NSString* args = @"null,null";
+  if (worker && wasm) {
+    NSData* json = [NSJSONSerialization
+        dataWithJSONObject:@[ worker, [wasm base64EncodedStringWithOptions:0] ]
+                   options:0
+                     error:nil];
+    args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+    args = [args substringWithRange:NSMakeRange(1, args.length - 2)];
+  }
+  NSString* script = [NSString
+      stringWithFormat:@"(function(f){if(typeof f==='function')f(%@)})("
+                       @"globalThis.__mbgaCodecReady)",
+                       args];
+  g_codec_reply = std::make_shared<const std::string>(script.UTF8String);
+  ReleaseCodecReplyLater();
+  return g_codec_reply;
+}
+
+void ReleaseCodecReplyLater() {
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC),
+                 dispatch_get_main_queue(), ^{
+                   if (CFAbsoluteTimeGetCurrent() - g_codec_reply_used >= 59) {
+                     g_codec_reply.reset();
+                   } else {
+                     ReleaseCodecReplyLater();
+                   }
+                 });
+}
+
+// Hands the converter to the documents of a browser that ask for it. A
+// page could ask over and over, so the engine asks its frames at most once
+// a second, sends each document the converter at most every few seconds,
+// and a tab at most a few times in ten seconds.
+class CodecDelivery {
+ public:
+  // A document asked: asks every frame which document it was.
+  void Requested(CefRefPtr<CefBrowser> browser) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - last_probe_ < 1) {
+      if (!probe_pending_) {
+        probe_pending_ = true;
+        std::weak_ptr<bool> alive = alive_;
+        CodecDelivery* delivery = this;
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          int64_t((1 - (now - last_probe_)) * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+              if (alive.lock()) {
+                delivery->probe_pending_ = false;
+                delivery->Probe(browser);
+              }
+            });
+      }
+      return;
+    }
+    Probe(browser);
+  }
+
+  // A frame answered with "<frame>:<document>".
+  void Answered(CefRefPtr<CefBrowser> browser, const std::string& answer) {
+    size_t colon = answer.rfind(':');
+    if (colon == std::string::npos) {
+      return;
+    }
+    CefRefPtr<CefFrame> frame =
+        browser->GetFrameByIdentifier(answer.substr(0, colon));
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    std::erase_if(recent_, [&](CFAbsoluteTime t) { return now - t > 10; });
+    auto sent = sent_.find(answer);
+    if (!frame || recent_.size() >= 8 ||
+        (sent != sent_.end() && now - sent->second < 5)) {
+      return;
+    }
+    recent_.push_back(now);
+    if (sent_.size() > 64) {
+      std::erase_if(sent_,
+                    [&](const auto& item) { return now - item.second > 60; });
+    }
+    sent_[answer] = now;
+    frame->ExecuteJavaScript(*CodecReply(), "", 0);
+  }
+
+  // A new page: its documents are new.
+  void Reset() { sent_.clear(); }
+
+ private:
+  void Probe(CefRefPtr<CefBrowser> browser) {
+    last_probe_ = CFAbsoluteTimeGetCurrent();
+    std::vector<CefString> frames;
+    browser->GetFrameIdentifiers(frames);
+    for (const CefString& id : frames) {
+      CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(id);
+      if (!frame) {
+        continue;
+      }
+      std::string probe =
+          "typeof __mbgaCodecReady==='function'&&__mbgaCodecReady.who('" +
+          std::string(kCodecFramePrefix) + id.ToString() + "')";
+      frame->ExecuteJavaScript(probe, "", 0);
+    }
+  }
+
+  CFAbsoluteTime last_probe_ = 0;
+  bool probe_pending_ = false;
+  std::map<std::string, CFAbsoluteTime> sent_;
+  std::vector<CFAbsoluteTime> recent_;
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+};
 
 enum MenuCommand {
   kOpenLinkInNewTab = MENU_ID_USER_FIRST,
@@ -816,16 +962,243 @@ class BaseClient : public CefClient,
   }
 };
 
+// Popups play video too (Twitch's pop-out player), so they get the media
+// shim as tabs do: in their documents, their cross-site frames and their
+// workers, and the converter when a document asks.
+class PopupMedia : public CefDevToolsMessageObserver {
+ public:
+  using Then = std::function<void(NSDictionary* result)>;
+
+  static void Start(CefRefPtr<CefBrowser> browser) {
+    CefRefPtr<PopupMedia> media(new PopupMedia);
+    CefRefPtr<CefBrowserHost> host = browser->GetHost();
+    media->registration_ = host->AddDevToolsMessageObserver(media);
+    All()[browser->GetIdentifier()] = media;
+    host->ExecuteDevToolsMethod(0, "Page.enable", nullptr);
+    CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+    params->SetString("source", MediaShim());
+    host->ExecuteDevToolsMethod(0, "Page.addScriptToEvaluateOnNewDocument",
+                                params);
+    media->Send(browser, "Target.setAutoAttach", kAutoAttachFrames, "",
+                nullptr);
+    media->Send(browser, "Target.getTargetInfo", "", "",
+                [media, browser](NSDictionary* result) {
+                  NSString* page = result[@"targetInfo"][@"targetId"];
+                  if (page) {
+                    media->FollowWorkers(browser, page.UTF8String);
+                  }
+                });
+  }
+
+  static void Stop(CefRefPtr<CefBrowser> browser) {
+    if (CefRefPtr<PopupMedia> media = For(browser)) {
+      // The registration holds the observer.
+      media->registration_ = nullptr;
+      media->then_.clear();
+      All().erase(browser->GetIdentifier());
+    }
+  }
+
+  static CefRefPtr<PopupMedia> For(CefRefPtr<CefBrowser> browser) {
+    auto media = All().find(browser->GetIdentifier());
+    return media == All().end() ? nullptr : media->second;
+  }
+
+  CodecDelivery& codec() { return codec_; }
+
+  bool OnDevToolsMessage(CefRefPtr<CefBrowser> browser,
+                         const void* message,
+                         size_t message_size) override {
+    static const char kSession[] = "\"sessionId\"";
+    if (then_.empty() &&
+        !memmem(message, message_size, kSession, strlen(kSession))) {
+      return false;
+    }
+    NSData* data = [NSData dataWithBytesNoCopy:const_cast<void*>(message)
+                                        length:message_size
+                                  freeWhenDone:NO];
+    NSDictionary* object = [NSJSONSerialization JSONObjectWithData:data
+                                                           options:0
+                                                             error:nil];
+    if (![object isKindOfClass:NSDictionary.class]) {
+      return false;
+    }
+    if (NSNumber* number = object[@"id"]) {
+      auto then = then_.find(number.intValue);
+      if (then == then_.end()) {
+        return false;
+      }
+      Then done = std::move(then->second);
+      then_.erase(then);
+      NSDictionary* result = object[@"result"];
+      done([result isKindOfClass:NSDictionary.class] ? result : nil);
+      return true;
+    }
+    if ([object[@"method"] isEqualToString:@"Target.attachedToTarget"]) {
+      Attached(browser, object[@"params"], object[@"sessionId"]);
+      return true;
+    }
+    return false;
+  }
+
+  void OnDevToolsEvent(CefRefPtr<CefBrowser> browser,
+                       const CefString& method,
+                       const void* params,
+                       size_t params_size) override {
+    if (method != "Target.attachedToTarget") {
+      return;
+    }
+    NSData* data = [NSData dataWithBytesNoCopy:const_cast<void*>(params)
+                                        length:params_size
+                                  freeWhenDone:NO];
+    Attached(browser,
+             [NSJSONSerialization JSONObjectWithData:data options:0 error:nil],
+             nil);
+  }
+
+ private:
+  static std::map<int, CefRefPtr<PopupMedia>>& All() {
+    static std::map<int, CefRefPtr<PopupMedia>> all;
+    return all;
+  }
+
+  // A second session on the popup or one of its cross-site frames, which
+  // attaches to its workers as they start.
+  void FollowWorkers(CefRefPtr<CefBrowser> browser, const std::string& target) {
+    own_attaches_[target]++;
+    CefRefPtr<PopupMedia> media(this);
+    Send(browser, "Target.attachToTarget",
+         "{\"targetId\":\"" + target + "\",\"flatten\":true}", "",
+         [media, browser](NSDictionary* result) {
+           if (NSString* session = result[@"sessionId"]) {
+             media->Send(browser, "Target.setAutoAttach", kAutoAttachWorkers,
+                         session.UTF8String, nullptr);
+           }
+         });
+  }
+
+  // As WebClient does for tabs: workers get the shim and are let go,
+  // frames keep their session for the shim in their later documents.
+  void Attached(CefRefPtr<CefBrowser> browser,
+                NSDictionary* params,
+                NSString* from) {
+    if (![params isKindOfClass:NSDictionary.class] || !params[@"sessionId"]) {
+      return;
+    }
+    NSDictionary* info = params[@"targetInfo"];
+    std::string session = [params[@"sessionId"] UTF8String];
+    std::string parent = from ? from.UTF8String : "";
+    std::string target = [info[@"targetId"] UTF8String] ?: "";
+    auto own = own_attaches_.find(target);
+    if (own != own_attaches_.end()) {
+      if (--own->second == 0) {
+        own_attaches_.erase(own);
+      }
+      return;
+    }
+    if ([info[@"type"] isEqualToString:@"page"]) {
+      return;
+    }
+    if ([info[@"type"] isEqualToString:@"iframe"]) {
+      static const std::string script = [] {
+        NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+          @"source" : @(MediaShim().c_str()),
+          @"runImmediately" : @YES
+        }
+                                                       options:0
+                                                         error:nil];
+        return std::string(static_cast<const char*>(json.bytes), json.length);
+      }();
+      Send(browser, "Page.enable", "", session, nullptr);
+      Send(browser, "Page.addScriptToEvaluateOnNewDocument", script, session,
+           nullptr);
+      Send(browser, "Target.setAutoAttach", kAutoAttachFrames, session,
+           nullptr);
+      FollowWorkers(browser, target);
+      return;
+    }
+    bool shim = [info[@"type"] isEqualToString:@"worker"] &&
+                ![info[@"title"] isEqualToString:@(kConverterWorker)];
+    if (shim) {
+      Send(browser, "Runtime.evaluate", WorkerShimParams(), session, nullptr);
+      Send(browser, "Target.setAutoAttach", kAutoAttachWorkers, session,
+           nullptr);
+    }
+    CefRefPtr<PopupMedia> media(this);
+    Send(browser, "Runtime.runIfWaitingForDebugger", "", session,
+         [media, browser, session, parent, shim](NSDictionary*) {
+           dispatch_after(
+               dispatch_time(DISPATCH_TIME_NOW,
+                             (shim ? kNestedWorkerSeconds : 0) * NSEC_PER_SEC),
+               dispatch_get_main_queue(), ^{
+                 media->Send(browser, "Target.detachFromTarget",
+                             "{\"sessionId\":\"" + session + "\"}", parent,
+                             nullptr);
+               });
+         });
+  }
+
+  // Sends a command to |session| (empty for the popup's page); |then| gets
+  // the result, nil if it failed.
+  void Send(CefRefPtr<CefBrowser> browser,
+            const std::string& method,
+            const std::string& params,
+            const std::string& session,
+            Then then) {
+    int id = next_id_++;
+    std::string message =
+        "{\"id\":" + std::to_string(id) + ",\"method\":\"" + method + "\"";
+    if (!session.empty()) {
+      message += ",\"sessionId\":\"" + session + "\"";
+    }
+    if (!params.empty()) {
+      message += ",\"params\":" + params;
+    }
+    message += "}";
+    if (then) {
+      then_[id] = std::move(then);
+    }
+    // Not from inside DevTools' own callbacks: their observer list doesn't
+    // allow it.
+    dispatch_async(dispatch_get_main_queue(), ^{
+      browser->GetHost()->SendDevToolsMessage(message.data(), message.size());
+    });
+  }
+
+  CefRefPtr<CefRegistration> registration_;
+  CodecDelivery codec_;
+  std::map<int, Then> then_;
+  std::map<std::string, int> own_attaches_;
+  int next_id_ = 1500000000;
+
+  IMPLEMENT_REFCOUNTING(PopupMedia);
+};
+
 // Popups (window.open with features, e.g. sign-in flows) and DevTools. They
-// keep their opener, so they get real windows owned by CEF.
-class AuxiliaryClient : public BaseClient, public CefLifeSpanHandler {
+// keep their opener, so they get real windows owned by CEF. Popups (not
+// DevTools) get the media shim.
+class AuxiliaryClient : public BaseClient,
+                        public CefLifeSpanHandler,
+                        public CefDisplayHandler,
+                        public CefLoadHandler {
  public:
   static CefRefPtr<AuxiliaryClient> Get() {
-    static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient);
+    static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient(false));
+    return instance;
+  }
+
+  static CefRefPtr<AuxiliaryClient> Popups() {
+    static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient(true));
     return instance;
   }
 
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override {
+    return popups_ ? this : nullptr;
+  }
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override {
+    return popups_ ? this : nullptr;
+  }
 
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
                      CefRefPtr<CefFrame> frame,
@@ -847,16 +1220,60 @@ class AuxiliaryClient : public BaseClient, public CefLifeSpanHandler {
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     g_browser_count++;
     g_auxiliary.push_back(browser);
+    if (popups_ && g_convert_video && !MediaShim().empty()) {
+      PopupMedia::Start(browser);
+    }
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    PopupMedia::Stop(browser);
     std::erase_if(g_auxiliary, [&](const CefRefPtr<CefBrowser>& b) {
       return b->IsSame(browser);
     });
     BrowserGone();
   }
 
+  bool OnConsoleMessage(CefRefPtr<CefBrowser> browser,
+                        cef_log_severity_t level,
+                        const CefString& message,
+                        const CefString& source,
+                        int line) override {
+    std::string text = message.ToString();
+    bool request = text == kCodecRequest;
+    if (!request && text.rfind(kCodecFramePrefix, 0) != 0) {
+      return false;
+    }
+    if (CefRefPtr<PopupMedia> media = PopupMedia::For(browser)) {
+      if (request) {
+        media->codec().Requested(browser);
+      } else {
+        media->codec().Answered(browser,
+                                text.substr(strlen(kCodecFramePrefix)));
+      }
+    }
+    return true;
+  }
+
+  // The popup's first page may have started before the shim was
+  // registered; it runs once per document either way.
+  void OnLoadStart(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   TransitionType transition_type) override {
+    if (!frame->IsMain() || !PopupMedia::For(browser)) {
+      return;
+    }
+    PopupMedia::For(browser)->codec().Reset();
+    std::string url = frame->GetURL().ToString();
+    if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
+      frame->ExecuteJavaScript(MediaShim(), "", 0);
+    }
+  }
+
  private:
+  explicit AuxiliaryClient(bool popups) : popups_(popups) {}
+
+  bool popups_;
+
   IMPLEMENT_REFCOUNTING(AuxiliaryClient);
 };
 
@@ -1110,7 +1527,7 @@ class WebClient : public BaseClient,
       }
       default:
         windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
-        client = AuxiliaryClient::Get();
+        client = AuxiliaryClient::Popups();
         return false;
     }
   }
@@ -1233,11 +1650,15 @@ class WebClient : public BaseClient,
       return true;
     }
     if (text == kCodecRequest) {
-      AskWhoWantsCodec(browser);
+      if (media_shim_) {
+        codec_.Requested(browser);
+      }
       return true;
     }
     if (text.rfind(kCodecFramePrefix, 0) == 0) {
-      SendCodec(browser, text.substr(strlen(kCodecFramePrefix)));
+      if (media_shim_) {
+        codec_.Answered(browser, text.substr(strlen(kCodecFramePrefix)));
+      }
       return true;
     }
     if (text.rfind(kThemePrefix, 0) == 0) {
@@ -1315,7 +1736,7 @@ class WebClient : public BaseClient,
     }
     blocked_ = 0;
     [view_ engineSetBlockedCount:0];
-    codec_sent_.clear();
+    codec_.Reset();
     console_errors_ = 0;
     console_warnings_ = 0;
     ReportConsole();
@@ -1639,34 +2060,63 @@ class WebClient : public BaseClient,
         return;
       }
       auto ignore = [](bool, const std::string&) {};
+      bool waiting = [params[@"waitingForDebugger"] boolValue];
+      std::string target = [info[@"targetId"] UTF8String] ?: "";
+      auto own = own_attaches_.find(target);
+      if (own != own_attaches_.end()) {
+        // The engine's own session for a target's workers.
+        if (--own->second == 0) {
+          own_attaches_.erase(own);
+        }
+        return;
+      }
+      if ([info[@"type"] isEqualToString:@"page"]) {
+        return;
+      }
       if (![info[@"type"] isEqualToString:@"iframe"]) {
-        // A worker may play media too (MediaSource in workers).
-        if ([info[@"type"] isEqualToString:@"worker"] && media_shim_) {
-          AddWorkerMediaShim(browser, session.UTF8String);
+        // A worker may play media too (MediaSource in workers): it gets the
+        // shim before its script, then goes on without the engine, which
+        // keeps no session on it. Workers it starts right away get the shim
+        // too; later ones don't. The converter's own worker needs nothing.
+        bool shim = [info[@"type"] isEqualToString:@"worker"] && media_shim_ &&
+                    ![info[@"title"] isEqualToString:@(kConverterWorker)];
+        std::string child = session.UTF8String;
+        std::string parent = from ? from.UTF8String : "";
+        if (shim) {
+          SendInSession(browser, "Runtime.evaluate", WorkerShimParams(), child,
+                        ignore);
+          SendInSession(browser, "Target.setAutoAttach", kAutoAttachWorkers,
+                        child, ignore);
         }
-        if ([params[@"waitingForDebugger"] boolValue]) {
-          CallInSession(browser, "Runtime.runIfWaitingForDebugger", "",
-                        session.UTF8String, ignore);
-        }
+        CefRefPtr<WebClient> client(this);
+        SendInSession(
+            browser, "Runtime.runIfWaitingForDebugger", "", child,
+            [client, browser, child, parent, shim](bool, const std::string&) {
+              dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                           (shim ? kNestedWorkerSeconds : 0) *
+                                               NSEC_PER_SEC),
+                             dispatch_get_main_queue(), ^{
+                               client->Detach(browser, child, parent);
+                             });
+            });
         return;
       }
       [view_ engineFrameAttached:info[@"targetId"] session:session];
       if (media_shim_ && !MediaShim().empty()) {
         AddMediaShim(browser, session.UTF8String);
+        FollowWorkers(browser, target);
       }
       // Frames inside it too.
-      CallInSession(browser, "Target.setAutoAttach", kAutoAttach,
+      SendInSession(browser, "Target.setAutoAttach", kAutoAttachFrames,
                     session.UTF8String, ignore);
-      if ([params[@"waitingForDebugger"] boolValue]) {
-        CallInSession(browser, "Runtime.runIfWaitingForDebugger", "",
+      if (waiting) {
+        SendInSession(browser, "Runtime.runIfWaitingForDebugger", "",
                       session.UTF8String, ignore);
       }
-    } else if ([method isEqualToString:@"Runtime.bindingCalled"] && from &&
-               [params[@"name"] isEqualToString:@(kCodecBinding)]) {
-      SendWorkerCodec(browser, from);
     } else if ([method isEqualToString:@"Target.detachedFromTarget"]) {
       if (NSString* session = params[@"sessionId"]) {
         [view_ engineFrameDetached:session];
+        std::erase(worker_sessions_, std::string(session.UTF8String));
       }
     } else if (recording_network_ && [method hasPrefix:@"Network."]) {
       [view_ engineNetworkEvent:method params:params];
@@ -1689,9 +2139,56 @@ class WebClient : public BaseClient,
     }
     auto_attached_ = attach;
     CallRaw(browser, "Target.setAutoAttach",
-            attach ? kAutoAttach
+            attach ? kAutoAttachFrames
                    : "{\"autoAttach\":false,\"waitForDebuggerOnStart\":false}",
             [](bool, const std::string&) {});
+  }
+
+  // Attaches a second session to the page (|target| empty) or a cross-site
+  // frame, which attaches to its workers as they start, for the shim.
+  void FollowWorkers(CefRefPtr<CefBrowser> browser, const std::string& target) {
+    CefRefPtr<WebClient> client(this);
+    if (target.empty()) {
+      if (following_workers_) {
+        return;
+      }
+      following_workers_ = true;
+      // Answered at once, so through SendInSession, which is ready for that.
+      SendInSession(browser, "Target.getTargetInfo", "", "",
+                    [client, browser](bool ok, const std::string& json) {
+                      NSDictionary* result = ok ? ParseObject(json) : nil;
+                      NSString* page = result[@"targetInfo"][@"targetId"];
+                      if (page && client->media_shim_) {
+                        client->FollowWorkers(browser, page.UTF8String);
+                      }
+                    });
+      return;
+    }
+    own_attaches_[target]++;
+    std::string params = "{\"targetId\":\"" + target + "\",\"flatten\":true}";
+    SendInSession(browser, "Target.attachToTarget", params, "",
+                  [client, browser](bool ok, const std::string& json) {
+                    NSString* session =
+                        ok ? ParseObject(json)[@"sessionId"] : nil;
+                    if (!session) {
+                      return;
+                    }
+                    client->worker_sessions_.push_back(session.UTF8String);
+                    client->SendInSession(
+                        browser, "Target.setAutoAttach", kAutoAttachWorkers,
+                        session.UTF8String, [](bool, const std::string&) {});
+                  });
+  }
+
+  // Stops following workers, when the shim is turned off.
+  void UnfollowWorkers(CefRefPtr<CefBrowser> browser) {
+    following_workers_ = false;
+    for (const std::string& session : worker_sessions_) {
+      SendInSession(browser, "Target.detachFromTarget",
+                    "{\"sessionId\":\"" + session + "\"}", "",
+                    [](bool, const std::string&) {});
+    }
+    worker_sessions_.clear();
   }
 
   // Registers the media shim, or unregisters it, as the setting says, for
@@ -1706,6 +2203,7 @@ class WebClient : public BaseClient,
       RemoveDocumentScript(browser->GetHost(), media_script_);
       media_script_.clear();
       UpdateAutoAttach(browser);
+      UnfollowWorkers(browser);
       return;
     }
     Call(browser, "Page.enable", nullptr);
@@ -1723,87 +2221,71 @@ class WebClient : public BaseClient,
            }
          });
     UpdateAutoAttach(browser);
+    FollowWorkers(browser, "");
   }
 
   // The same for a cross-site frame's session, as it attaches.
   void AddMediaShim(CefRefPtr<CefBrowser> browser, const std::string& session) {
+    static const std::string script = [] {
+      NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+        @"source" : @(MediaShim().c_str()),
+        @"runImmediately" : @YES
+      }
+                                                     options:0
+                                                       error:nil];
+      return std::string(static_cast<const char*>(json.bytes), json.length);
+    }();
     auto ignore = [](bool, const std::string&) {};
-    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
-      @"source" : @(MediaShim().c_str()),
-      @"runImmediately" : @YES
-    }
-                                                   options:0
-                                                     error:nil];
-    std::string script(static_cast<const char*>(json.bytes), json.length);
-    CallInSession(browser, "Page.enable", "", session, ignore);
-    CallInSession(browser, "Page.addScriptToEvaluateOnNewDocument", script,
+    SendInSession(browser, "Page.enable", "", session, ignore);
+    SendInSession(browser, "Page.addScriptToEvaluateOnNewDocument", script,
                   session, ignore);
   }
 
-  // A worker gets the shim before its own script, and the binding it asks
-  // for the converter with.
-  void AddWorkerMediaShim(CefRefPtr<CefBrowser> browser,
-                          const std::string& session) {
+  // Lets go of a worker's session (|parent| is the session it came through,
+  // empty for the page's own).
+  void Detach(CefRefPtr<CefBrowser> browser,
+              const std::string& session,
+              const std::string& parent) {
+    std::string params = "{\"sessionId\":\"" + session + "\"}";
     auto ignore = [](bool, const std::string&) {};
-    CallInSession(browser, "Runtime.addBinding",
-                  std::string("{\"name\":\"") + kCodecBinding + "\"}", session,
-                  ignore);
-    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
-      @"expression" : @(MediaShim().c_str())
-    }
-                                                   options:0
-                                                     error:nil];
-    CallInSession(
-        browser, "Runtime.evaluate",
-        std::string(static_cast<const char*>(json.bytes), json.length), session,
-        ignore);
+    SendInSession(browser, "Target.detachFromTarget", params, parent, ignore);
   }
 
-  void SendWorkerCodec(CefRefPtr<CefBrowser> browser, NSString* session) {
-    std::string key = std::string("worker:") + session.UTF8String;
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (now - codec_sent_[key] < 5) {
-      return;
+  // Sends a command to a session (empty for the page's own) with |params| as
+  // they are (JSON, or empty for none), without parsing them again: the shim
+  // is big. |done| is ready before the command goes, as some are answered
+  // at once.
+  void SendInSession(CefRefPtr<CefBrowser> browser,
+                     const std::string& method,
+                     const std::string& params,
+                     const std::string& session,
+                     RawReply done) {
+    int message_id = next_session_message_++;
+    std::string message = "{\"id\":" + std::to_string(message_id) +
+                          ",\"method\":\"" + method + "\"";
+    if (!session.empty()) {
+      message += ",\"sessionId\":\"" + session + "\"";
     }
-    codec_sent_[key] = now;
-    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
-      @"expression" : @(CodecReply().c_str())
+    if (!params.empty()) {
+      message += ",\"params\":" + params;
     }
-                                                   options:0
-                                                     error:nil];
-    CallInSession(
-        browser, "Runtime.evaluate",
-        std::string(static_cast<const char*>(json.bytes), json.length),
-        session.UTF8String, [](bool, const std::string&) {});
-  }
-
-  // Asks each frame of the tab whether it's waiting for the converter;
-  // the ones that are reply with their identifier.
-  void AskWhoWantsCodec(CefRefPtr<CefBrowser> browser) {
-    std::vector<CefString> frames;
-    browser->GetFrameIdentifiers(frames);
-    for (const CefString& id : frames) {
-      CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(id);
-      if (!frame) {
-        continue;
+    message += "}";
+    session_replies_[message_id] = std::move(done);
+    // Not from inside DevTools' own callbacks, which this is often called
+    // from: their observer list doesn't allow it.
+    CefRefPtr<WebClient> client(this);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (browser->GetHost()->SendDevToolsMessage(message.data(),
+                                                  message.size())) {
+        return;
       }
-      std::string probe =
-          "typeof __mbgaCodecReady==='function'&&__mbgaCodecReady.who('" +
-          std::string(kCodecFramePrefix) + id.ToString() + "')";
-      frame->ExecuteJavaScript(probe, "", 0);
-    }
-  }
-
-  // Sends the converter to a frame, at most every few seconds each: a page
-  // could ask over and over.
-  void SendCodec(CefRefPtr<CefBrowser> browser, const std::string& id) {
-    CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(id);
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    if (!frame || now - codec_sent_[id] < 5) {
-      return;
-    }
-    codec_sent_[id] = now;
-    frame->ExecuteJavaScript(CodecReply(), "", 0);
+      auto reply = client->session_replies_.find(message_id);
+      if (reply != client->session_replies_.end()) {
+        RawReply failed = std::move(reply->second);
+        client->session_replies_.erase(reply);
+        failed(false, "{\"message\":\"the command could not be sent\"}");
+      }
+    });
   }
 
   // Sends a command to a frame's session as a raw message.
@@ -2275,11 +2757,16 @@ class WebClient : public BaseClient,
   int next_session_message_ = 1000000000;
   bool network_enabled_ = false;
   // The media shim: registered for this tab's documents (and its frames'),
-  // its identifier, and when frames were last sent the converter.
+  // its identifier, and the converter for the documents that ask.
   bool media_shim_ = false;
   bool auto_attached_ = false;
+  // Sessions the engine attached to follow workers, and the attaches of its
+  // own still to be announced.
+  bool following_workers_ = false;
+  std::vector<std::string> worker_sessions_;
+  std::map<std::string, int> own_attaches_;
   std::string media_script_;
-  std::map<std::string, CFAbsoluteTime> codec_sent_;
+  CodecDelivery codec_;
 
   IMPLEMENT_REFCOUNTING(WebClient);
 };

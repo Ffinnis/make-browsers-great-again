@@ -1,11 +1,22 @@
 //! Progressive (non-fragmented) MP4: the sample tables of a moov, and a plan
-//! to deliver them as fragments of a few seconds cut at video keyframes.
+//! to deliver them as fragments of a couple of seconds.
 
-use crate::bytes::{boxes, child, err, path, Reader, Result};
+use crate::bytes::{child, err, path, Reader, Result};
 use crate::frag::{Sample, NOT_SYNC, SYNC};
 
-/// How long a fragment runs before the next keyframe may start another.
+/// How long a fragment runs. The worker's decoder carries on from one
+/// fragment to the next, so cuts needn't wait for keyframes, but one at
+/// most `KEYFRAME_SLACK` later is taken instead.
 const FRAGMENT_SECONDS: f64 = 2.0;
+const KEYFRAME_SLACK: f64 = 1.0;
+
+/// The most samples a track may have: over four hours of 60 fps video or
+/// six of AAC. Sample tables are tiny next to what they describe, so this
+/// bounds what a small, broken moov can make the converter allocate.
+pub const MAX_SAMPLES: usize = 1 << 20;
+
+/// Past any real file: 256 TB.
+const MAX_OFFSET: u64 = 1 << 48;
 
 /// A sample with its absolute position in the file.
 pub struct FileSample {
@@ -18,15 +29,31 @@ pub struct FileSample {
 }
 
 impl FileSample {
-    /// The sample with its data range relative to `base` in the file.
-    pub fn at(&self, base: u64) -> Sample {
-        let start = (self.offset - base) as usize;
-        Sample {
-            dts: self.dts,
-            cto: self.cto,
-            duration: self.duration,
-            flags: if self.sync { SYNC } else { NOT_SYNC },
-            data: start..start + self.size as usize,
+    /// When the sample ends, in its track's timescale.
+    pub fn end_time(&self) -> f64 {
+        (self.dts + i64::from(self.duration)) as f64
+    }
+
+    /// Where the sample's bytes end in the file.
+    pub fn end(&self) -> u64 {
+        // Offsets are checked when the tables are read.
+        self.offset.saturating_add(u64::from(self.size))
+    }
+
+    /// The sample with its data range relative to `base` in the file, if
+    /// its bytes lie within the `len` bytes there.
+    pub fn at(&self, base: u64, len: usize) -> Result<Sample> {
+        let start = self.offset.checked_sub(base).and_then(|s| usize::try_from(s).ok());
+        let range = start.and_then(|start| Some(start..start.checked_add(self.size as usize)?));
+        match range {
+            Some(data) if data.end <= len => Ok(Sample {
+                dts: self.dts,
+                cto: self.cto,
+                duration: self.duration,
+                flags: if self.sync { SYNC } else { NOT_SYNC },
+                data,
+            }),
+            _ => err("sample outside the file's bytes"),
         }
     }
 }
@@ -54,16 +81,15 @@ pub fn samples(trak: &[u8]) -> Result<Vec<FileSample>> {
         return err("stts and stsz disagree");
     }
     if let Some(ctts) = child(stbl, *b"ctts")? {
-        let mut i = 0;
+        let mut rest = &mut out[..];
         for (count, offset) in pairs(Some(ctts))? {
-            for _ in 0..count {
-                if let Some(s) = out.get_mut(i) {
-                    // Version 0 is unsigned on paper, but writers put negative
-                    // offsets there too.
-                    s.cto = i64::from(offset as i32);
-                }
-                i += 1;
+            let (these, after) = rest.split_at_mut((count as usize).min(rest.len()));
+            for s in these {
+                // Version 0 is unsigned on paper, but writers put negative
+                // offsets there too.
+                s.cto = i64::from(offset as i32);
             }
+            rest = after;
         }
     }
     if let Some(stss) = child(stbl, *b"stss")? {
@@ -104,6 +130,9 @@ fn sizes(stbl: &[u8]) -> Result<Vec<u32>> {
         r.full_header()?;
         let fixed = r.u32()?;
         let count = r.u32()? as usize;
+        if count > MAX_SAMPLES {
+            return err("too many samples");
+        }
         if fixed != 0 {
             return Ok(vec![fixed; count]);
         }
@@ -119,6 +148,9 @@ fn sizes(stbl: &[u8]) -> Result<Vec<u32>> {
     r.full_header()?;
     let bits = r.u32()? & 0xff;
     let count = r.u32()? as usize;
+    if count > MAX_SAMPLES {
+        return err("too many samples");
+    }
     let mut out = Vec::with_capacity(count.min(r.remaining() * 2));
     while out.len() < count {
         match bits {
@@ -166,6 +198,9 @@ fn place(stbl: &[u8], samples: &mut [FileSample]) -> Result<()> {
                 let Some(s) = samples.get_mut(i) else {
                     return Ok(());
                 };
+                if offset > MAX_OFFSET {
+                    return err("chunk past the end of any file");
+                }
                 s.offset = offset;
                 offset += u64::from(s.size);
                 i += 1;
@@ -201,25 +236,25 @@ fn pairs_of_three(data: Option<&[u8]>) -> Result<Vec<(u32, u32)>> {
     Ok(out)
 }
 
-/// Where each fragment ends, as a time in seconds: at the first video
-/// keyframe at least `FRAGMENT_SECONDS` after the fragment's start, or every
-/// `FRAGMENT_SECONDS` without video.
+/// Where each fragment ends, as a decode time in seconds: every
+/// `FRAGMENT_SECONDS`, moved to a video keyframe if one comes within
+/// `KEYFRAME_SLACK` after that, so that fragments start on keyframes where
+/// the file allows and sparse keyframes don't make one huge fragment.
 pub fn cut_times(video: Option<(&[FileSample], u32)>, end: f64) -> Vec<f64> {
+    let keys: Vec<f64> = video.map_or_else(Vec::new, |(samples, timescale)| {
+        samples.iter().filter(|s| s.sync).map(|s| s.dts as f64 / f64::from(timescale)).collect()
+    });
     let mut cuts = Vec::new();
     let mut start = 0.0;
-    if let Some((samples, timescale)) = video {
-        for s in samples.iter().filter(|s| s.sync) {
-            let t = s.dts as f64 / f64::from(timescale);
-            if t - start >= FRAGMENT_SECONDS {
-                cuts.push(t);
-                start = t;
-            }
+    let mut next_key = 0;
+    // The last fragment runs longer rather than leave a short one after it.
+    while end - (start + FRAGMENT_SECONDS) > KEYFRAME_SLACK {
+        let due = start + FRAGMENT_SECONDS;
+        while keys.get(next_key).is_some_and(|&k| k < due) {
+            next_key += 1;
         }
-    } else {
-        while start + FRAGMENT_SECONDS < end {
-            start += FRAGMENT_SECONDS;
-            cuts.push(start);
-        }
+        start = keys.get(next_key).copied().filter(|&k| k <= due + KEYFRAME_SLACK).unwrap_or(due);
+        cuts.push(start);
     }
     cuts.push(f64::INFINITY);
     cuts
@@ -249,9 +284,4 @@ pub fn find_moov(data: &[u8]) -> Result<Scan> {
         }
         pos = pos.saturating_add(size);
     }
-}
-
-/// The traks of a moov, by track id, for reading their tables.
-pub fn traks(moov: &[u8]) -> Result<Vec<&[u8]>> {
-    Ok(boxes(moov)?.into_iter().filter(|b| &b.kind == b"trak").map(|b| b.body).collect())
 }
