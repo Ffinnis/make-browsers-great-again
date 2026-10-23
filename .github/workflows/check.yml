@@ -27,7 +27,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             core/target
-          key: cargo-${{ hashFiles('core/Cargo.lock', 'rust-toolchain.toml') }}
+          key: cargo-${{ hashFiles('core/Cargo.lock', 'media/Cargo.lock', 'rust-toolchain.toml') }}
       - run: scripts/check.sh
 
   build:
@@ -45,11 +45,12 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-registry-${{ hashFiles('core/Cargo.lock') }}
+          key: cargo-registry-${{ hashFiles('core/Cargo.lock', 'media/Cargo.lock') }}
       - name: Fetch Rust crates
         run: |
           for attempt in 1 2 3 4 5; do
-            cargo fetch --locked --manifest-path core/Cargo.toml && exit 0
+            cargo fetch --locked --manifest-path core/Cargo.toml &&
+              cargo fetch --locked --manifest-path media/Cargo.toml && exit 0
             echo "::warning::Fetching crates failed (attempt $attempt), retrying"
             sleep $((attempt * 15))
           done
