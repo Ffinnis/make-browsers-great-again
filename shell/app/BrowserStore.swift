@@ -389,7 +389,7 @@ final class BrowserStore: NSObject {
         passwords.forget(id)
         devStates[id]?.picking = false
         if pausedMediaTab == id { pausedMediaTab = nil }
-        view.isHidden = true
+        webContainer.stopDrawing(view)
         view.close()
     }
 
@@ -1398,10 +1398,10 @@ extension BrowserStore {
         return store.views[id] != nil && store.navStates[id] != nil
     }
 
-    func renderBehind(_ id: UInt64) -> () -> Void {
+    func holdDrawing(_ id: UInt64) -> (started: Bool, release: () -> Void) {
         let store = keeper(of: id)
-        guard id != store.visibleTabID, let view = store.views[id] else { return {} }
-        return store.webContainer.renderBehind(view)
+        guard id != store.visibleTabID, let view = store.views[id] else { return (false, {}) }
+        return store.webContainer.holdDrawing(view, grace: 30)
     }
 
     func navState(of id: UInt64) -> NavState { keeper(of: id).navStates[id] ?? NavState() }

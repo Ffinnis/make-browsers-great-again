@@ -46,8 +46,6 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: cargo-registry-${{ hashFiles('core/Cargo.lock') }}
-      # Download the crates up front, retrying when the runner's network
-      # drops out, so the long build after it never needs the network.
       - name: Fetch Rust crates
         run: |
           for attempt in 1 2 3 4 5; do
