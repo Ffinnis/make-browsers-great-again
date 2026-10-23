@@ -32,6 +32,12 @@ scripts/build.sh --run    # build and launch
 The app is written to `build/cmake/out/MBGA.app`. Rust's version is pinned
 in `rust-toolchain.toml`, so `rustup` picks it up on its own.
 
+If you work in several worktrees, install [kache](https://docs.rs/crate/kache)
+with `cargo +stable install kache --locked` (it needs a newer Rust than the
+pinned one). The build uses it when it's on your path, so a new worktree
+restores the Rust core from the cache instead of compiling it again: about 6
+seconds instead of a minute. You don't need `kache init`.
+
 A development build stores its data in `~/Library/Application Support/MBGA`,
 the same folder as an installed copy, and shares its preferences. If you
 also use MBGA day to day, give test runs a folder of their own so they don't
