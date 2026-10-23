@@ -627,6 +627,21 @@ NSString* DescribeMedia(uint32_t permissions) {
                                     [parts componentsJoinedByString:@" and "]];
 }
 
+std::vector<cef_content_setting_types_t> DeviceSettings(uint32_t permissions) {
+  if (permissions & (CEF_MEDIA_PERMISSION_DESKTOP_VIDEO_CAPTURE |
+                     CEF_MEDIA_PERMISSION_DESKTOP_AUDIO_CAPTURE)) {
+    return {};
+  }
+  std::vector<cef_content_setting_types_t> settings;
+  if (permissions & CEF_MEDIA_PERMISSION_DEVICE_AUDIO_CAPTURE) {
+    settings.push_back(CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC);
+  }
+  if (permissions & CEF_MEDIA_PERMISSION_DEVICE_VIDEO_CAPTURE) {
+    settings.push_back(CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA);
+  }
+  return settings;
+}
+
 NSString* DescribePrompt(uint32_t permissions) {
   if (permissions & CEF_PERMISSION_TYPE_GEOLOCATION) {
     return @"know your location";
@@ -856,8 +871,37 @@ class BaseClient : public CefClient,
       const CefString& requesting_origin,
       uint32_t requested_permissions,
       CefRefPtr<CefMediaAccessCallback> callback) override {
+    CefRefPtr<CefRequestContext> context =
+        browser->GetHost()->GetRequestContext();
+    std::string origin = requesting_origin;
+    std::string top = browser->GetMainFrame()->GetURL();
+    std::vector<cef_content_setting_types_t> settings =
+        DeviceSettings(requested_permissions);
+    if (!settings.empty()) {
+      bool all_allowed = true;
+      for (cef_content_setting_types_t setting : settings) {
+        cef_content_setting_values_t value =
+            context->GetContentSetting(origin, top, setting);
+        if (value == CEF_CONTENT_SETTING_VALUE_BLOCK) {
+          callback->Continue(CEF_MEDIA_PERMISSION_NONE);
+          return true;
+        }
+        all_allowed &= value == CEF_CONTENT_SETTING_VALUE_ALLOW;
+      }
+      if (all_allowed) {
+        callback->Continue(requested_permissions);
+        return true;
+      }
+    }
     AskPermission(browser, requesting_origin,
                   DescribeMedia(requested_permissions), ^(BOOL allowed) {
+                    if (allowed) {
+                      for (cef_content_setting_types_t setting : settings) {
+                        context->SetContentSetting(
+                            origin, top, setting,
+                            CEF_CONTENT_SETTING_VALUE_ALLOW);
+                      }
+                    }
                     callback->Continue(allowed ? requested_permissions
                                                : CEF_MEDIA_PERMISSION_NONE);
                   });
