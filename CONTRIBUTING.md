@@ -181,7 +181,8 @@ The workflow needs these repository secrets:
 | --- | --- |
 | `MBGA_UPDATE_KEY` | The update signing key (`security find-generic-password -s "MBGA update signing key" -a mbga -w`). Copies only accept updates signed with it. |
 | `APPLE_DEVELOPMENT_P12`, `APPLE_DEVELOPMENT_P12_PASSWORD` | The Apple Development certificate and its private key, exported from Keychain Access as a .p12 and base64-encoded, with its password. |
-| `ASC_KEY_P8`, `ASC_KEY_ID`, `ASC_ISSUER_ID` | An App Store Connect API key with the Admin role, which lets Xcode sign with the cloud-managed Developer ID and notarize. |
+| `DEVELOPER_ID_P12`, `DEVELOPER_ID_P12_PASSWORD` | The team's Developer ID Application certificate and its private key, exported the same way. Xcode can't sign with the cloud-managed Developer ID when it signs in with an API key, so CI needs a certificate of its own. The Account Holder makes one in Xcode ▸ Settings ▸ Accounts ▸ Manage Certificates. |
+| `ASC_KEY_P8`, `ASC_KEY_ID`, `ASC_ISSUER_ID` | An App Store Connect API key with the Admin role, which lets Xcode upload the app to be notarized. |
 
 `scripts/release.sh` also runs on a Mac signed into Xcode with the team's
 account, using the keys in your keychain:

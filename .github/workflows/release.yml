@@ -68,6 +68,8 @@ jobs:
         env:
           CERTIFICATE: ${{ secrets.APPLE_DEVELOPMENT_P12 }}
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPMENT_P12_PASSWORD }}
+          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
           ASC_KEY: ${{ secrets.ASC_KEY_P8 }}
         run: |
           KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
@@ -75,9 +77,17 @@ jobs:
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
           security set-keychain-settings -lut 21600 "$KEYCHAIN"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          echo "$CERTIFICATE" | base64 --decode >"$RUNNER_TEMP/certificate.p12"
-          security import "$RUNNER_TEMP/certificate.p12" -P "$CERTIFICATE_PASSWORD" -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign
-          rm "$RUNNER_TEMP/certificate.p12"
+          if [[ -z "$DEVELOPER_ID" ]]; then
+            echo "::error::Add the DEVELOPER_ID_P12 secret: Xcode can't sign with the cloud-managed Developer ID using an API key."
+            exit 1
+          fi
+          import() {
+            echo "$1" | base64 --decode >"$RUNNER_TEMP/certificate.p12"
+            security import "$RUNNER_TEMP/certificate.p12" -P "$2" -f pkcs12 -k "$KEYCHAIN" -T /usr/bin/codesign -T /usr/bin/xcodebuild
+            rm "$RUNNER_TEMP/certificate.p12"
+          }
+          import "$CERTIFICATE" "$CERTIFICATE_PASSWORD"
+          import "$DEVELOPER_ID" "$DEVELOPER_ID_PASSWORD"
           security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
           echo "$ASC_KEY" >"$RUNNER_TEMP/AuthKey.p8"
