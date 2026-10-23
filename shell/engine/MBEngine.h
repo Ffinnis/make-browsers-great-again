@@ -149,6 +149,8 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 
 + (void)setFormScript:(NSString*)script;
 
++ (void)setConvertsVideo:(BOOL)converts;
+
 @property(class, nonatomic, readonly) BOOL usesMockKeychain;
 
 @end

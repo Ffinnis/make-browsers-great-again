@@ -207,6 +207,30 @@ private final class SettingsPaneController: NSViewController {
             if awake.currentEditor() == nil { awake.stringValue = store.keepAwakeSites.joined(separator: ", ") }
         }
 
+        return [
+            [label("Sidebar:"), layout],
+            [label("Sidebar colour:"), colour],
+            [NSGridCell.emptyContentView, matchPage],
+            [label("Archive Today tabs:"), archive],
+            [NSGridCell.emptyContentView, caption("Tabs in Today you haven't used for this long move to the archive. Pinned tabs and favourites stay.")],
+            [label("Put tabs to sleep:"), sleep],
+            [NSGridCell.emptyContentView, caption("A tab in the background you haven't used for this long is unloaded, and reloads when you select it. The tab you're on, tabs playing sound and tabs kept awake stay loaded.")],
+            [label("Keep loaded at most:"), limit],
+            [NSGridCell.emptyContentView, caption("Beyond this many, the tabs you used longest ago go to sleep first. When your Mac runs low on memory, tabs go to sleep sooner whatever you choose.")],
+            [label("Keep awake:"), awake],
+            [NSGridCell.emptyContentView, caption("Tabs of these sites, with their subdomains, are never put to sleep, frozen or archived, so mail and chat keep notifying you. Separate them with commas.")],
+        ] + videoRows() + updateRows()
+    }
+
+    private func videoRows() -> [[NSView]] {
+        let convert = checkbox("Play H.264 video by converting it") { [store] on in store.setConvertsVideo(on) }
+        refreshers.append { [store] in convert.state = store.convertsVideo ? .on : .off }
+        let about = "Sites like X, Reddit and Twitch send video in a format the engine can't play. "
+            + "MBGA converts it as it plays, which uses more battery. Applies to pages you load afterwards."
+        return [[label("Video:"), convert], [NSGridCell.emptyContentView, caption(about)]]
+    }
+
+    private func updateRows() -> [[NSView]] {
         let updater = Updater.shared
         let automatic = checkbox("Keep MBGA up to date") { on in updater.automatic = on }
         let check = NSButton.push("Check Now") { updater.check(userInitiated: true) }
@@ -221,39 +245,16 @@ private final class SettingsPaneController: NSViewController {
             } else {
                 check.title = "Check Now"
                 check.onAction { updater.check(userInitiated: true) }
-                status.stringValue = Self.updateStatus(updater)
+                status.stringValue = updater.statusText
             }
             check.isEnabled = updater.available && updater.state != .checking && !updater.isDownloading
         }
 
         return [
-            [label("Sidebar:"), layout],
-            [label("Sidebar colour:"), colour],
-            [NSGridCell.emptyContentView, matchPage],
-            [label("Archive Today tabs:"), archive],
-            [NSGridCell.emptyContentView, caption("Tabs in Today you haven't used for this long move to the archive. Pinned tabs and favourites stay.")],
-            [label("Put tabs to sleep:"), sleep],
-            [NSGridCell.emptyContentView, caption("A tab in the background you haven't used for this long is unloaded, and reloads when you select it. The tab you're on, tabs playing sound and tabs kept awake stay loaded.")],
-            [label("Keep loaded at most:"), limit],
-            [NSGridCell.emptyContentView, caption("Beyond this many, the tabs you used longest ago go to sleep first. When your Mac runs low on memory, tabs go to sleep sooner whatever you choose.")],
-            [label("Keep awake:"), awake],
-            [NSGridCell.emptyContentView, caption("Tabs of these sites, with their subdomains, are never put to sleep, frozen or archived, so mail and chat keep notifying you. Separate them with commas.")],
             [label("Updates:"), automatic],
             [NSGridCell.emptyContentView, check],
             [NSGridCell.emptyContentView, status],
         ]
-    }
-
-    private static func updateStatus(_ updater: Updater) -> String {
-        let version = "This is MBGA \(updater.currentVersion)."
-        guard updater.available else { return "\(version) Built from source, it doesn't update itself." }
-        switch updater.state {
-        case .checking: return "\(version) Checking for updates…"
-        case .downloading(let next): return "\(version) Downloading \(next)…"
-        case .upToDate: return "\(version) It's the latest version."
-        case .failed(let problem): return "\(version) \(problem)."
-        case .idle: return "\(version) Updates download in the background and install when you restart."
-        }
     }
 
     private func privacyRows() -> [[NSView]] {

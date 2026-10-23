@@ -23,6 +23,7 @@ guard MBEngine.start(
 ) else {
     fatalError("Failed to start the browser engine")
 }
+MBEngine.setConvertsVideo(core.snapshot().convertVideo)
 
 let appDelegate = MainActor.assumeIsolated { AppDelegate(core: core) }
 app.delegate = appDelegate

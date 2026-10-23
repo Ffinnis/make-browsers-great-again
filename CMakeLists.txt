@@ -78,6 +78,22 @@ add_custom_command(
   VERBATIM)
 add_custom_target(mbga_core DEPENDS "${CORE_LIB}" "${CORE_SWIFT}")
 
+set(MEDIA_DIR "${CMAKE_SOURCE_DIR}/media")
+set(MEDIA_TARGET_DIR "${CMAKE_BINARY_DIR}/media-target")
+set(MEDIA_WASM "${MEDIA_TARGET_DIR}/wasm32-unknown-unknown/release/mbga_media.wasm")
+file(GLOB_RECURSE MEDIA_SOURCES CONFIGURE_DEPENDS "${MEDIA_DIR}/src/*.rs")
+add_custom_command(
+  OUTPUT "${MEDIA_WASM}"
+  COMMAND "${CARGO}" build --release --lib --target wasm32-unknown-unknown
+          --manifest-path "${MEDIA_DIR}/Cargo.toml"
+          --target-dir "${MEDIA_TARGET_DIR}"
+  DEPENDS ${MEDIA_SOURCES} "${MEDIA_DIR}/Cargo.toml" "${MEDIA_DIR}/Cargo.lock"
+  WORKING_DIRECTORY "${MEDIA_DIR}"
+  COMMENT "Building the video converter"
+  USES_TERMINAL
+  VERBATIM)
+add_custom_target(mbga_media DEPENDS "${MEDIA_WASM}")
+
 add_library(mbga_engine STATIC
   shell/engine/MBEngine.h
   shell/engine/MBEngine.mm)
@@ -123,10 +139,12 @@ set_source_files_properties("${CORE_SWIFT}" PROPERTIES GENERATED TRUE)
 configure_file(shell/resources/Info.plist.in "${CMAKE_BINARY_DIR}/Info.plist")
 
 add_executable(mbga MACOSX_BUNDLE ${MBGA_SWIFT_SOURCES} "${CORE_SWIFT}")
-add_dependencies(mbga mbga_core ${MBGA_HELPER_TARGETS})
+add_dependencies(mbga mbga_core mbga_media ${MBGA_HELPER_TARGETS})
+file(GLOB MEDIA_RESOURCES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/shell/resources/media/*")
 set_target_properties(mbga PROPERTIES
   OUTPUT_NAME "${MBGA_PRODUCT_NAME}"
-  MACOSX_BUNDLE_INFO_PLIST "${CMAKE_BINARY_DIR}/Info.plist")
+  MACOSX_BUNDLE_INFO_PLIST "${CMAKE_BINARY_DIR}/Info.plist"
+  LINK_DEPENDS "${MEDIA_WASM};${MEDIA_RESOURCES}")
 target_compile_options(mbga PRIVATE
   "SHELL:-import-objc-header ${CMAKE_SOURCE_DIR}/shell/engine/MBEngine.h"
   "SHELL:-Xcc -fmodule-map-file=${CORE_GEN}/mbga_coreFFI.modulemap"
@@ -167,6 +185,9 @@ add_custom_command(TARGET mbga POST_BUILD
   COMMAND cp "$<TARGET_FILE:mbga_cli>" "${_app}/Contents/Resources/bin/mbga"
   COMMAND rsync -a --delete "${CMAKE_SOURCE_DIR}/shell/resources/extension/"
           "${_app}/Contents/Resources/extension/"
+  COMMAND rsync -a --delete "${CMAKE_SOURCE_DIR}/shell/resources/media/"
+          "${_app}/Contents/Resources/media/"
+  COMMAND cp "${MEDIA_WASM}" "${_app}/Contents/Resources/media/"
   VERBATIM)
 set(_icon "${CMAKE_SOURCE_DIR}/shell/resources/AppIcon.icon")
 set(_icon_out "${CMAKE_BINARY_DIR}/icon")

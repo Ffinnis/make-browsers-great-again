@@ -563,6 +563,21 @@ fn blocker_compiles_lists_once_and_loads_the_cache() {
 }
 
 #[test]
+fn video_conversion_is_on_until_turned_off() {
+    let dir = temp_dir("convert-video");
+    let core = BrowserCore::new(dir.clone());
+    assert!(core.snapshot().convert_video);
+    core.set_convert_video(false);
+    assert!(core.persist());
+    assert!(!BrowserCore::new(dir.clone()).snapshot().convert_video);
+    let mut saved = serde_json::to_value(State::new_default()).unwrap();
+    saved.as_object_mut().unwrap().remove("convert_video").unwrap();
+    let state: State = serde_json::from_value(saved).unwrap();
+    assert!(state.convert_video);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn ad_settings_survive_a_restart() {
     let dir = temp_dir("ads");
     let core = BrowserCore::new(dir.clone());

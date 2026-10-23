@@ -7,8 +7,10 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
@@ -79,6 +81,7 @@ MBExtensionBridge g_extension_bridge = nil;
 MBPageScript g_extension_script = nil;
 const char kBridgeOrigin[] = "https://mbga-extension.invalid/";
 bool g_reject_drops = false;
+bool g_convert_video = false;
 
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
 constexpr char kFormPrefix[] = "__mbga_form:";
@@ -129,6 +132,235 @@ constexpr char kPauseMediaScript[] =
 constexpr char kResumeMediaScript[] =
     "(function(){document.querySelectorAll('[data-mbga-paused]').forEach("
     "function(m){delete m.dataset.mbgaPaused;m.play();});})();";
+
+constexpr char kCodecRequest[] = "__mbga_codec";
+constexpr char kCodecFramePrefix[] = "__mbga_codec_frame:";
+constexpr char kConverterWorker[] = "MBGA video converter";
+constexpr char kAutoAttachFrames[] =
+    "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
+    "true,\"filter\":[{\"type\":\"iframe\"}]}";
+constexpr int64_t kWorkerResumeSeconds = 5;
+constexpr char kAutoAttachWorkers[] =
+    "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":"
+    "true,\"filter\":[{\"type\":\"worker\"}]}";
+
+NSDictionary* ParseObject(const std::string& json) {
+  NSData* data = [NSData dataWithBytes:json.data() length:json.size()];
+  id object = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+  return [object isKindOfClass:NSDictionary.class] ? object : nil;
+}
+
+NSString* MediaResource(NSString* name) {
+  NSString* path = [[NSBundle.mainBundle.resourcePath
+      stringByAppendingPathComponent:@"media"]
+      stringByAppendingPathComponent:name];
+  NSData* data = [NSData dataWithContentsOfFile:path];
+  return data ? [[NSString alloc] initWithData:data
+                                      encoding:NSUTF8StringEncoding]
+              : nil;
+}
+
+const std::string& MediaShim() {
+  static const std::string shim = MediaResource(@"shim.js").UTF8String ?: "";
+  return shim;
+}
+
+const std::string& WorkerShimParams() {
+  static const std::string params = [] {
+    NSString* shim = @(MediaShim().c_str());
+    NSRange pages = [shim rangeOfString:@"\n  if (Media && isWindow) {\n"
+                                        @"    playPlainFiles();"];
+    if (pages.location != NSNotFound) {
+      shim = [[shim substringToIndex:pages.location]
+          stringByAppendingString:@"})();\n"];
+    }
+    NSMutableArray<NSString*>* lines = [NSMutableArray array];
+    for (NSString* line in [shim componentsSeparatedByString:@"\n"]) {
+      NSString* code =
+          [line stringByTrimmingCharactersInSet:NSCharacterSet
+                                                    .whitespaceCharacterSet];
+      if (code.length > 0) {
+        [lines addObject:code];
+      }
+    }
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+      @"expression" : [lines componentsJoinedByString:@"\n"]
+    }
+                                                   options:0
+                                                     error:nil];
+    return std::string(static_cast<const char*>(json.bytes), json.length);
+  }();
+  return params;
+}
+
+std::shared_ptr<const std::string> g_codec_reply;
+CFAbsoluteTime g_codec_reply_used = 0;
+void ReleaseCodecReplyLater();
+
+std::shared_ptr<const std::string> CodecReply() {
+  g_codec_reply_used = CFAbsoluteTimeGetCurrent();
+  if (g_codec_reply) {
+    return g_codec_reply;
+  }
+  NSString* worker = MediaResource(@"worker.js");
+  NSString* path = [NSBundle.mainBundle.resourcePath
+      stringByAppendingPathComponent:@"media/mbga_media.wasm"];
+  NSData* wasm = [NSData dataWithContentsOfFile:path];
+  NSString* args = @"null,null";
+  if (worker && wasm) {
+    NSData* json = [NSJSONSerialization
+        dataWithJSONObject:@[ worker, [wasm base64EncodedStringWithOptions:0] ]
+                   options:0
+                     error:nil];
+    args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
+    args = [args substringWithRange:NSMakeRange(1, args.length - 2)];
+  }
+  NSString* script = [NSString
+      stringWithFormat:@"(function(f){if(typeof f==='function')f(%@)})("
+                       @"globalThis.__mbgaCodecReady)",
+                       args];
+  g_codec_reply = std::make_shared<const std::string>(script.UTF8String);
+  ReleaseCodecReplyLater();
+  return g_codec_reply;
+}
+
+void ReleaseCodecReplyLater() {
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_SEC),
+                 dispatch_get_main_queue(), ^{
+                   if (CFAbsoluteTimeGetCurrent() - g_codec_reply_used >= 59) {
+                     g_codec_reply.reset();
+                   } else {
+                     ReleaseCodecReplyLater();
+                   }
+                 });
+}
+
+class CodecDelivery {
+ public:
+  void Requested(CefRefPtr<CefBrowser> browser) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (now - last_probe_ < 1) {
+      if (!probe_pending_) {
+        probe_pending_ = true;
+        std::weak_ptr<bool> alive = alive_;
+        CodecDelivery* delivery = this;
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          int64_t((1 - (now - last_probe_)) * NSEC_PER_SEC)),
+            dispatch_get_main_queue(), ^{
+              if (alive.lock()) {
+                delivery->probe_pending_ = false;
+                delivery->Probe(browser);
+              }
+            });
+      }
+      return;
+    }
+    Probe(browser);
+  }
+
+  void Answered(CefRefPtr<CefBrowser> browser, const std::string& answer) {
+    size_t word_at = answer.rfind(':');
+    if (word_at == std::string::npos || word_at == 0) {
+      return;
+    }
+    size_t document_at = answer.rfind(':', word_at - 1);
+    if (document_at == std::string::npos) {
+      return;
+    }
+    std::string frame_id = answer.substr(0, document_at);
+    auto probe = probes_.find(frame_id);
+    if (probe == probes_.end() || probe->second != answer.substr(word_at + 1)) {
+      return;
+    }
+    probes_.erase(probe);
+    std::string document = answer.substr(0, word_at);
+    auto sent = sent_.find(document);
+    if (sent != sent_.end() && CFAbsoluteTimeGetCurrent() - sent->second < 5) {
+      return;
+    }
+    auto queued =
+        std::find_if(queue_.begin(), queue_.end(),
+                     [&](const auto& item) { return item.first == frame_id; });
+    if (queued != queue_.end()) {
+      queued->second = document;
+    } else {
+      queue_.emplace_back(frame_id, document);
+    }
+    Serve(browser);
+  }
+
+  void Reset() {
+    sent_.clear();
+    queue_.clear();
+    probes_.clear();
+  }
+
+ private:
+  void Probe(CefRefPtr<CefBrowser> browser) {
+    last_probe_ = CFAbsoluteTimeGetCurrent();
+    probes_.clear();
+    std::vector<CefString> frames;
+    browser->GetFrameIdentifiers(frames);
+    for (const CefString& id : frames) {
+      CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(id);
+      if (!frame) {
+        continue;
+      }
+      char word[17];
+      snprintf(word, sizeof(word), "%08x%08x", arc4random(), arc4random());
+      probes_[id.ToString()] = word;
+      std::string probe =
+          "typeof __mbgaCodecReady==='function'&&__mbgaCodecReady.who('" +
+          std::string(kCodecFramePrefix) + id.ToString() + "','" + word + "')";
+      frame->ExecuteJavaScript(probe, "", 0);
+    }
+  }
+
+  void Serve(CefRefPtr<CefBrowser> browser) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    std::erase_if(recent_, [&](CFAbsoluteTime t) { return now - t > 10; });
+    while (!queue_.empty() && recent_.size() < 8) {
+      auto [frame_id, document] = queue_.front();
+      queue_.pop_front();
+      CefRefPtr<CefFrame> frame = browser->GetFrameByIdentifier(frame_id);
+      if (!frame) {
+        continue;
+      }
+      recent_.push_back(now);
+      if (sent_.size() > 64) {
+        std::erase_if(sent_,
+                      [&](const auto& item) { return now - item.second > 60; });
+      }
+      sent_[document] = now;
+      frame->ExecuteJavaScript(*CodecReply(), "", 0);
+    }
+    if (queue_.empty() || serve_pending_) {
+      return;
+    }
+    serve_pending_ = true;
+    double wait = std::max(0.05, 10.05 - (now - recent_.front()));
+    std::weak_ptr<bool> alive = alive_;
+    CodecDelivery* delivery = this;
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, int64_t(wait * NSEC_PER_SEC)),
+        dispatch_get_main_queue(), ^{
+          if (alive.lock()) {
+            delivery->serve_pending_ = false;
+            delivery->Serve(browser);
+          }
+        });
+  }
+
+  CFAbsoluteTime last_probe_ = 0;
+  bool probe_pending_ = false;
+  bool serve_pending_ = false;
+  std::map<std::string, std::string> probes_;
+  std::deque<std::pair<std::string, std::string>> queue_;
+  std::map<std::string, CFAbsoluteTime> sent_;
+  std::vector<CFAbsoluteTime> recent_;
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+};
 
 enum MenuCommand {
   kOpenLinkInNewTab = MENU_ID_USER_FIRST,
@@ -662,14 +894,235 @@ class BaseClient : public CefClient,
   }
 };
 
-class AuxiliaryClient : public BaseClient, public CefLifeSpanHandler {
+class PopupMedia : public CefDevToolsMessageObserver {
+ public:
+  using Then = std::function<void(NSDictionary* result)>;
+
+  static void Start(CefRefPtr<CefBrowser> browser) {
+    CefRefPtr<PopupMedia> media(new PopupMedia);
+    CefRefPtr<CefBrowserHost> host = browser->GetHost();
+    media->registration_ = host->AddDevToolsMessageObserver(media);
+    All()[browser->GetIdentifier()] = media;
+    host->ExecuteDevToolsMethod(0, "Page.enable", nullptr);
+    CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+    params->SetString("source", MediaShim());
+    host->ExecuteDevToolsMethod(0, "Page.addScriptToEvaluateOnNewDocument",
+                                params);
+    media->Send(browser, "Target.setAutoAttach", kAutoAttachFrames, "",
+                nullptr);
+    media->Send(browser, "Target.getTargetInfo", "", "",
+                [media, browser](NSDictionary* result) {
+                  NSString* page = result[@"targetInfo"][@"targetId"];
+                  if (page) {
+                    media->FollowWorkers(browser, page.UTF8String);
+                  }
+                });
+  }
+
+  static void Stop(CefRefPtr<CefBrowser> browser) {
+    if (CefRefPtr<PopupMedia> media = For(browser)) {
+      media->registration_ = nullptr;
+      media->then_.clear();
+      All().erase(browser->GetIdentifier());
+    }
+  }
+
+  static CefRefPtr<PopupMedia> For(CefRefPtr<CefBrowser> browser) {
+    auto media = All().find(browser->GetIdentifier());
+    return media == All().end() ? nullptr : media->second;
+  }
+
+  CodecDelivery& codec() { return codec_; }
+
+  bool OnDevToolsMessage(CefRefPtr<CefBrowser> browser,
+                         const void* message,
+                         size_t message_size) override {
+    static const char kSession[] = "\"sessionId\"";
+    if (then_.empty() &&
+        !memmem(message, message_size, kSession, strlen(kSession))) {
+      return false;
+    }
+    NSData* data = [NSData dataWithBytesNoCopy:const_cast<void*>(message)
+                                        length:message_size
+                                  freeWhenDone:NO];
+    NSDictionary* object = [NSJSONSerialization JSONObjectWithData:data
+                                                           options:0
+                                                             error:nil];
+    if (![object isKindOfClass:NSDictionary.class]) {
+      return false;
+    }
+    if (NSNumber* number = object[@"id"]) {
+      auto then = then_.find(number.intValue);
+      if (then == then_.end()) {
+        return false;
+      }
+      Then done = std::move(then->second);
+      then_.erase(then);
+      NSDictionary* result = object[@"result"];
+      done([result isKindOfClass:NSDictionary.class] ? result : nil);
+      return true;
+    }
+    if ([object[@"method"] isEqualToString:@"Target.attachedToTarget"]) {
+      Attached(browser, object[@"params"], object[@"sessionId"]);
+      return true;
+    }
+    return false;
+  }
+
+  void OnDevToolsEvent(CefRefPtr<CefBrowser> browser,
+                       const CefString& method,
+                       const void* params,
+                       size_t params_size) override {
+    if (method != "Target.attachedToTarget") {
+      return;
+    }
+    NSData* data = [NSData dataWithBytesNoCopy:const_cast<void*>(params)
+                                        length:params_size
+                                  freeWhenDone:NO];
+    Attached(browser,
+             [NSJSONSerialization JSONObjectWithData:data options:0 error:nil],
+             nil);
+  }
+
+ private:
+  static std::map<int, CefRefPtr<PopupMedia>>& All() {
+    static std::map<int, CefRefPtr<PopupMedia>> all;
+    return all;
+  }
+
+  void FollowWorkers(CefRefPtr<CefBrowser> browser, const std::string& target) {
+    own_attaches_[target]++;
+    CefRefPtr<PopupMedia> media(this);
+    Send(browser, "Target.attachToTarget",
+         "{\"targetId\":\"" + target + "\",\"flatten\":true}", "",
+         [media, browser](NSDictionary* result) {
+           if (NSString* session = result[@"sessionId"]) {
+             media->Send(browser, "Target.setAutoAttach", kAutoAttachWorkers,
+                         session.UTF8String, nullptr);
+           }
+         });
+  }
+
+  void Attached(CefRefPtr<CefBrowser> browser,
+                NSDictionary* params,
+                NSString* from) {
+    if (![params isKindOfClass:NSDictionary.class] || !params[@"sessionId"]) {
+      return;
+    }
+    NSDictionary* info = params[@"targetInfo"];
+    std::string session = [params[@"sessionId"] UTF8String];
+    std::string parent = from ? from.UTF8String : "";
+    std::string target = [info[@"targetId"] UTF8String] ?: "";
+    auto own = own_attaches_.find(target);
+    if (own != own_attaches_.end()) {
+      if (--own->second == 0) {
+        own_attaches_.erase(own);
+      }
+      return;
+    }
+    if ([info[@"type"] isEqualToString:@"page"]) {
+      return;
+    }
+    if ([info[@"type"] isEqualToString:@"iframe"]) {
+      static const std::string script = [] {
+        NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+          @"source" : @(MediaShim().c_str()),
+          @"runImmediately" : @YES
+        }
+                                                       options:0
+                                                         error:nil];
+        return std::string(static_cast<const char*>(json.bytes), json.length);
+      }();
+      Send(browser, "Page.enable", "", session, nullptr);
+      Send(browser, "Page.addScriptToEvaluateOnNewDocument", script, session,
+           nullptr);
+      Send(browser, "Target.setAutoAttach", kAutoAttachFrames, session,
+           nullptr);
+      FollowWorkers(browser, target);
+      return;
+    }
+    bool shim = [info[@"type"] isEqualToString:@"worker"] &&
+                ![info[@"title"] isEqualToString:@(kConverterWorker)];
+    if (shim) {
+      Send(browser, "Runtime.evaluate", WorkerShimParams(), session, nullptr);
+      Send(browser, "Target.setAutoAttach", kAutoAttachWorkers, session,
+           nullptr);
+    }
+    CefRefPtr<PopupMedia> media(this);
+    auto resumed = std::make_shared<bool>(false);
+    Send(
+        browser, "Runtime.runIfWaitingForDebugger", "", session,
+        [media, browser, session, parent, shim, resumed](NSDictionary* result) {
+          *resumed = result != nil;
+          if (!shim) {
+            media->Send(browser, "Target.detachFromTarget",
+                        "{\"sessionId\":\"" + session + "\"}", parent, nullptr);
+          }
+        });
+    dispatch_after(
+        dispatch_time(DISPATCH_TIME_NOW, kWorkerResumeSeconds * NSEC_PER_SEC),
+        dispatch_get_main_queue(), ^{
+          if (!*resumed) {
+            media->Send(browser, "Target.detachFromTarget",
+                        "{\"sessionId\":\"" + session + "\"}", parent, nullptr);
+          }
+        });
+  }
+
+  void Send(CefRefPtr<CefBrowser> browser,
+            const std::string& method,
+            const std::string& params,
+            const std::string& session,
+            Then then) {
+    int id = next_id_++;
+    std::string message =
+        "{\"id\":" + std::to_string(id) + ",\"method\":\"" + method + "\"";
+    if (!session.empty()) {
+      message += ",\"sessionId\":\"" + session + "\"";
+    }
+    if (!params.empty()) {
+      message += ",\"params\":" + params;
+    }
+    message += "}";
+    if (then) {
+      then_[id] = std::move(then);
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      browser->GetHost()->SendDevToolsMessage(message.data(), message.size());
+    });
+  }
+
+  CefRefPtr<CefRegistration> registration_;
+  CodecDelivery codec_;
+  std::map<int, Then> then_;
+  std::map<std::string, int> own_attaches_;
+  int next_id_ = 1500000000;
+
+  IMPLEMENT_REFCOUNTING(PopupMedia);
+};
+
+class AuxiliaryClient : public BaseClient,
+                        public CefLifeSpanHandler,
+                        public CefDisplayHandler,
+                        public CefLoadHandler {
  public:
   static CefRefPtr<AuxiliaryClient> Get() {
-    static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient);
+    static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient(false));
+    return instance;
+  }
+
+  static CefRefPtr<AuxiliaryClient> Popups() {
+    static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient(true));
     return instance;
   }
 
   CefRefPtr<CefLifeSpanHandler> GetLifeSpanHandler() override { return this; }
+  CefRefPtr<CefDisplayHandler> GetDisplayHandler() override {
+    return popups_ ? this : nullptr;
+  }
+  CefRefPtr<CefLoadHandler> GetLoadHandler() override {
+    return popups_ ? this : nullptr;
+  }
 
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
                      CefRefPtr<CefFrame> frame,
@@ -691,16 +1144,58 @@ class AuxiliaryClient : public BaseClient, public CefLifeSpanHandler {
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     g_browser_count++;
     g_auxiliary.push_back(browser);
+    if (popups_ && g_convert_video && !MediaShim().empty()) {
+      PopupMedia::Start(browser);
+    }
   }
 
   void OnBeforeClose(CefRefPtr<CefBrowser> browser) override {
+    PopupMedia::Stop(browser);
     std::erase_if(g_auxiliary, [&](const CefRefPtr<CefBrowser>& b) {
       return b->IsSame(browser);
     });
     BrowserGone();
   }
 
+  bool OnConsoleMessage(CefRefPtr<CefBrowser> browser,
+                        cef_log_severity_t level,
+                        const CefString& message,
+                        const CefString& source,
+                        int line) override {
+    std::string text = message.ToString();
+    bool request = text == kCodecRequest;
+    if (!request && text.rfind(kCodecFramePrefix, 0) != 0) {
+      return false;
+    }
+    if (CefRefPtr<PopupMedia> media = PopupMedia::For(browser)) {
+      if (request) {
+        media->codec().Requested(browser);
+      } else {
+        media->codec().Answered(browser,
+                                text.substr(strlen(kCodecFramePrefix)));
+      }
+    }
+    return true;
+  }
+
+  void OnLoadStart(CefRefPtr<CefBrowser> browser,
+                   CefRefPtr<CefFrame> frame,
+                   TransitionType transition_type) override {
+    if (!frame->IsMain() || !PopupMedia::For(browser)) {
+      return;
+    }
+    PopupMedia::For(browser)->codec().Reset();
+    std::string url = frame->GetURL().ToString();
+    if (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0) {
+      frame->ExecuteJavaScript(MediaShim(), "", 0);
+    }
+  }
+
  private:
+  explicit AuxiliaryClient(bool popups) : popups_(popups) {}
+
+  bool popups_;
+
   IMPLEMENT_REFCOUNTING(AuxiliaryClient);
 };
 
@@ -931,16 +1426,17 @@ class WebClient : public BaseClient,
       }
       default:
         windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
-        client = AuxiliaryClient::Get();
+        client = AuxiliaryClient::Popups();
         return false;
     }
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
     devtools_ = browser->GetHost()->AddDevToolsMessageObserver(this);
-    if (g_page_script || g_extension_script) {
+    if (g_page_script || g_extension_script || g_convert_video) {
       browser->GetHost()->ExecuteDevToolsMethod(0, "Page.enable", nullptr);
     }
+    SyncMediaShim(browser);
     [view_ engineDidCreateBrowser:browser];
     if (deferred_url_.empty()) {
       return;
@@ -1041,6 +1537,18 @@ class WebClient : public BaseClient,
       }
       return true;
     }
+    if (text == kCodecRequest) {
+      if (media_shim_) {
+        codec_.Requested(browser);
+      }
+      return true;
+    }
+    if (text.rfind(kCodecFramePrefix, 0) == 0) {
+      if (media_shim_) {
+        codec_.Answered(browser, text.substr(strlen(kCodecFramePrefix)));
+      }
+      return true;
+    }
     if (text.rfind(kThemePrefix, 0) == 0) {
       [view_ engineSetThemeColor:@(text.c_str() + strlen(kThemePrefix))];
       return true;
@@ -1111,6 +1619,7 @@ class WebClient : public BaseClient,
     }
     blocked_ = 0;
     [view_ engineSetBlockedCount:0];
+    codec_.Reset();
     console_errors_ = 0;
     console_warnings_ = 0;
     ReportConsole();
@@ -1124,6 +1633,9 @@ class WebClient : public BaseClient,
       frame->ExecuteJavaScript(script.UTF8String, "", 0);
     }
     bool web = url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0;
+    if (web && media_shim_ && !MediaShim().empty()) {
+      frame->ExecuteJavaScript(MediaShim(), "", 0);
+    }
     form_token_.clear();
     if (web && !g_form_script.empty()) {
       form_token_ = NSUUID.UUID.UUIDString.UTF8String;
@@ -1203,6 +1715,7 @@ class WebClient : public BaseClient,
     if (frame->IsMain()) {
       navigation_started_ = CFAbsoluteTimeGetCurrent();
       load_error_ = 0;
+      SyncMediaShim(browser);
       std::string url = request->GetURL().ToString();
       if (url == prepared_url_) {
         prepared_url_.clear();
@@ -1348,7 +1861,15 @@ class WebClient : public BaseClient,
   bool OnDevToolsMessage(CefRefPtr<CefBrowser> browser,
                          const void* message,
                          size_t message_size) override {
-    if (session_replies_.empty() && !following_frames_) {
+    static const char kAttached[] = "Target.attachedToTarget";
+    if (session_replies_.empty() && !following_frames_ && !media_shim_ &&
+        shim_workers_.empty() &&
+        !memmem(message, message_size, kAttached, strlen(kAttached))) {
+      return false;
+    }
+    static const char kSession[] = "\"sessionId\"";
+    if (session_replies_.empty() &&
+        !memmem(message, message_size, kSession, strlen(kSession))) {
       return false;
     }
     NSData* data = [NSData dataWithBytesNoCopy:const_cast<void*>(message)
@@ -1378,7 +1899,7 @@ class WebClient : public BaseClient,
     NSString* session = object[@"sessionId"];
     NSString* method = object[@"method"];
     if (session && method) {
-      HandleEvent(browser, method, object[@"params"]);
+      HandleEvent(browser, method, object[@"params"], session);
       return true;
     }
     return false;
@@ -1386,28 +1907,78 @@ class WebClient : public BaseClient,
 
   void HandleEvent(CefRefPtr<CefBrowser> browser,
                    NSString* method,
-                   NSDictionary* params) {
+                   NSDictionary* params,
+                   NSString* from = nil) {
     if (![params isKindOfClass:NSDictionary.class]) {
       return;
     }
     if ([method isEqualToString:@"Target.attachedToTarget"]) {
       NSDictionary* info = params[@"targetInfo"];
       NSString* session = params[@"sessionId"];
-      if (![info[@"type"] isEqualToString:@"iframe"] || !session) {
+      if (!session) {
+        return;
+      }
+      auto ignore = [](bool, const std::string&) {};
+      bool waiting = [params[@"waitingForDebugger"] boolValue];
+      std::string target = [info[@"targetId"] UTF8String] ?: "";
+      auto own = own_attaches_.find(target);
+      if (own != own_attaches_.end()) {
+        if (--own->second == 0) {
+          own_attaches_.erase(own);
+        }
+        return;
+      }
+      if ([info[@"type"] isEqualToString:@"page"]) {
+        return;
+      }
+      if (![info[@"type"] isEqualToString:@"iframe"]) {
+        bool shim = [info[@"type"] isEqualToString:@"worker"] && media_shim_ &&
+                    ![info[@"title"] isEqualToString:@(kConverterWorker)];
+        std::string child = session.UTF8String;
+        std::string parent = from ? from.UTF8String : "";
+        if (shim) {
+          shim_workers_[child] = parent;
+          SendInSession(browser, "Runtime.evaluate", WorkerShimParams(), child,
+                        ignore);
+          SendInSession(browser, "Target.setAutoAttach", kAutoAttachWorkers,
+                        child, ignore);
+        }
+        CefRefPtr<WebClient> client(this);
+        auto resumed = std::make_shared<bool>(false);
+        SendInSession(browser, "Runtime.runIfWaitingForDebugger", "", child,
+                      [client, browser, child, parent, shim, resumed](
+                          bool ok, const std::string&) {
+                        *resumed = ok;
+                        if (!shim) {
+                          client->Detach(browser, child, parent);
+                        }
+                      });
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     kWorkerResumeSeconds * NSEC_PER_SEC),
+                       dispatch_get_main_queue(), ^{
+                         if (!*resumed) {
+                           client->shim_workers_.erase(child);
+                           client->Detach(browser, child, parent);
+                         }
+                       });
         return;
       }
       [view_ engineFrameAttached:info[@"targetId"] session:session];
-      CallInSession(browser, "Target.setAutoAttach",
-                    "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,"
-                    "\"flatten\":true}",
-                    session.UTF8String, [](bool, const std::string&) {});
-      if ([params[@"waitingForDebugger"] boolValue]) {
-        CallInSession(browser, "Runtime.runIfWaitingForDebugger", "",
-                      session.UTF8String, [](bool, const std::string&) {});
+      if (media_shim_ && !MediaShim().empty()) {
+        AddMediaShim(browser, session.UTF8String);
+        FollowWorkers(browser, target);
+      }
+      SendInSession(browser, "Target.setAutoAttach", kAutoAttachFrames,
+                    session.UTF8String, ignore);
+      if (waiting) {
+        SendInSession(browser, "Runtime.runIfWaitingForDebugger", "",
+                      session.UTF8String, ignore);
       }
     } else if ([method isEqualToString:@"Target.detachedFromTarget"]) {
       if (NSString* session = params[@"sessionId"]) {
         [view_ engineFrameDetached:session];
+        std::erase(worker_sessions_, std::string(session.UTF8String));
+        shim_workers_.erase(session.UTF8String);
       }
     } else if (recording_network_ && [method hasPrefix:@"Network."]) {
       [view_ engineNetworkEvent:method params:params];
@@ -1419,10 +1990,152 @@ class WebClient : public BaseClient,
       return;
     }
     following_frames_ = true;
+    UpdateAutoAttach(browser);
+  }
+
+  void UpdateAutoAttach(CefRefPtr<CefBrowser> browser) {
+    bool attach = following_frames_ || media_shim_;
+    if (!attach && !auto_attached_) {
+      return;
+    }
+    auto_attached_ = attach;
     CallRaw(browser, "Target.setAutoAttach",
-            "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
-            "true}",
+            attach ? kAutoAttachFrames
+                   : "{\"autoAttach\":false,\"waitForDebuggerOnStart\":false}",
             [](bool, const std::string&) {});
+  }
+
+  void FollowWorkers(CefRefPtr<CefBrowser> browser, const std::string& target) {
+    CefRefPtr<WebClient> client(this);
+    if (target.empty()) {
+      if (following_workers_) {
+        return;
+      }
+      following_workers_ = true;
+      SendInSession(browser, "Target.getTargetInfo", "", "",
+                    [client, browser](bool ok, const std::string& json) {
+                      NSDictionary* result = ok ? ParseObject(json) : nil;
+                      NSString* page = result[@"targetInfo"][@"targetId"];
+                      if (page && client->media_shim_) {
+                        client->FollowWorkers(browser, page.UTF8String);
+                      }
+                    });
+      return;
+    }
+    own_attaches_[target]++;
+    std::string params = "{\"targetId\":\"" + target + "\",\"flatten\":true}";
+    SendInSession(browser, "Target.attachToTarget", params, "",
+                  [client, browser](bool ok, const std::string& json) {
+                    NSString* session =
+                        ok ? ParseObject(json)[@"sessionId"] : nil;
+                    if (!session) {
+                      return;
+                    }
+                    client->worker_sessions_.push_back(session.UTF8String);
+                    client->SendInSession(
+                        browser, "Target.setAutoAttach", kAutoAttachWorkers,
+                        session.UTF8String, [](bool, const std::string&) {});
+                  });
+  }
+
+  void UnfollowWorkers(CefRefPtr<CefBrowser> browser) {
+    following_workers_ = false;
+    for (const auto& [session, parent] : shim_workers_) {
+      Detach(browser, session, parent);
+    }
+    shim_workers_.clear();
+    for (const std::string& session : worker_sessions_) {
+      SendInSession(browser, "Target.detachFromTarget",
+                    "{\"sessionId\":\"" + session + "\"}", "",
+                    [](bool, const std::string&) {});
+    }
+    worker_sessions_.clear();
+  }
+
+  void SyncMediaShim(CefRefPtr<CefBrowser> browser) {
+    bool wanted = g_convert_video && !MediaShim().empty();
+    if (wanted == media_shim_) {
+      return;
+    }
+    media_shim_ = wanted;
+    if (!wanted) {
+      RemoveDocumentScript(browser->GetHost(), media_script_);
+      media_script_.clear();
+      UpdateAutoAttach(browser);
+      UnfollowWorkers(browser);
+      return;
+    }
+    Call(browser, "Page.enable", nullptr);
+    CefRefPtr<CefDictionaryValue> params = CefDictionaryValue::Create();
+    params->SetString("source", MediaShim());
+    CefRefPtr<WebClient> client(this);
+    Call(browser, "Page.addScriptToEvaluateOnNewDocument", params,
+         [client, browser](CefRefPtr<CefDictionaryValue> result) {
+           std::string identifier =
+               result ? result->GetString("identifier").ToString() : "";
+           if (client->media_shim_) {
+             client->media_script_ = identifier;
+           } else {
+             client->RemoveDocumentScript(browser->GetHost(), identifier);
+           }
+         });
+    UpdateAutoAttach(browser);
+    FollowWorkers(browser, "");
+  }
+
+  void AddMediaShim(CefRefPtr<CefBrowser> browser, const std::string& session) {
+    static const std::string script = [] {
+      NSData* json = [NSJSONSerialization dataWithJSONObject:@{
+        @"source" : @(MediaShim().c_str()),
+        @"runImmediately" : @YES
+      }
+                                                     options:0
+                                                       error:nil];
+      return std::string(static_cast<const char*>(json.bytes), json.length);
+    }();
+    auto ignore = [](bool, const std::string&) {};
+    SendInSession(browser, "Page.enable", "", session, ignore);
+    SendInSession(browser, "Page.addScriptToEvaluateOnNewDocument", script,
+                  session, ignore);
+  }
+
+  void Detach(CefRefPtr<CefBrowser> browser,
+              const std::string& session,
+              const std::string& parent) {
+    std::string params = "{\"sessionId\":\"" + session + "\"}";
+    auto ignore = [](bool, const std::string&) {};
+    SendInSession(browser, "Target.detachFromTarget", params, parent, ignore);
+  }
+
+  void SendInSession(CefRefPtr<CefBrowser> browser,
+                     const std::string& method,
+                     const std::string& params,
+                     const std::string& session,
+                     RawReply done) {
+    int message_id = next_session_message_++;
+    std::string message = "{\"id\":" + std::to_string(message_id) +
+                          ",\"method\":\"" + method + "\"";
+    if (!session.empty()) {
+      message += ",\"sessionId\":\"" + session + "\"";
+    }
+    if (!params.empty()) {
+      message += ",\"params\":" + params;
+    }
+    message += "}";
+    session_replies_[message_id] = std::move(done);
+    CefRefPtr<WebClient> client(this);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (browser->GetHost()->SendDevToolsMessage(message.data(),
+                                                  message.size())) {
+        return;
+      }
+      auto reply = client->session_replies_.find(message_id);
+      if (reply != client->session_replies_.end()) {
+        RawReply failed = std::move(reply->second);
+        client->session_replies_.erase(reply);
+        failed(false, "{\"message\":\"the command could not be sent\"}");
+      }
+    });
   }
 
   void CallInSession(CefRefPtr<CefBrowser> browser,
@@ -1860,6 +2573,14 @@ class WebClient : public BaseClient,
   std::map<int, RawReply> session_replies_;
   int next_session_message_ = 1000000000;
   bool network_enabled_ = false;
+  bool media_shim_ = false;
+  bool auto_attached_ = false;
+  bool following_workers_ = false;
+  std::vector<std::string> worker_sessions_;
+  std::map<std::string, std::string> shim_workers_;
+  std::map<std::string, int> own_attaches_;
+  std::string media_script_;
+  CodecDelivery codec_;
 
   IMPLEMENT_REFCOUNTING(WebClient);
 };
@@ -2195,6 +2916,10 @@ class CookieKeys : public CefCookieVisitor {
 
 + (void)setFormScript:(NSString*)script {
   g_form_script = script.UTF8String;
+}
+
++ (void)setConvertsVideo:(BOOL)converts {
+  g_convert_video = converts;
 }
 
 + (BOOL)usesMockKeychain {

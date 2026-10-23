@@ -1,0 +1,941 @@
+[
+  {
+    "name": "x-video",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-av",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "samples/ainit.mp4",
+          "samples/a0.m4s",
+          "samples/a1.m4s",
+          "samples/a2.m4s",
+          "samples/a3.m4s",
+          "samples/a4.m4s",
+          "samples/a5.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-abr",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/s-init.mp4",
+          "samples/s1.m4s",
+          "samples/vinit.mp4",
+          "samples/v2.m4s"
+        ],
+        "naturals": [
+          [
+            720,
+            1280,
+            null
+          ],
+          [
+            320,
+            568,
+            3
+          ],
+          [
+            720,
+            1280,
+            6
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-low",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.4D4015\"",
+        "files": [
+          "samples/s-init.mp4",
+          "samples/s0.m4s",
+          "samples/s1.m4s",
+          "samples/s2.m4s",
+          "samples/s3.m4s",
+          "samples/s4.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "samples/lo-init.mp4",
+          "samples/lo0.m4s",
+          "samples/lo1.m4s",
+          "samples/lo2.m4s",
+          "samples/lo3.m4s",
+          "samples/lo4.m4s",
+          "samples/lo5.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "muxed",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d,mp4a.40.2\"",
+        "files": [
+          "fixtures/muxed.mp4"
+        ],
+        "split": 7001
+      }
+    ]
+  },
+  {
+    "name": "midgop",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "split": 9000
+      }
+    ]
+  },
+  {
+    "name": "fixture-av",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/video-init.mp4",
+          "fixtures/video-0.m4s",
+          "fixtures/video-1.m4s",
+          "fixtures/video-2.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "fixtures/aac-init.mp4",
+          "fixtures/aac-0.m4s",
+          "fixtures/aac-1.m4s",
+          "fixtures/aac-2.m4s",
+          "fixtures/aac-3.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "heaac",
+    "sbs": [
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.5\"",
+        "files": [
+          "fixtures/heaac-init.mp4",
+          "fixtures/heaac-0.m4s",
+          "fixtures/heaac-1.m4s",
+          "fixtures/heaac-2.m4s",
+          "fixtures/heaac-3.m4s"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "gif",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/gif.mp4"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "progressive",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-gif",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "samples/gif.mp4"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-fallback",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "samples/v.mp4"
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-half",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              360,
+              640
+            ]
+          }
+        },
+        "lastSize": [
+          360,
+          640
+        ],
+        "natural": [
+          720,
+          1280
+        ]
+      }
+    ]
+  },
+  {
+    "name": "x-resize",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              1440,
+              2560
+            ]
+          },
+          "3": {
+            "size": [
+              180,
+              320
+            ]
+          }
+        },
+        "lastSize": [
+          180,
+          320
+        ],
+        "natural": [
+          720,
+          1280
+        ]
+      }
+    ]
+  },
+  {
+    "name": "abort-after-init",
+    "noExpect": true,
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4+samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s"
+        ],
+        "actions": {
+          "0": {
+            "abort": true
+          }
+        },
+        "naturals": [
+          [
+            720,
+            1280,
+            null
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "name": "sparse",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/sparse.mp4"
+        ],
+        "split": 20000
+      }
+    ]
+  },
+  {
+    "name": "hostile",
+    "noExpect": true,
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/video-init.mp4",
+          "fixtures/video-0.m4s",
+          "fixtures/video-1.m4s",
+          "fixtures/video-2.m4s"
+        ],
+        "actions": {
+          "1": {
+            "patch": [
+              {
+                "box": "trun",
+                "set": {
+                  "8": 1,
+                  "12": 4294967295
+                }
+              }
+            ],
+            "expect": "error"
+          },
+          "2": {
+            "patch": [
+              {
+                "box": "moof",
+                "set": {
+                  "0": 2147483632
+                }
+              }
+            ],
+            "expect": "error"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "hostile-progressive",
+    "errorsOnly": true,
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "actions": {
+          "0": {
+            "patch": [
+              {
+                "box": "stsz",
+                "set": {
+                  "12": 1,
+                  "16": 2147483647
+                }
+              }
+            ],
+            "expect": "error"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "hostile-ctts",
+    "noExpect": true,
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "actions": {
+          "0": {
+            "patch": [
+              {
+                "box": "ctts",
+                "set": {
+                  "16": 4294967295
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "x-fps",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              360,
+              640,
+              10
+            ]
+          }
+        },
+        "natural": [
+          720,
+          1280
+        ]
+      }
+    ],
+    "expectStats": {
+      "capped": 100
+    }
+  },
+  {
+    "name": "reappend",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          3,
+          4
+        ]
+      }
+    ]
+  },
+  {
+    "name": "rest",
+    "tune": {
+      "rest": 300
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "2": {
+            "wait": 1000
+          },
+          "4": {
+            "wait": 1000
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rested": 2
+    }
+  },
+  {
+    "name": "x-rest",
+    "tune": {
+      "rest": 300
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "3": {
+            "wait": 1000
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rested": 1
+    }
+  },
+  {
+    "name": "recycle",
+    "tune": {
+      "bigMemory": 1
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ]
+      },
+      {
+        "mime": "audio/mp4; codecs=\"mp4a.40.2\"",
+        "files": [
+          "samples/ainit.mp4",
+          "samples/a0.m4s",
+          "samples/a1.m4s",
+          "samples/a2.m4s",
+          "samples/a3.m4s",
+          "samples/a4.m4s",
+          "samples/a5.m4s"
+        ]
+      }
+    ],
+    "expectStats": {
+      "recycled": 4
+    }
+  },
+  {
+    "name": "recycle-midgop",
+    "tune": {
+      "bigMemory": 1
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "2": {
+            "drain": true
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "recycled": 1,
+      "decodeOnly": 1
+    }
+  },
+  {
+    "name": "huge-duration",
+    "errorsOnly": true,
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "actions": {
+          "0": {
+            "patch": [
+              {
+                "box": "mdhd",
+                "set": {
+                  "20": 1
+                }
+              },
+              {
+                "box": "stts",
+                "set": {
+                  "20": 4294967295
+                }
+              }
+            ],
+            "expect": "error"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "init-replace",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "3": {
+            "patch": [
+              {
+                "box": "mvhd",
+                "set": {
+                  "12": 12345
+                }
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  {
+    "name": "cadence-24",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate24.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-25",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate25.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-30",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate30.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-50",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate50.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "cadence-60",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001e\"",
+        "files": [
+          "samples/rate60.mp4"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              640,
+              360,
+              15
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "encoded": [
+        58,
+        62
+      ]
+    }
+  },
+  {
+    "name": "x-uncap",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64001F\"",
+        "files": [
+          "samples/vinit.mp4",
+          "samples/v0.m4s",
+          "samples/v1.m4s",
+          "samples/v2.m4s",
+          "samples/v3.m4s",
+          "samples/v4.m4s"
+        ],
+        "actions": {
+          "0": {
+            "size": [
+              360,
+              640,
+              10
+            ]
+          },
+          "3": {
+            "size": [
+              360,
+              640,
+              0
+            ]
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rerated": 1,
+      "resized": [
+        0,
+        0
+      ]
+    }
+  },
+  {
+    "name": "avc3",
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc3.64000d\"",
+        "files": [
+          "fixtures/avc3.mp4"
+        ],
+        "split": 9000,
+        "naturals": [
+          [
+            320,
+            180,
+            null
+          ],
+          [
+            480,
+            270,
+            1.067
+          ]
+        ]
+      }
+    ]
+  },
+  {
+    "name": "progressive-start",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "fixtures/progressive.mp4"
+        ],
+        "split": 4096,
+        "start": 1.2,
+        "needs": 1
+      }
+    ],
+    "expected": [
+      [
+        1.0,
+        2.0
+      ]
+    ],
+    "expectStats": {
+      "decoded": [
+        28,
+        34
+      ]
+    }
+  },
+  {
+    "name": "moov-last",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "samples/big-last.mp4"
+        ],
+        "split": 262144,
+        "needs": 2
+      }
+    ]
+  },
+  {
+    "name": "moov-last-start",
+    "sbs": [
+      {
+        "mime": "progressive",
+        "files": [
+          "samples/big-last.mp4"
+        ],
+        "split": 262144,
+        "start": 20.5,
+        "needs": 2
+      }
+    ],
+    "expected": [
+      [
+        20.0,
+        30.0
+      ]
+    ],
+    "expectStats": {
+      "decoded": [
+        290,
+        330
+      ]
+    }
+  },
+  {
+    "name": "keepalive",
+    "tune": {
+      "rest": 300
+    },
+    "sbs": [
+      {
+        "mime": "video/mp4; codecs=\"avc1.64000d\"",
+        "files": [
+          "fixtures/midgop.mp4"
+        ],
+        "units": [
+          0,
+          1,
+          2,
+          3,
+          4
+        ],
+        "actions": {
+          "2": {
+            "wait": 1000,
+            "keepalive": true
+          }
+        }
+      }
+    ],
+    "expectStats": {
+      "rested": [
+        0,
+        0
+      ]
+    }
+  }
+]

@@ -44,12 +44,14 @@ step() {
 
 ruff() { uvx --quiet "ruff@$RUFF_VERSION" "$@"; }
 OBJC=(shell/engine/MBEngine.h shell/engine/MBEngine.mm shell/helper/helper_main.mm)
-SHELL_SCRIPTS=(scripts/*.sh .githooks/*)
+SHELL_SCRIPTS=(scripts/*.sh .githooks/* media/tests/fixtures/make.sh)
 
 if [[ "$FIX" == 1 ]]; then
   scripts/comments.py --fix
   cargo fmt --manifest-path core/Cargo.toml
   cargo clippy --manifest-path core/Cargo.toml --all-targets --fix --allow-dirty --allow-staged --quiet
+  cargo fmt --manifest-path media/Cargo.toml
+  cargo clippy --manifest-path media/Cargo.toml --all-targets --fix --allow-dirty --allow-staged --quiet
   swiftformat --quiet .
   swiftlint lint --fix --quiet
   clang-format -i "${OBJC[@]}"
@@ -62,6 +64,10 @@ step "comments" scripts/comments.py
 step "rustfmt" cargo fmt --manifest-path core/Cargo.toml --check
 step "clippy" cargo clippy --manifest-path core/Cargo.toml --all-targets --quiet -- -D warnings
 step "cargo test" cargo test --manifest-path core/Cargo.toml --quiet
+step "rustfmt (media)" cargo fmt --manifest-path media/Cargo.toml --check
+step "clippy (media)" cargo clippy --manifest-path media/Cargo.toml --all-targets --quiet -- -D warnings
+step "clippy (media, wasm)" cargo clippy --manifest-path media/Cargo.toml --target wasm32-unknown-unknown --quiet -- -D warnings
+step "cargo test (media)" cargo test --manifest-path media/Cargo.toml --quiet
 step "swiftformat" swiftformat --lint --quiet .
 step "swiftlint" scripts/swiftlint-ratchet.py
 step "clang-format" clang-format --dry-run --Werror "${OBJC[@]}"

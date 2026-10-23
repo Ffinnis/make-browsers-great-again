@@ -71,6 +71,7 @@ pub struct Snapshot {
     pub strict_site_isolation: bool,
     pub can_reopen: bool,
     pub block_ads: bool,
+    pub convert_video: bool,
     pub archive_after_hours: u32,
     pub cleanup_answered: bool,
     pub keep_awake_sites: Vec<String>,
@@ -486,6 +487,7 @@ impl BrowserCore {
             strict_site_isolation: s.policy.strict_site_isolation,
             can_reopen: !s.closed.is_empty(),
             block_ads: s.block_ads,
+            convert_video: s.convert_video,
             archive_after_hours: s.policy.archive_after_hours,
             cleanup_answered: s.cleanup_answered,
             keep_awake_sites: s.keep_awake.clone(),
@@ -876,6 +878,10 @@ impl BrowserCore {
 
     pub fn isolated_origins(&self) -> Vec<String> {
         model::ALWAYS_ISOLATED_ORIGINS.iter().map(ToString::to_string).collect()
+    }
+
+    pub fn set_convert_video(&self, enabled: bool) {
+        self.mutate(|s, _| s.convert_video = enabled);
     }
 
     pub fn resolve_input(&self, text: String) -> String {

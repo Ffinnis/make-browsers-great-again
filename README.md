@@ -48,6 +48,8 @@ tabs back where they were. Settings ▸ General turns this off.
 - **Ad and tracker blocking.** EasyList, EasyPrivacy and uBlock Origin's
   lists, matched by Brave's engine, plus cosmetic rules, scriptlets and your
   own filters.
+- **H.264 video** on X, Reddit, Twitch and other sites the engine can't play
+  natively, converted to VP9 in the page as it plays.
 - **Chrome extensions** from the Chrome Web Store, with toolbar buttons,
   popups, menus and shortcuts. Manifest V3 only, so use uBlock Origin Lite.
 - **Import** spaces, pinned tabs and favorites from Arc; bookmarks and tabs

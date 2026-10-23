@@ -173,6 +173,8 @@ pub struct State {
     pub block_ads: bool,
     #[serde(default)]
     pub ads_allowed: Vec<String>,
+    #[serde(default = "default_convert_video")]
+    pub convert_video: bool,
     #[serde(skip)]
     pub closed: Vec<Closed>,
     #[serde(skip)]
@@ -188,6 +190,10 @@ fn default_onboarded() -> bool {
 }
 
 fn default_block_ads() -> bool {
+    true
+}
+
+fn default_convert_video() -> bool {
     true
 }
 
@@ -211,6 +217,7 @@ impl State {
             cleanup_answered: false,
             block_ads: true,
             ads_allowed: Vec::new(),
+            convert_video: true,
             closed: Vec::new(),
             shown_elsewhere: Vec::new(),
         };
