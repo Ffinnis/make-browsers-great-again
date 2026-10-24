@@ -35,6 +35,11 @@
 @property(nonatomic, readonly) BOOL answered;
 @end
 
+@interface MBDownload ()
+- (instancetype)initWithItem:(CefRefPtr<CefDownloadItem>)item
+                       state:(MBDownloadState)state;
+@end
+
 @interface MBWebView ()
 - (void)engineAddPrompt:(MBPermissionPrompt*)prompt;
 - (void)engineDidCreateBrowser:(CefRefPtr<CefBrowser>)browser;
@@ -82,6 +87,8 @@ MBPageScript g_extension_script = nil;
 const char kBridgeOrigin[] = "https://mbga-extension.invalid/";
 bool g_reject_drops = false;
 bool g_convert_video = false;
+void (^g_download_handler)(MBDownload* download) = nil;
+std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>> g_downloads;
 
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
 constexpr char kFormPrefix[] = "__mbga_form:";
@@ -593,6 +600,19 @@ NSString* UniqueDownloadPath(NSString* suggested) {
   return path;
 }
 
+MBDownloadState DownloadState(CefRefPtr<CefDownloadItem> item) {
+  if (item->IsComplete()) {
+    return MBDownloadStateDone;
+  }
+  if (item->IsCanceled()) {
+    return MBDownloadStateCanceled;
+  }
+  if (item->IsInterrupted()) {
+    return MBDownloadStateFailed;
+  }
+  return item->IsPaused() ? MBDownloadStatePaused : MBDownloadStateRunning;
+}
+
 void AskPermission(CefRefPtr<CefBrowser> browser,
                    const CefString& origin,
                    NSString* action,
@@ -858,10 +878,21 @@ class BaseClient : public CefClient,
   void OnDownloadUpdated(CefRefPtr<CefBrowser> browser,
                          CefRefPtr<CefDownloadItem> download_item,
                          CefRefPtr<CefDownloadItemCallback> callback) override {
-    if (download_item->IsComplete()) {
+    MBDownloadState state = DownloadState(download_item);
+    uint32_t identifier = download_item->GetId();
+    if (state == MBDownloadStateRunning || state == MBDownloadStatePaused) {
+      g_downloads[identifier] = callback;
+    } else {
+      g_downloads.erase(identifier);
+    }
+    if (state == MBDownloadStateDone) {
       [NSDistributedNotificationCenter.defaultCenter
           postNotificationName:@"com.apple.DownloadFileFinished"
                         object:ToNS(download_item->GetFullPath())];
+    }
+    if (g_download_handler) {
+      g_download_handler([[MBDownload alloc] initWithItem:download_item
+                                                    state:state]);
     }
   }
 
@@ -2786,6 +2817,24 @@ class CookieKeys : public CefCookieVisitor {
 
 }
 
+@implementation MBDownload
+
+- (instancetype)initWithItem:(CefRefPtr<CefDownloadItem>)item
+                       state:(MBDownloadState)state {
+  if ((self = [super init])) {
+    _identifier = item->GetId();
+    _url = ToNS(item->GetURL());
+    _path = ToNS(item->GetFullPath());
+    _received = item->GetReceivedBytes();
+    _total = item->GetTotalBytes();
+    _speed = item->GetCurrentSpeed();
+    _state = state;
+  }
+  return self;
+}
+
+@end
+
 @implementation MBCookie
 @end
 
@@ -3036,6 +3085,31 @@ class CookieKeys : public CefCookieVisitor {
     }
   }];
   return YES;
+}
+
++ (void)setDownloadHandler:(void (^)(MBDownload*))handler {
+  g_download_handler = handler;
+}
+
++ (void)cancelDownload:(uint32_t)identifier {
+  auto it = g_downloads.find(identifier);
+  if (it != g_downloads.end()) {
+    it->second->Cancel();
+  }
+}
+
++ (void)pauseDownload:(uint32_t)identifier {
+  auto it = g_downloads.find(identifier);
+  if (it != g_downloads.end()) {
+    it->second->Pause();
+  }
+}
+
++ (void)resumeDownload:(uint32_t)identifier {
+  auto it = g_downloads.find(identifier);
+  if (it != g_downloads.end()) {
+    it->second->Resume();
+  }
 }
 
 + (void)setLoadsExtensionHelper:(BOOL)loads {

@@ -24,6 +24,7 @@ guard MBEngine.start(
     fatalError("Failed to start the browser engine")
 }
 MBEngine.setConvertsVideo(core.snapshot().convertVideo)
+MainActor.assumeIsolated { DownloadCenter.shared.start(core: core) }
 
 let appDelegate = MainActor.assumeIsolated { AppDelegate(core: core) }
 app.delegate = appDelegate

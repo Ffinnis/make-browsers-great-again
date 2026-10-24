@@ -670,20 +670,14 @@ private final class SpacePagerView: FlippedView {
 
 private final class SidebarBottomBar: FlippedView {
     private let store: BrowserStore
-    private let downloads: SymbolButton
+    private let downloads = DownloadsButton()
     private let add: SymbolButton
     private var dots: [SpaceDotView] = []
 
     init(store: BrowserStore) {
         self.store = store
-        downloads = SymbolButton("arrow.down.circle") {
-            if let folder = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
-                NSWorkspace.shared.open(folder)
-            }
-        }
         add = SymbolButton("plus")
         super.init(frame: .zero)
-        downloads.toolTip = "Downloads"
         add.action = { [weak add] in
             guard let add else { return }
             Menus.newItem(store: store).popUp(positioning: nil, at: NSPoint(x: 0, y: add.bounds.height + 4), in: add)

@@ -460,6 +460,53 @@ fn navigations_are_recorded_in_history_and_persisted() {
 }
 
 #[test]
+fn downloads_are_listed_newest_first_and_interrupted_ones_fail_after_a_restart() {
+    use downloads::DownloadState;
+    let dir = temp_dir("downloads");
+    let core = BrowserCore::new(dir.clone());
+    let first = core.start_download("https://a.example.com/a.zip".into(), "/tmp/a.zip".into());
+    let second = core.start_download("https://b.example.com/b.pdf".into(), String::new());
+    core.update_download(first, String::new(), 50, 0, DownloadState::Done);
+    core.update_download(second, "/tmp/b.pdf".into(), 10, 100, DownloadState::Running);
+    let listed = core.downloads();
+    assert_eq!(listed.iter().map(|d| d.id).collect::<Vec<_>>(), vec![second, first]);
+    assert_eq!((listed[1].received, listed[1].total, listed[1].path.as_str()), (50, 50, "/tmp/a.zip"));
+    assert_eq!(listed[0].path, "/tmp/b.pdf");
+    core.update_download(first, String::new(), 0, 0, DownloadState::Failed);
+    assert_eq!(core.downloads()[1].state, DownloadState::Done);
+    assert!(core.persist());
+
+    let reopened = BrowserCore::new(dir.clone());
+    let listed = reopened.downloads();
+    assert_eq!(listed[0].state, DownloadState::Failed);
+    assert_eq!(listed[1].state, DownloadState::Done);
+    let third = reopened.start_download("https://c.example.com/c".into(), String::new());
+    assert!(third > second);
+    reopened.clear_downloads();
+    assert_eq!(reopened.downloads().iter().map(|d| d.id).collect::<Vec<_>>(), vec![third]);
+    reopened.remove_download(third);
+    assert_eq!(reopened.downloads().len(), 1);
+    reopened.update_download(third, String::new(), 0, 0, DownloadState::Canceled);
+    reopened.remove_download(third);
+    assert!(reopened.downloads().is_empty());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn old_finished_downloads_make_room_but_running_ones_stay() {
+    use downloads::{DownloadState, Downloads};
+    let mut list = Downloads::default();
+    let running = list.start("https://a.example.com/big", "", 0);
+    for n in 1..=150 {
+        let id = list.start("https://a.example.com/small", "", n);
+        list.update(id, "", 1, 1, DownloadState::Done);
+    }
+    assert_eq!(list.items().len(), 100);
+    assert!(list.items().iter().any(|d| d.id == running));
+    assert_eq!(list.items()[0].started_ms, 150);
+}
+
+#[test]
 fn closing_clearing_and_deleting_folders_can_be_undone() {
     let mut s = State::new_default();
     let sp = home(&s);
