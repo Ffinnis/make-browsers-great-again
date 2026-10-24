@@ -63,6 +63,7 @@ typedef BOOL (^MBEarlyScript)(NSString* page);
 - (void)webView:(MBWebView*)view
     choseContextMenuItem:(NSString*)itemID
                  context:(NSDictionary*)context;
+- (BOOL)webView:(MBWebView*)view hostsPopup:(MBWebView*)popup size:(NSSize)size;
 @end
 
 @interface MBCookie : NSObject
