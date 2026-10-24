@@ -1,10 +1,85 @@
 import AppKit
 
 @MainActor
+enum ExtensionPins {
+    static let defaultsKey = "ExtensionPins"
+    static let limit = 3
+    static let fullMessage = "The toolbar holds \(limit) extensions. Unpin one first."
+
+    static func pinned(in profile: String, among items: [InstalledExtension]) -> [String] {
+        let usable = Set(items.filter { $0.enabled && $0.hasAction }.map(\.id))
+        if let ids = saved[profile] { return ids.filter(usable.contains) }
+        let ids = Array(items.filter { usable.contains($0.id) }.prefix(limit).map(\.id))
+        if !ids.isEmpty { save(ids, in: profile) }
+        return ids
+    }
+
+    @discardableResult
+    static func toggle(_ id: String, in profile: String, among items: [InstalledExtension]) -> Bool {
+        var ids = pinned(in: profile, among: items)
+        if let index = ids.firstIndex(of: id) {
+            ids.remove(at: index)
+        } else if ids.count < limit {
+            ids.append(id)
+        } else {
+            return false
+        }
+        save(ids, in: profile)
+        BrowserStore.extensionsChanged()
+        return true
+    }
+
+    private static var saved: [String: [String]] {
+        UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: [String]] ?? [:]
+    }
+
+    private static func save(_ ids: [String], in profile: String) {
+        var all = saved
+        all[profile] = ids
+        UserDefaults.standard.set(all, forKey: defaultsKey)
+    }
+}
+
+@MainActor
+extension CommandAction {
+    static func extensionActions(for store: BrowserStore) -> [Self] {
+        let host = store.extensions
+        let profile = host.profilePath(store.activeSpace.profileId)
+        let all = host.extensions(in: profile)
+        let pins = ExtensionPins.pinned(in: profile, among: all)
+        var list: [Self] = []
+        for item in all where item.enabled {
+            let key = ExtensionHost.Key(profile: profile, extensionID: item.id)
+            let image = item.icon(size: 16)
+            let keywords = ["extension", "add-on"]
+            if item.hasAction {
+                if store.visibleTab != nil {
+                    list.append(Self(id: "extension-\(item.id)", title: item.name, symbol: "puzzlepiece.extension",
+                                     keywords: keywords, image: image) { store.runExtensionAction(key, from: nil) })
+                }
+                let pinned = pins.contains(item.id)
+                list.append(Self(id: "extension-pin-\(item.id)", title: pinned ? "Unpin \(item.name)" : "Pin \(item.name) to Toolbar",
+                                 symbol: pinned ? "pin.slash" : "pin", keywords: keywords + ["toolbar"], image: image) {
+                        if !ExtensionPins.toggle(item.id, in: profile, among: all) {
+                            store.showToast(Toast(message: ExtensionPins.fullMessage, symbol: "pin"))
+                        }
+                    })
+            }
+            if item.optionsPage != nil {
+                list.append(Self(id: "extension-options-\(item.id)", title: "\(item.name) Options", symbol: "gearshape",
+                                 keywords: keywords + ["settings", "preferences"], image: image) { host.openOptions(key) })
+            }
+        }
+        return list
+    }
+}
+
+@MainActor
 final class ExtensionButtonsView: FlippedView {
     private let store: BrowserStore
     private var buttons: [ExtensionButton] = []
     private let more: SymbolButton
+    private let dot = NSView()
     private var items: [InstalledExtension] = []
 
     init(store: BrowserStore) {
@@ -12,7 +87,11 @@ final class ExtensionButtonsView: FlippedView {
         more = SymbolButton("puzzlepiece.extension", size: 12)
         super.init(frame: .zero)
         more.toolTip = "Extensions"
-        more.action = { [weak self] in self?.showMenu() }
+        more.action = { [weak self] in self?.showList() }
+        dot.wantsLayer = true
+        dot.layer?.cornerRadius = 3
+        dot.layer?.backgroundColor = NSColor.systemRed.cgColor
+        more.addSubview(dot)
         addSubview(more)
         update()
     }
@@ -23,7 +102,9 @@ final class ExtensionButtonsView: FlippedView {
     func update() {
         let host = store.extensions
         let profile = host.profilePath(store.activeSpace.profileId)
-        items = host.extensions(in: profile).filter { $0.enabled && $0.hasAction }
+        let all = host.extensions(in: profile)
+        let pins = ExtensionPins.pinned(in: profile, among: all)
+        items = pins.compactMap { id in all.first { $0.id == id } }
         let tab = store.visibleTabID.flatMap { host.extensionTabID(of: $0) }
         while buttons.count > items.count { buttons.removeLast().removeFromSuperview() }
         while buttons.count < items.count {
@@ -38,9 +119,14 @@ final class ExtensionButtonsView: FlippedView {
                 guard let self, let button else { return }
                 store.runExtensionAction(key, from: button)
             }
-            button.menu = buttonMenu(item, key: key)
+            button.menu = Self.menu(for: item, key: key, store: store)
         }
-        more.isHidden = host.extensions(in: profile).isEmpty
+        dot.isHidden = !all.contains { item in
+            guard item.enabled, item.hasAction, !pins.contains(item.id) else { return false }
+            let key = ExtensionHost.Key(profile: profile, extensionID: item.id)
+            return !(host.action(key, tab: tab).badgeText ?? "").isEmpty
+        }
+        more.isHidden = all.isEmpty
         needsLayout = true
     }
 
@@ -57,6 +143,7 @@ final class ExtensionButtonsView: FlippedView {
         super.layout()
         var x = bounds.width - 26
         more.frame = NSRect(x: x, y: 3, width: 26, height: 24)
+        dot.frame = NSRect(x: 17, y: 4, width: 6, height: 6)
         for button in buttons {
             x -= 26
             button.isHidden = x < 0
@@ -64,43 +151,186 @@ final class ExtensionButtonsView: FlippedView {
         }
     }
 
-    private func showMenu() {
-        let host = store.extensions
-        let profile = host.profilePath(store.activeSpace.profileId)
-        let menu = NSMenu()
-        for item in host.extensions(in: profile) {
-            let key = ExtensionHost.Key(profile: profile, extensionID: item.id)
-            let entry = menu.add(item.name, enabled: item.enabled && item.hasAction) { [weak self] in
-                guard let self else { return }
-                store.runExtensionAction(key, from: more)
-            }
-            entry.image = item.icon(size: 16)
-            entry.submenu = buttonMenu(item, key: key)
-        }
-        if !menu.items.isEmpty { menu.addItem(.separator()) }
-        menu.add("Manage Extensions…") { [weak self] in self?.store.showExtensions() }
-        menu.popUp(positioning: nil, at: NSPoint(x: more.frame.minX, y: more.frame.maxY + 4), in: self)
+    private func showList() {
+        let popover = NSPopover()
+        popover.behavior = .transient
+        let list = ExtensionListView(store: store) { [weak popover] in popover?.close() }
+        let controller = NSViewController()
+        controller.view = list
+        popover.contentViewController = controller
+        popover.contentSize = list.frame.size
+        popover.show(relativeTo: more.bounds, of: more, preferredEdge: .maxY)
     }
 
-    private func buttonMenu(_ item: InstalledExtension, key: ExtensionHost.Key) -> NSMenu {
+    static func menu(for item: InstalledExtension, key: ExtensionHost.Key, store: BrowserStore) -> NSMenu {
         let menu = NSMenu()
         menu.add(item.name, enabled: false) {}
         for entry in store.extensions.actionMenuItems(key) {
-            menu.add(entry.title, state: entry.checked) { [weak self] in
-                guard let self, let tab = store.visibleTabID else { return }
+            menu.add(entry.title, state: entry.checked) { [weak store] in
+                guard let store, let tab = store.visibleTabID else { return }
                 store.extensions.choosePageMenuItem(entry.id, context: ["pageUrl": store.visibleTab?.url ?? ""],
                                                     profile: key.profile, tab: tab)
             }
         }
         menu.addItem(.separator())
-        if item.optionsPage != nil {
-            menu.add("Options") { [weak self] in self?.store.extensions.openOptions(key) }
+        if item.enabled, item.hasAction {
+            let all = store.extensions.extensions(in: key.profile)
+            let pinned = ExtensionPins.pinned(in: key.profile, among: all).contains(item.id)
+            menu.add(pinned ? "Unpin from Toolbar" : "Pin to Toolbar") { [weak store] in
+                if !ExtensionPins.toggle(item.id, in: key.profile, among: all) {
+                    store?.showToast(Toast(message: ExtensionPins.fullMessage, symbol: "pin"))
+                }
+            }
         }
-        menu.add("Manage Extensions…") { [weak self] in
-            self?.store.showExtensions(url: "chrome://extensions/?id=\(item.id)")
+        if item.optionsPage != nil {
+            menu.add("Options") { [weak store] in store?.extensions.openOptions(key) }
+        }
+        menu.add("Manage Extensions…") { [weak store] in
+            store?.showExtensions(url: "chrome://extensions/?id=\(item.id)")
         }
         return menu
     }
+}
+
+private final class ExtensionListView: FlippedView {
+    private let store: BrowserStore
+    private let dismiss: () -> Void
+
+    init(store: BrowserStore, dismiss: @escaping () -> Void) {
+        self.store = store
+        self.dismiss = dismiss
+        super.init(frame: .zero)
+        reload()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func reload() {
+        subviews.forEach { $0.removeFromSuperview() }
+        let host = store.extensions
+        let profile = host.profilePath(store.activeSpace.profileId)
+        let all = host.extensions(in: profile)
+        let pins = ExtensionPins.pinned(in: profile, among: all)
+        let tab = store.visibleTabID.flatMap { host.extensionTabID(of: $0) }
+        let width: CGFloat = 250
+        var y: CGFloat = 6
+        for item in all {
+            let key = ExtensionHost.Key(profile: profile, extensionID: item.id)
+            let usable = item.enabled && item.hasAction
+            let pinned = pins.contains(item.id)
+            let row = ExtensionListRow(item, badge: usable ? host.action(key, tab: tab).badgeText : nil)
+            row.frame = NSRect(x: 6, y: y, width: width - 12, height: 28)
+            row.menu = ExtensionButtonsView.menu(for: item, key: key, store: store)
+            if usable {
+                row.action = { [weak self] in
+                    guard let self else { return }
+                    dismiss()
+                    store.runExtensionAction(key, from: nil)
+                }
+                row.showPin(pinned, canPin: pinned || pins.count < ExtensionPins.limit) { [weak self] in
+                    ExtensionPins.toggle(item.id, in: profile, among: all)
+                    self?.reload()
+                }
+            }
+            addSubview(row)
+            y += 28
+        }
+        if !all.isEmpty {
+            let rule = NSView(frame: NSRect(x: 12, y: y + 4, width: width - 24, height: 1))
+            rule.wantsLayer = true
+            rule.layer?.backgroundColor = Theme.faint(0.1).cgColor
+            addSubview(rule)
+            y += 9
+        }
+        let manage = ExtensionListRow(title: "Manage Extensions…")
+        manage.frame = NSRect(x: 6, y: y, width: width - 12, height: 28)
+        manage.action = { [weak self] in
+            guard let self else { return }
+            dismiss()
+            store.showExtensions()
+        }
+        addSubview(manage)
+        setFrameSize(NSSize(width: width, height: y + 28 + 6))
+    }
+}
+
+private final class ExtensionListRow: HoverView {
+    var action: (() -> Void)?
+    private let fill = FillLayer()
+    private let icon = NSImageView()
+    private let name: NSTextField
+    private let badge = Label.chip()
+    private var pin: SymbolButton?
+
+    init(_ item: InstalledExtension, badge text: String?) {
+        name = Label.make(item.name)
+        super.init(frame: .zero)
+        icon.image = item.icon(size: 16)
+        setUp()
+        if !(item.enabled && item.hasAction) {
+            icon.alphaValue = 0.4
+            name.textColor = .tertiaryLabelColor
+        }
+        badge.stringValue = text ?? ""
+        badge.isHidden = (text ?? "").isEmpty
+    }
+
+    init(title: String) {
+        name = Label.make(title, color: .secondaryLabelColor)
+        super.init(frame: .zero)
+        setUp()
+        badge.isHidden = true
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func setUp() {
+        fill.cornerRadius = 6
+        layer?.addSublayer(fill)
+        icon.imageScaling = .scaleProportionallyUpOrDown
+        for view in [icon, name, badge] as [NSView] { addSubview(view) }
+    }
+
+    func showPin(_ pinned: Bool, canPin: Bool, toggle: @escaping () -> Void) {
+        let button = SymbolButton(pinned ? "pin.fill" : "pin", size: 11, action: toggle)
+        button.toolTip = pinned ? "Unpin from Toolbar" : canPin ? "Pin to Toolbar" : ExtensionPins.fullMessage
+        button.isEnabled = canPin
+        addSubview(button)
+        pin = button
+        needsLayout = true
+    }
+
+    override func layout() {
+        super.layout()
+        fill.frame = bounds
+        let midY = bounds.midY
+        var right = bounds.width - 2
+        if let pin {
+            pin.frame = NSRect(x: right - 26, y: midY - 11, width: 26, height: 22)
+            right = pin.frame.minX - 2
+        }
+        if !badge.isHidden {
+            let width = badge.textWidth + 8
+            badge.frame = NSRect(x: right - width, y: midY - 8, width: width, height: 16)
+            right = badge.frame.minX - 6
+        }
+        let x: CGFloat = icon.image == nil ? 8 : 34
+        icon.frame = NSRect(x: 8, y: midY - 8, width: 16, height: 16)
+        name.frame = NSRect(x: x, y: midY - 8, width: max(right - x, 0), height: 16)
+    }
+
+    override func updateLayer() {
+        fill.paint(fill: hovering && action != nil ? Theme.hoverFill : nil, in: effectiveAppearance)
+        badge.layer?.backgroundColor = Theme.faint(0.08).cgColor
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { action?() }
+    }
+
+    override func mouseDown(with event: NSEvent) {}
 }
 
 private final class ExtensionButton: HoverView {
