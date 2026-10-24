@@ -54,13 +54,17 @@ impl Downloads {
                 started_ms: now,
             },
         );
+        self.trim();
+        id
+    }
+
+    fn trim(&mut self) {
         while self.items.len() > MAX_ENTRIES {
             let Some(oldest) = self.items.iter().rposition(|d| !d.state.is_active()) else {
                 break;
             };
             self.items.remove(oldest);
         }
-        id
     }
 
     pub fn update(&mut self, id: u64, path: &str, received: u64, total: u64, state: DownloadState) -> bool {
@@ -77,6 +81,9 @@ impl Downloads {
         d.received = received;
         d.total = if state == DownloadState::Done && total == 0 { received } else { total };
         d.state = state;
+        if !state.is_active() {
+            self.trim();
+        }
         lasting
     }
 

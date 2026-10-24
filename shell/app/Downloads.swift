@@ -313,8 +313,11 @@ final class DownloadsButton: HoverView {
         self.popover = popover
         needsDisplay = true
         popover.show(relativeTo: bounds, of: self, preferredEdge: .minY)
-        NotificationCenter.default.addObserver(forName: NSPopover.didCloseNotification, object: popover, queue: .main) { [weak self] _ in
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(forName: NSPopover.didCloseNotification, object: popover,
+                                                       queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
+                if let token { NotificationCenter.default.removeObserver(token) }
                 self?.popover = nil
                 self?.needsDisplay = true
             }

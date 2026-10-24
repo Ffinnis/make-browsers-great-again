@@ -504,6 +504,14 @@ fn old_finished_downloads_make_room_but_running_ones_stay() {
     assert_eq!(list.items().len(), 100);
     assert!(list.items().iter().any(|d| d.id == running));
     assert_eq!(list.items()[0].started_ms, 150);
+
+    let mut busy = Downloads::default();
+    let ids: Vec<u64> = (0..105).map(|n| busy.start("https://a.example.com/many", "", n)).collect();
+    assert_eq!(busy.items().len(), 105);
+    for id in ids {
+        busy.update(id, "", 1, 1, DownloadState::Done);
+    }
+    assert_eq!(busy.items().len(), 100);
 }
 
 #[test]

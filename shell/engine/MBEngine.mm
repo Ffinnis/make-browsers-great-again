@@ -37,6 +37,7 @@
 
 @interface MBDownload ()
 - (instancetype)initWithItem:(CefRefPtr<CefDownloadItem>)item
+                  identifier:(uint32_t)identifier
                        state:(MBDownloadState)state;
 @end
 
@@ -89,6 +90,9 @@ bool g_reject_drops = false;
 bool g_convert_video = false;
 void (^g_download_handler)(MBDownload* download) = nil;
 std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>> g_downloads;
+std::map<std::pair<std::string, uint32_t>, uint32_t> g_download_ids;
+std::set<uint32_t> g_finished_downloads;
+uint32_t g_last_download = 0;
 
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
 constexpr char kFormPrefix[] = "__mbga_form:";
@@ -879,11 +883,22 @@ class BaseClient : public CefClient,
                          CefRefPtr<CefDownloadItem> download_item,
                          CefRefPtr<CefDownloadItemCallback> callback) override {
     MBDownloadState state = DownloadState(download_item);
-    uint32_t identifier = download_item->GetId();
+    std::string context =
+        browser
+            ? browser->GetHost()->GetRequestContext()->GetCachePath().ToString()
+            : std::string();
+    uint32_t& identifier = g_download_ids[{context, download_item->GetId()}];
+    if (!identifier) {
+      identifier = ++g_last_download;
+    }
+    if (g_finished_downloads.count(identifier)) {
+      return;
+    }
     if (state == MBDownloadStateRunning || state == MBDownloadStatePaused) {
       g_downloads[identifier] = callback;
     } else {
       g_downloads.erase(identifier);
+      g_finished_downloads.insert(identifier);
     }
     if (state == MBDownloadStateDone) {
       [NSDistributedNotificationCenter.defaultCenter
@@ -892,6 +907,7 @@ class BaseClient : public CefClient,
     }
     if (g_download_handler) {
       g_download_handler([[MBDownload alloc] initWithItem:download_item
+                                               identifier:identifier
                                                     state:state]);
     }
   }
@@ -2820,9 +2836,10 @@ class CookieKeys : public CefCookieVisitor {
 @implementation MBDownload
 
 - (instancetype)initWithItem:(CefRefPtr<CefDownloadItem>)item
+                  identifier:(uint32_t)identifier
                        state:(MBDownloadState)state {
   if ((self = [super init])) {
-    _identifier = item->GetId();
+    _identifier = identifier;
     _url = ToNS(item->GetURL());
     _path = ToNS(item->GetFullPath());
     _received = item->GetReceivedBytes();
