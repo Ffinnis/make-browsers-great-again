@@ -80,6 +80,24 @@ typedef BOOL (^MBEarlyScript)(NSString* page);
 @property(nonatomic) int priority;
 @end
 
+typedef NS_ENUM(NSInteger, MBDownloadState) {
+  MBDownloadStateRunning,
+  MBDownloadStatePaused,
+  MBDownloadStateDone,
+  MBDownloadStateFailed,
+  MBDownloadStateCanceled,
+};
+
+@interface MBDownload : NSObject
+@property(nonatomic, readonly) uint32_t identifier;
+@property(nonatomic, readonly, copy) NSString* url;
+@property(nonatomic, readonly, copy) NSString* path;
+@property(nonatomic, readonly) int64_t received;
+@property(nonatomic, readonly) int64_t total;
+@property(nonatomic, readonly) int64_t speed;
+@property(nonatomic, readonly) MBDownloadState state;
+@end
+
 typedef NS_ENUM(NSInteger, MBChromeCommand) {
   MBChromeCommandBack = 33000,
   MBChromeCommandForward = 33001,
@@ -151,6 +169,11 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 + (void)setFormScript:(NSString*)script;
 
 + (void)setConvertsVideo:(BOOL)converts;
+
++ (void)setDownloadHandler:(void (^)(MBDownload* download))handler;
++ (void)cancelDownload:(uint32_t)identifier;
++ (void)pauseDownload:(uint32_t)identifier;
++ (void)resumeDownload:(uint32_t)identifier;
 
 @property(class, nonatomic, readonly) BOOL usesMockKeychain;
 
