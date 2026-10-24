@@ -208,7 +208,7 @@ final class BrowserStore: NSObject {
 
     var isDragging: Bool { draggingItem != nil }
 
-    private(set) var views: [UInt64: MBWebView] = [:]
+    var views: [UInt64: MBWebView] = [:]
     private(set) var navStates: [UInt64: NavState] = [:]
     private var refreshPending = false
     private var persistTimer: Timer?

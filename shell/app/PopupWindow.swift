@@ -10,7 +10,10 @@ final class PopupWindow: NSObject, NSWindowDelegate, MBWebViewDelegate {
     private let color: RGB
     private let content: PopupWindowView
     private var url = ""
+    private var title = ""
+    private var favicon: Data?
     private var closing = false
+    private var movedToTab = false
 
     static let defaultSize = NSSize(width: 500, height: 640)
 
@@ -35,6 +38,7 @@ final class PopupWindow: NSObject, NSWindowDelegate, MBWebViewDelegate {
         window.delegate = self
         window.contentView = content
         content.copyLink = { [weak self] in self?.copyLink() }
+        content.openInTab = { [weak self] in self?.openInTab() }
         content.host(view, cornerRadius: max(window.systemCornerRadius - 6, 6))
         view.delegate = self
         place(over: opener.window)
@@ -65,6 +69,14 @@ final class PopupWindow: NSObject, NSWindowDelegate, MBWebViewDelegate {
         content.showCopied()
     }
 
+    private func openInTab() {
+        guard !closing, !view.isClosing, let store,
+              store.openPopupInTab(view, url: url, title: title, favicon: favicon, opener: opener) else { return }
+        movedToTab = true
+        closing = true
+        window.close()
+    }
+
     private func fadeOutAndClose() {
         guard !closing else { return }
         closing = true
@@ -90,6 +102,10 @@ final class PopupWindow: NSObject, NSWindowDelegate, MBWebViewDelegate {
 
     func windowWillClose(_ notification: Notification) {
         closing = true
+        if movedToTab {
+            Self.open.remove(self)
+            return
+        }
         if view.isClosing, view.browserIdentifier == 0 {
             Self.open.remove(self)
         } else {
@@ -140,6 +156,7 @@ final class PopupWindow: NSObject, NSWindowDelegate, MBWebViewDelegate {
 
     nonisolated func webView(_ view: MBWebView, didChangeTitle title: String) {
         MainActor.assumeIsolated {
+            self.title = title
             window.title = title
             content.setTitle(title)
         }
@@ -150,7 +167,10 @@ final class PopupWindow: NSObject, NSWindowDelegate, MBWebViewDelegate {
     }
 
     nonisolated func webView(_ view: MBWebView, didReceiveFavicon png: Data) {
-        MainActor.assumeIsolated { content.setIcon(NSImage(data: png)) }
+        MainActor.assumeIsolated {
+            favicon = png
+            content.setIcon(NSImage(data: png))
+        }
     }
 
     nonisolated func webView(_ view: MBWebView, requestsNewTabWithURL url: String, foreground: Bool) {
@@ -202,6 +222,26 @@ extension BrowserStore {
             return true
         }
     }
+
+    func openPopupInTab(_ popup: MBWebView, url: String, title: String, favicon: Data?, opener: MBWebView?) -> Bool {
+        let owner = opener.flatMap { opener in
+            snapshot.spaces.first { s in
+                s.today.contains { $0.id == opener.tabID } || s.pinned.contains { $0.id == opener.tabID }
+            }
+        }
+        let space = owner?.id ?? activeSpace.id
+        guard !url.isEmpty, let id = core.openTab(spaceId: space, url: url, activate: false) else { return false }
+        if !title.isEmpty { core.updateTab(id: id, url: nil, title: title) }
+        if let favicon { core.setFavicon(tabId: id, png: favicon) }
+        popup.tabID = id
+        popup.delegate = self
+        views[id] = popup
+        webContainer.add(popup)
+        core.setLive(id: id, live: true)
+        select(id, in: space)
+        window?.makeKeyAndOrderFront(nil)
+        return true
+    }
 }
 
 private final class PopupWindowView: FlippedView {
@@ -216,9 +256,11 @@ private final class PopupWindowView: FlippedView {
     private let title = Label.make(size: 12, color: .secondaryLabelColor)
     private let spinner = NSProgressIndicator()
     private let copy = NSButton()
+    private let tab = NSButton()
     private let container = NSView()
     private var secure = false
     var copyLink: (() -> Void)?
+    var openInTab: (() -> Void)?
 
     static func frame(around page: NSSize) -> NSSize {
         NSSize(width: page.width + inset * 2, height: page.height + barHeight + inset)
@@ -243,13 +285,22 @@ private final class PopupWindowView: FlippedView {
         copy.contentTintColor = .secondaryLabelColor
         copy.toolTip = "Copy link"
         copy.onAction { [weak self] in self?.copyLink?() }
+        tab.isBordered = false
+        tab.image = .symbol("sidebar.left", size: 12)
+        tab.imagePosition = .imageLeading
+        tab.attributedTitle = NSAttributedString(string: " Open in Tab", attributes: [
+            .font: Theme.font(12, .medium), .foregroundColor: NSColor.labelColor,
+        ])
+        tab.contentTintColor = .labelColor
+        tab.toolTip = "Move this page into a tab in the main window"
+        tab.onAction { [weak self] in self?.openInTab?() }
         container.wantsLayer = true
         container.layer?.masksToBounds = true
         container.layer?.cornerCurve = .continuous
         container.layer?.backgroundColor = NSColor.white.cgColor
         addSubview(backdrop)
         addSubview(bar)
-        for view in [icon, lock, address, title, spinner, copy] as [NSView] { bar.addSubview(view) }
+        for view in [icon, lock, address, title, spinner, copy, tab] as [NSView] { bar.addSubview(view) }
         addSubview(container)
         updateTint()
     }
@@ -311,10 +362,12 @@ private final class PopupWindowView: FlippedView {
         let inset = Self.inset
         backdrop.frame = bounds
         bar.frame = NSRect(x: 0, y: 0, width: bounds.width, height: Self.barHeight)
-        icon.frame = NSRect(x: 74, y: 11, width: 14, height: 14)
-        copy.frame = NSRect(x: bounds.width - 10 - 24, y: 6, width: 24, height: 24)
+        icon.frame = NSRect(x: 86, y: 11, width: 14, height: 14)
+        let tabWidth = tab.intrinsicContentSize.width + 8
+        tab.frame = NSRect(x: bounds.width - 10 - tabWidth, y: 8, width: tabWidth, height: 20)
+        copy.frame = NSRect(x: tab.frame.minX - 4 - 24, y: 6, width: 24, height: 24)
         spinner.frame = NSRect(x: copy.frame.minX - 18, y: 10, width: 16, height: 16)
-        var x: CGFloat = 96
+        var x: CGFloat = 108
         if secure {
             lock.frame = NSRect(x: x, y: 12, width: 10, height: 12)
             x += 14
