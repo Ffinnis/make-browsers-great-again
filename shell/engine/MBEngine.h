@@ -63,6 +63,7 @@ typedef BOOL (^MBEarlyScript)(NSString* page);
 - (void)webView:(MBWebView*)view
     choseContextMenuItem:(NSString*)itemID
                  context:(NSDictionary*)context;
+- (BOOL)webView:(MBWebView*)view hostsPopup:(MBWebView*)popup size:(NSSize)size;
 @end
 
 @interface MBCookie : NSObject
@@ -163,7 +164,7 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (instancetype)initWithFrame:(NSRect)frameRect NS_UNAVAILABLE;
 - (nullable instancetype)initWithCoder:(NSCoder*)coder NS_UNAVAILABLE;
 
-@property(nonatomic, readonly) uint64_t tabID;
+@property(nonatomic) uint64_t tabID;
 @property(nonatomic, readonly) int browserIdentifier;
 @property(nonatomic, weak, nullable) id<MBWebViewDelegate> delegate;
 @property(nonatomic, readonly, getter=isClosing) BOOL closing;
