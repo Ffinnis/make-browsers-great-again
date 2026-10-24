@@ -2,6 +2,7 @@ uniffi::setup_scaffolding!();
 
 pub mod blocker;
 pub mod crypto;
+pub mod downloads;
 pub mod history;
 pub mod import;
 pub mod model;
@@ -255,6 +256,8 @@ struct Inner {
     dirty: bool,
     history: history::History,
     history_dirty: bool,
+    downloads: downloads::Downloads,
+    downloads_dirty: bool,
     revision: u64,
     data_dir: PathBuf,
     detected: Vec<import::Source>,
@@ -279,10 +282,15 @@ fn now_ms() -> u64 {
 
 const STATE_FILE: &str = "state.json";
 const HISTORY_FILE: &str = "history.json";
+const DOWNLOADS_FILE: &str = "downloads.json";
 const PASSWORDS_FILE: &str = "passwords.json";
 
 fn load_history(dir: &Path) -> history::History {
     fs::read(dir.join(HISTORY_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn load_downloads(dir: &Path) -> downloads::Downloads {
+    fs::read(dir.join(DOWNLOADS_FILE)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
 fn load_passwords(dir: &Path) -> passwords::Store {
@@ -413,6 +421,8 @@ impl BrowserCore {
         let data_dir = fs::canonicalize(&data_dir).unwrap_or(data_dir);
         let mut state = load_state(&data_dir);
         let history = load_history(&data_dir);
+        let mut downloads = load_downloads(&data_dir);
+        let downloads_dirty = downloads.interrupt();
         let mut passwords = load_passwords(&data_dir);
         passwords.keep_profiles(&state.profiles.iter().map(|p| p.id).collect::<Vec<_>>());
         let blocker = blocker::Blocker::new(state.block_ads, state.ads_allowed.iter().cloned());
@@ -425,6 +435,8 @@ impl BrowserCore {
                 dirty: true,
                 history,
                 history_dirty: false,
+                downloads,
+                downloads_dirty,
                 revision: 1,
                 data_dir,
                 detected: Vec::new(),
@@ -603,6 +615,37 @@ impl BrowserCore {
         let mut inner = self.lock();
         inner.history.clear();
         inner.history_dirty = true;
+    }
+
+    pub fn downloads(&self) -> Vec<downloads::Download> {
+        self.lock().downloads.items().to_vec()
+    }
+
+    pub fn start_download(&self, url: String, path: String) -> u64 {
+        let mut inner = self.lock();
+        inner.downloads_dirty = true;
+        inner.downloads.start(&url, &path, now_ms())
+    }
+
+    pub fn update_download(&self, id: u64, path: String, received: u64, total: u64, state: downloads::DownloadState) {
+        let mut inner = self.lock();
+        if inner.downloads.update(id, &path, received, total, state) {
+            inner.downloads_dirty = true;
+        }
+    }
+
+    pub fn remove_download(&self, id: u64) {
+        let mut inner = self.lock();
+        if inner.downloads.remove(id) {
+            inner.downloads_dirty = true;
+        }
+    }
+
+    pub fn clear_downloads(&self) {
+        let mut inner = self.lock();
+        if inner.downloads.clear() {
+            inner.downloads_dirty = true;
+        }
     }
 
     pub fn close_tab(&self, id: u64) -> CloseOutcome {
@@ -1119,6 +1162,13 @@ impl BrowserCore {
         if inner.history_dirty {
             if write_atomic(&inner.data_dir, HISTORY_FILE, &inner.history) {
                 inner.history_dirty = false;
+            } else {
+                ok = false;
+            }
+        }
+        if inner.downloads_dirty {
+            if write_atomic(&inner.data_dir, DOWNLOADS_FILE, &inner.downloads) {
+                inner.downloads_dirty = false;
             } else {
                 ok = false;
             }
