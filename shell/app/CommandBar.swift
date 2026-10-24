@@ -310,7 +310,7 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
             cell.set(emoji: space.icon.isEmpty ? "•" : space.icon, title: space.name, chip: index < 9 ? "⌃\(index + 1)" : nil)
         case .action(let id):
             if let action = actions.first(where: { $0.id == id }) {
-                cell.set(symbol: action.symbol, title: action.title, chip: action.shortcut)
+                cell.set(symbol: action.symbol, image: action.image, title: action.title, chip: action.shortcut)
             }
         case .closed(let tab):
             cell.set(image: FaviconCache.shared.image(for: tab), title: tab.displayTitle, subtitle: tab.host,
@@ -495,8 +495,8 @@ private final class CommandItemCell: NSTableCellView {
         needsLayout = true
     }
 
-    func set(symbol: String, title: String, subtitle: String? = nil, chip: String? = nil) {
-        icon.image = .symbol(symbol, size: 13, weight: .regular)
+    func set(symbol: String, image: NSImage? = nil, title: String, subtitle: String? = nil, chip: String? = nil) {
+        icon.image = image ?? .symbol(symbol, size: 13, weight: .regular)
         icon.alphaValue = 1
         icon.isHidden = false
         emoji.isHidden = true
@@ -547,6 +547,7 @@ struct CommandAction {
     let symbol: String
     var shortcut: String?
     var keywords: [String] = []
+    var image: NSImage?
     let run: () -> Void
 
     func matches(_ query: String) -> Bool {
@@ -573,9 +574,7 @@ struct CommandAction {
                 Self(id: "reload", title: "Reload Page", symbol: "arrow.clockwise", shortcut: "⌘R", keywords: ["refresh"]) {
                     store.reload()
                 },
-                Self(id: "duplicate", title: "Duplicate Tab", symbol: "plus.square.on.square") {
-                    store.duplicate(tab, in: space)
-                },
+                Self(id: "duplicate", title: "Duplicate Tab", symbol: "plus.square.on.square") { store.duplicate(tab, in: space) },
                 Self(id: "little", title: "Open in Little Window", symbol: "macwindow.on.rectangle",
                      keywords: ["pop", "out", "float", "window"]) {
                     store.openInLittleWindow(tab.id)
@@ -678,7 +677,7 @@ struct CommandAction {
                 store.showToast(Toast(message: "History cleared", symbol: "clock.arrow.circlepath"))
             },
         ]
-        list += developerActions(for: store)
+        list += developerActions(for: store) + extensionActions(for: store)
         if store.canReopen {
             list.append(Self(id: "reopen", title: "Reopen Closed Tab", symbol: "arrow.uturn.backward", shortcut: "⇧⌘T",
                              keywords: ["undo", "restore"]) { store.undoClose() })
