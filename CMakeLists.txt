@@ -12,7 +12,7 @@ project(mbga LANGUAGES C CXX Swift)
 
 set(MBGA_PRODUCT_NAME "MBGA")
 set(MBGA_BUNDLE_ID "dev.mbga.browser")
-set(MBGA_VERSION "0.0.9")
+set(MBGA_VERSION "0.0.10")
 option(MBGA_MOCK_KEYCHAIN "Use a mock keychain (avoids prompts on ad-hoc signed builds)" ON)
 option(MBGA_UPDATES "Update from MBGA's releases on GitHub" OFF)
 set(MBGA_UPDATE_PUBLIC_KEY "HQrQqNM/GyMsslsnQmag+Y9mTGB2YHt1WsyouwlPpjw=")
