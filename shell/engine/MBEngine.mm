@@ -1456,22 +1456,35 @@ class WebClient : public BaseClient,
                      CefBrowserSettings& settings,
                      CefRefPtr<CefDictionaryValue>& extra_info,
                      bool* no_javascript_access) override {
-    switch (target_disposition) {
+    if (OpenInNewTab(target_url, target_disposition)) {
+      return true;
+    }
+    windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+    client = AuxiliaryClient::Popups();
+    return false;
+  }
+
+  bool OnOpenURLFromTab(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefFrame> frame,
+                        const CefString& target_url,
+                        WindowOpenDisposition target_disposition,
+                        bool user_gesture) override {
+    return OpenInNewTab(target_url, target_disposition);
+  }
+
+  bool OpenInNewTab(const CefString& url, WindowOpenDisposition disposition) {
+    switch (disposition) {
       case CEF_WOD_NEW_FOREGROUND_TAB:
       case CEF_WOD_NEW_BACKGROUND_TAB:
       case CEF_WOD_NEW_WINDOW:
       case CEF_WOD_SINGLETON_TAB: {
         MBWebView* view = view_;
         [view.delegate webView:view
-            requestsNewTabWithURL:ToNS(target_url)
-                       foreground:target_disposition !=
-                                  CEF_WOD_NEW_BACKGROUND_TAB];
+            requestsNewTabWithURL:ToNS(url)
+                       foreground:disposition != CEF_WOD_NEW_BACKGROUND_TAB];
         return true;
       }
-      default:
-        windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
-        client = AuxiliaryClient::Popups();
-        return false;
+      default: return false;
     }
   }
 
