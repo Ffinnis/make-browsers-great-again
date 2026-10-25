@@ -1465,6 +1465,7 @@ class WebClient : public BaseClient,
                   public CefResourceRequestHandler,
                   public CefContextMenuHandler,
                   public CefDragHandler,
+                  public CefFindHandler,
                   public CefDevToolsMessageObserver {
  public:
   using RawReply = std::function<void(bool, const std::string&)>;
@@ -1483,6 +1484,24 @@ class WebClient : public BaseClient,
     return this;
   }
   CefRefPtr<CefDragHandler> GetDragHandler() override { return this; }
+  CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
+
+  void OnFindResult(CefRefPtr<CefBrowser> browser,
+                    int identifier,
+                    int count,
+                    const CefRect& selectionRect,
+                    int activeMatchOrdinal,
+                    bool finalUpdate) override {
+    MBWebView* view = view_;
+    if ([view.delegate
+            respondsToSelector:@selector(
+                                   webView:didFindMatches:active:finished:)]) {
+      [view.delegate webView:view
+              didFindMatches:count
+                      active:activeMatchOrdinal
+                    finished:finalUpdate];
+    }
+  }
 
   bool OnDragEnter(CefRefPtr<CefBrowser> browser,
                    CefRefPtr<CefDragData> dragData,
@@ -3372,6 +3391,18 @@ class CookieKeys : public CefCookieVisitor {
 - (void)resetZoom {
   if (_browser) {
     _browser->GetHost()->Zoom(CEF_ZOOM_COMMAND_RESET);
+  }
+}
+
+- (void)findText:(NSString*)text forward:(BOOL)forward next:(BOOL)next {
+  if (_browser) {
+    _browser->GetHost()->Find(text.UTF8String, forward, false, next);
+  }
+}
+
+- (void)stopFinding:(BOOL)clearSelection {
+  if (_browser) {
+    _browser->GetHost()->StopFinding(clearSelection);
   }
 }
 

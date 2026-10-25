@@ -58,6 +58,10 @@ typedef BOOL (^MBEarlyScript)(NSString* page);
                       url:(NSString*)url;
 
 @optional
+- (void)webView:(MBWebView*)view
+    didFindMatches:(NSInteger)count
+            active:(NSInteger)active
+          finished:(BOOL)finished;
 - (NSArray<NSDictionary*>*)webView:(MBWebView*)view
                contextMenuItemsFor:(NSDictionary*)context;
 - (void)webView:(MBWebView*)view
@@ -107,6 +111,9 @@ typedef NS_ENUM(NSInteger, MBChromeCommand) {
   MBChromeCommandReopenTab = 34028,
   MBChromeCommandZoomIn = 38001,
   MBChromeCommandActualSize = 38002,
+  MBChromeCommandFind = 37000,
+  MBChromeCommandFindNext = 37001,
+  MBChromeCommandFindPrevious = 37002,
   MBChromeCommandZoomOut = 38003,
   MBChromeCommandFocusLocation = 39001,
 };
@@ -199,6 +206,8 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (void)zoomIn;
 - (void)zoomOut;
 - (void)resetZoom;
+- (void)findText:(NSString*)text forward:(BOOL)forward next:(BOOL)next;
+- (void)stopFinding:(BOOL)clearSelection;
 - (void)showDevTools;
 - (void)closeDevTools;
 @property(nonatomic, readonly, nullable) NSWindow* devToolsWindow;
