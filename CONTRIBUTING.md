@@ -161,11 +161,13 @@ The body explains why and how.
 To release, run the **Release** workflow (Actions ▸ Release ▸ Run workflow)
 from `dev` and choose which part of the version to raise. It:
 
-1. sets `MBGA_VERSION` in `CMakeLists.txt` to the version after the latest
+1. merges `main` into `dev`, so anything merged straight into `main` is part
+   of the release; if they conflict, it stops before building,
+2. sets `MBGA_VERSION` in `CMakeLists.txt` to the version after the latest
    tag (`scripts/bump-version.sh`) and commits it to `dev`,
-2. builds, signs and notarizes the app, then publishes the GitHub release
+3. builds, signs and notarizes the app, then publishes the GitHub release
    with its tag, which every installed copy picks up (`scripts/release.sh`),
-3. merges the release into `main`.
+4. merges the release into `main`.
 
 For a hotfix, branch from `main`, merge the fix into `main` and run the
 workflow from `main`. The release is then merged back into `dev`. If that
