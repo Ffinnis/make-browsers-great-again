@@ -78,6 +78,7 @@ void (^g_pipe_handler)(NSString* message) = nil;
 int g_browser_count = 0;
 bool g_quitting = false;
 bool g_asking_to_quit = false;
+MBCredentialsHandler g_credentials_handler = nil;
 bool g_strict_site_isolation = true;
 std::string g_isolated_origins;
 MBRequestFilter g_request_filter = nil;
@@ -1248,7 +1249,8 @@ class PopupMedia : public CefDevToolsMessageObserver {
 class AuxiliaryClient : public BaseClient,
                         public CefLifeSpanHandler,
                         public CefDisplayHandler,
-                        public CefLoadHandler {
+                        public CefLoadHandler,
+                        public CefRequestHandler {
  public:
   static CefRefPtr<AuxiliaryClient> Get() {
     static CefRefPtr<AuxiliaryClient> instance(new AuxiliaryClient(false));
@@ -1266,6 +1268,36 @@ class AuxiliaryClient : public BaseClient,
   }
   CefRefPtr<CefLoadHandler> GetLoadHandler() override {
     return popups_ ? this : nullptr;
+  }
+  CefRefPtr<CefRequestHandler> GetRequestHandler() override { return this; }
+
+  bool GetAuthCredentials(CefRefPtr<CefBrowser> browser,
+                          const CefString& origin_url,
+                          bool isProxy,
+                          const CefString& host,
+                          int port,
+                          const CefString& realm,
+                          const CefString& scheme,
+                          CefRefPtr<CefAuthCallback> callback) override {
+    NSString* name = ToNS(host);
+    NSString* area = ToNS(realm);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      if (!g_credentials_handler) {
+        callback->Cancel();
+        return;
+      }
+      NSView* view = (__bridge NSView*)browser->GetHost()->GetWindowHandle();
+      g_credentials_handler(name, area, isProxy, view.window,
+                            ^(NSString* user, NSString* password) {
+                              if (user) {
+                                callback->Continue(user.UTF8String,
+                                                   password.UTF8String ?: "");
+                              } else {
+                                callback->Cancel();
+                              }
+                            });
+    });
+    return true;
   }
 
   bool OnBeforePopup(CefRefPtr<CefBrowser> browser,
@@ -3592,6 +3624,10 @@ class CookieKeys : public CefCookieVisitor {
 
 + (void)runMessageLoop {
   CefRunMessageLoop();
+}
+
++ (void)setCredentialsHandler:(MBCredentialsHandler)handler {
+  g_credentials_handler = [handler copy];
 }
 
 + (BOOL)isQuitting {

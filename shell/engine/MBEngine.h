@@ -11,6 +11,12 @@ typedef BOOL (^MBRequestFilter)(NSString* url, NSString* page, NSString* kind);
 typedef NSString* _Nonnull (^MBPageScript)(NSString* page);
 typedef NSString* _Nonnull (^MBPageReply)(NSString* page, NSString* report);
 typedef BOOL (^MBEarlyScript)(NSString* page);
+typedef void (^MBCredentialsHandler)(
+    NSString* host,
+    NSString* realm,
+    BOOL proxy,
+    NSWindow* _Nullable window,
+    void (^reply)(NSString* _Nullable user, NSString* _Nullable password));
 
 @protocol MBWebViewDelegate <NSObject>
 - (void)webView:(MBWebView*)view didChangeURL:(NSString*)url;
@@ -145,6 +151,7 @@ typedef NS_ENUM(NSInteger, MBChromeCommand) {
 
 + (void)closeAllAndQuit;
 + (void)quitAskingPages;
++ (void)setCredentialsHandler:(MBCredentialsHandler)handler;
 @property(class, nonatomic, readonly) BOOL isQuitting;
 
 + (void)shutdown;

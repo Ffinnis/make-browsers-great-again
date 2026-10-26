@@ -168,6 +168,12 @@ extension NSMenu {
     func addingPageItems() -> NSMenu {
         let commands = PageCommands.shared
         commands.monitorMouseButtons()
+        MBEngine.setCredentialsHandler { host, realm, proxy, window, reply in
+            MainActor.assumeIsolated {
+                guard let window = window ?? NSApp.keyWindow else { return reply(nil, nil) }
+                SignInPrompt(host: host, realm: realm, proxy: proxy).show(in: window, reply: reply)
+            }
+        }
         let history = HistoryMenu.shared
         insert("Open File…", #selector(HistoryMenu.openFile(_:)), "o", target: history,
                in: "File", after: "Open Location…")
