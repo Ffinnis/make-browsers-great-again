@@ -184,8 +184,13 @@ final class WebContainerView: NSView {
     var onPageAreaChange: (() -> Void)?
     private(set) var pageArea = NSRect.zero
     var heldSize: NSSize? {
-        didSet { if heldSize != oldValue { placeCurrent() } }
+        didSet {
+            guard heldSize != oldValue else { return }
+            placeCurrent()
+            if heldSize == nil { settled() }
+        }
     }
+    private var afterHold: [@MainActor () -> Void] = []
     private let devToolsEdge = NSView()
     private let devToolsBacking = NSView()
     private lazy var devToolsHeader = DevToolsHeaderView { [weak self] in self?.current?.closeDevTools() }
@@ -361,6 +366,17 @@ extension WebContainerView {
                            width: max(width, 0), height: max(height, 0))
         if current.frame != frame { current.frame = frame }
         setPreview(current, radius: min(size.width, size.height) < 500 ? 24 : 12)
+    }
+
+    func whenSettled(_ work: @escaping @MainActor () -> Void) {
+        guard heldSize != nil else { return work() }
+        afterHold.append(work)
+    }
+
+    private func settled() {
+        let work = afterHold
+        afterHold = []
+        for item in work { item() }
     }
 
     private func held(_ area: NSRect) -> NSRect {

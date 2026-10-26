@@ -96,6 +96,7 @@ final class InspectorSession {
     private var models: [ObjectIdentifier: InspectorModel] = [:]
     private var order: [ObjectIdentifier] = []
     private var stopped = false
+    private var deferred: [@MainActor () -> Void] = []
 
     static let eagerModels: [InspectorModel.Type] = [ConsoleModel.self, NetworkModel.self, SourcesModel.self]
 
@@ -134,6 +135,7 @@ final class InspectorSession {
 
     func stop() {
         guard !stopped else { return }
+        flushDeferred()
         stopped = true
         for id in order.reversed() { models[id]?.stop() }
         call("Runtime.disable")
@@ -219,15 +221,18 @@ final class InspectorSession {
                 }
             }
         }
-        view.sendDevToolsCommand(method, params: json) { result, error in
+        view.sendDevToolsCommand(method, params: json) { [weak self] result, error in
             MainActor.assumeIsolated {
                 guard let done, !answered else { return }
                 answered = true
-                if let result {
-                    done((try? JSONSerialization.jsonObject(with: Data(result.utf8))) as? JSON ?? [:], nil)
-                } else {
-                    done(nil, error ?? "\(method) failed")
+                let reply = {
+                    if let result {
+                        done((try? JSONSerialization.jsonObject(with: Data(result.utf8))) as? JSON ?? [:], nil)
+                    } else {
+                        done(nil, error ?? "\(method) failed")
+                    }
                 }
+                if let self { self.deliver(reply) } else { reply() }
             }
         }
     }
@@ -237,6 +242,22 @@ final class InspectorSession {
     }
 
     func receive(_ method: String, _ params: JSON) {
+        guard !stopped else { return }
+        deliver { [weak self] in self?.dispatch(method, params) }
+    }
+
+    private func deliver(_ work: @escaping @MainActor () -> Void) {
+        deferred.append(work)
+        let container = view?.superview as? WebContainerView
+        guard !stopped, container?.heldSize != nil else { return flushDeferred() }
+        if deferred.count == 1 { container?.whenSettled { [weak self] in self?.flushDeferred() } }
+    }
+
+    private func flushDeferred() {
+        while !deferred.isEmpty { deferred.removeFirst()() }
+    }
+
+    private func dispatch(_ method: String, _ params: JSON) {
         guard !stopped else { return }
         var stale = false
         for handler in handlers {

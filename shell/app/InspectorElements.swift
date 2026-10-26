@@ -1811,7 +1811,7 @@ final class RuleBlock: FlippedView, NSViewToolTipOwner {
     }
 
     override func resetCursorRects() {
-        guard rule.editable else { return }
+        guard rule.editable, !visibleRect.isEmpty else { return }
         for entry in lines {
             switch entry.line {
             case .selector where rule.origin != "inline": addCursorRect(selectorRect(entry.y), cursor: .iBeam)
