@@ -385,6 +385,7 @@ fn new_tab(state: &mut State, item: &Item, pinned: bool, now: u64) -> Id {
             pinned_url: pinned.then(|| url.clone()),
             last_active_ms: now,
             always_awake: false,
+            muted: false,
             live: false,
             audible: false,
             frozen: false,

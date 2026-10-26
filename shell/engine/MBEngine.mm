@@ -3951,6 +3951,13 @@ class CookieKeys : public CefCookieVisitor {
   }
 }
 
+- (void)setAudioMuted:(BOOL)muted {
+  _audioMuted = muted;
+  if (_browser) {
+    _browser->GetHost()->SetAudioMuted(muted);
+  }
+}
+
 - (void)setScriptsDisabled:(BOOL)disabled {
   _scriptsDisabled = disabled;
   if (!_browser) {
@@ -4350,6 +4357,9 @@ class CookieKeys : public CefCookieVisitor {
   }
   if (_scriptsDisabled) {
     [self setScriptsDisabled:YES];
+  }
+  if (_audioMuted) {
+    _browser->GetHost()->SetAudioMuted(true);
   }
   if (_cacheDisabled || _latency != 0 || _throughput != 0) {
     _client->SetNetworkOverrides(_browser, _cacheDisabled, _latency,

@@ -28,6 +28,9 @@ enum Menus {
                 menu.add("Allow Ads on \(site)", state: tab.adsAllowed) { store.setAdsAllowed(!tab.adsAllowed, for: tab) }
             }
         }
+        if tab.live || tab.muted {
+            menu.add(tab.muted ? "Unmute Tab" : "Mute Tab") { store.toggleMute(tab.id) }
+        }
         menu.add("Copy Link") { store.copyLink(tab.url) }
         menu.add("Duplicate") { store.duplicate(tab, in: space) }
         menu.add(store.isInLittleWindow(tab.id) ? "Show Little Window" : "Open in Little Window") {

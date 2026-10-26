@@ -139,7 +139,7 @@ private final class RailTabView: HoverView {
         icon.image = FaviconCache.shared.image(for: tab)
         icon.alphaValue = tab.live || space.activeTab == tab.id ? 1 : 0.55
         equalizer.isHidden = !tab.audible
-        equalizer.playing = tab.audible && store.pausedMediaTab != tab.id
+        equalizer.playing = tab.audible && store.pausedMediaTab != tab.id && !tab.muted
         toolTip = tab.displayTitle
         needsDisplay = true
         updateLayer()

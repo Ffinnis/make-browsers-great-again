@@ -25,6 +25,8 @@ pub struct Tab {
     pub last_active_ms: u64,
     #[serde(default)]
     pub always_awake: bool,
+    #[serde(default)]
+    pub muted: bool,
     #[serde(skip)]
     pub live: bool,
     #[serde(skip)]
@@ -402,6 +404,7 @@ impl State {
                 pinned_url: None,
                 last_active_ms: now,
                 always_awake: false,
+                muted: false,
                 live: false,
                 audible: false,
                 frozen: false,
@@ -883,6 +886,12 @@ impl State {
                 true
             }
             _ => false,
+        }
+    }
+
+    pub fn set_muted(&mut self, id: Id, muted: bool) {
+        if let Some(t) = self.tabs.get_mut(&id) {
+            t.muted = muted;
         }
     }
 

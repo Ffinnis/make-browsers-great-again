@@ -6,6 +6,13 @@ extension BrowserStore {
         "yandex": "Yandex", "brave": "Brave", "startpage": "Startpage", "perplexity": "Perplexity", "yahoo": "Yahoo",
     ]
 
+    func toggleMute(_ tabID: UInt64) {
+        guard let tab = core.tab(id: tabID) else { return }
+        core.setMuted(id: tabID, muted: !tab.muted)
+        Self.holder(of: tabID)?.views[tabID]?.audioMuted = !tab.muted
+        refresh()
+    }
+
     func closeVisibleTab() {
         if let id = visibleTabID { closeAsking(id) }
     }

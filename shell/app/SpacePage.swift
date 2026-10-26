@@ -544,8 +544,7 @@ final class TabCellView: NSTableCellView, HoverAware {
         badge.contentTintColor = .labelColor
         badge.alphaValue = 0.5
         badge.toolTip = "Open in a little window"
-        equalizer.alphaValue = 0.6
-        equalizer.toolTip = "Playing"
+        equalizer.onClick = { [weak self] in if let self, let data { store.toggleMute(data.tab.id) } }
         for view in [favicon, title, close, badge, equalizer] as [NSView] { addSubview(view) }
     }
 
@@ -596,7 +595,8 @@ final class TabCellView: NSTableCellView, HoverAware {
         badge.setVisible(!showClose && data.inLittleWindow, animated: animated)
         let audible = !showClose && !data.inLittleWindow && data.tab.audible
         equalizer.setVisible(audible, animated: animated)
-        equalizer.playing = audible && !data.mediaPaused
+        equalizer.playing = audible && !data.mediaPaused && !data.tab.muted
+        equalizer.showMuted(data.tab.muted)
         needsLayout = true
         effectiveAppearance.performAsCurrentDrawingAppearance {
             close.layer?.backgroundColor = Theme.faint(0.08).cgColor

@@ -17,6 +17,22 @@ final class EqualizerView: NSView {
     }
     private var animating = false
 
+    var onClick: (() -> Void)?
+
+    func showMuted(_ muted: Bool) {
+        alphaValue = muted ? 0.3 : 0.6
+        toolTip = muted ? "Muted. Click to unmute" : "Playing. Click to mute"
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if onClick == nil { super.mouseDown(with: event) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let onClick else { return super.mouseUp(with: event) }
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { onClick() }
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true

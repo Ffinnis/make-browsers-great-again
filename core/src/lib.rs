@@ -23,6 +23,7 @@ pub struct TabInfo {
     pub pinned_url: Option<String>,
     pub live: bool,
     pub audible: bool,
+    pub muted: bool,
     pub frozen: bool,
     pub keep_awake: bool,
     pub always_awake: bool,
@@ -341,6 +342,7 @@ fn tab_info(s: &State, t: &Tab) -> TabInfo {
         pinned_url: t.pinned_url.clone(),
         live: t.live,
         audible: t.audible,
+        muted: t.muted,
         frozen: t.frozen,
         keep_awake: s.keeps_awake(&t.url),
         always_awake: t.always_awake,
@@ -788,6 +790,10 @@ impl BrowserCore {
 
     pub fn set_live(&self, id: u64, live: bool) {
         self.mutate(|s, now| s.set_live(id, live, now));
+    }
+
+    pub fn set_muted(&self, id: u64, muted: bool) {
+        self.mutate(|s, _| s.set_muted(id, muted));
     }
 
     pub fn set_audible(&self, id: u64, audible: bool) {

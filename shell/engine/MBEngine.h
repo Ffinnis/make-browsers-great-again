@@ -217,6 +217,7 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (void)stopLoading;
 - (void)printPage;
 - (void)exitFullscreen;
+@property(nonatomic) BOOL audioMuted;
 - (void)saveURLAs:(NSString*)url;
 - (void)zoomIn;
 - (void)zoomOut;

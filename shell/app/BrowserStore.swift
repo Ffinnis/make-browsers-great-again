@@ -362,6 +362,7 @@ final class BrowserStore: NSObject {
         let url = tab.url.isEmpty ? "about:blank" : tab.url
         let view = MBWebView(url: url, profilePath: core.profileDir(profileId: profile), tabID: tab.id)
         view.delegate = self
+        view.audioMuted = tab.muted
         view.picksForInspector = !DeveloperSettings.usesChromeDevTools
         if let state = devStates[tab.id] { view.apply(state) }
         views[tab.id] = view
@@ -1173,7 +1174,7 @@ extension BrowserStore {
         for store in open.allObjects { store.changed(.update) }
     }
 
-    fileprivate static func holder(of id: UInt64) -> BrowserStore? {
+    static func holder(of id: UInt64) -> BrowserStore? {
         open.allObjects.first { $0.views[id] != nil }
     }
 

@@ -189,6 +189,20 @@ fn omnibox_input_resolution() {
 }
 
 #[test]
+fn muted_tabs_stay_muted_after_a_restart() {
+    let dir = temp_dir("muted");
+    let core = BrowserCore::new(dir.clone());
+    let sp = core.snapshot().active_space;
+    let t = core.open_tab(sp, "https://loud.example.com".into(), true).unwrap();
+    assert!(!core.tab(t).unwrap().muted);
+    core.set_muted(t, true);
+    assert!(core.persist());
+    drop(core);
+    let core = BrowserCore::new(dir);
+    assert!(core.tab(t).unwrap().muted);
+}
+
+#[test]
 fn persists_and_reloads_through_ffi() {
     let dir = temp_dir("persist");
     let core = BrowserCore::new(dir.clone());
