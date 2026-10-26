@@ -1601,6 +1601,11 @@ extension BrowserStore: MBWebViewDelegate {
         }
     }
 
+    func windowExitedFullscreen() {
+        enteredFullscreenForContent = false
+        if contentFullscreen { visibleView?.exitFullscreen() }
+    }
+
     nonisolated func webView(_ view: MBWebView, opensExtensionsPage url: String, fromPage page: String) {
         MainActor.assumeIsolated {
             guard isCurrent(view), let profile = core.profileOfTab(tabId: view.tabID) else { return }

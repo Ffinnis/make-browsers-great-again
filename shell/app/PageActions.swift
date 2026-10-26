@@ -107,6 +107,11 @@ extension AppDelegate {
         if let url { store.openFromSystem(url) }
         return store
     }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        guard let store = BrowserStore.front, store.window === notification.object as? NSWindow else { return }
+        store.windowExitedFullscreen()
+    }
 }
 
 @MainActor

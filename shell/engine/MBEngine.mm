@@ -3741,6 +3741,12 @@ class CookieKeys : public CefCookieVisitor {
   }
 }
 
+- (void)exitFullscreen {
+  if (_browser) {
+    _browser->GetHost()->ExitFullscreen(true);
+  }
+}
+
 - (void)zoomIn {
   if (_browser) {
     _browser->GetHost()->Zoom(CEF_ZOOM_COMMAND_IN);
