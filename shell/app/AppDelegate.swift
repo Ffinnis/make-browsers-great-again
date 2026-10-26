@@ -23,7 +23,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
         default: break
         }
-        NSApp.mainMenu = buildMainMenu()
+        NSApp.mainMenu = buildMainMenu().addingFindItems(target: self)
         let extensions = ExtensionHost(core: core, devTools: BrowserDevTools(available: hasBrowserDevTools),
                                        dataDirectory: dataDirectory)
         ExtensionHost.shared = extensions
