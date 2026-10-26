@@ -183,6 +183,9 @@ final class WebContainerView: NSView {
     var viewport: ((MBWebView) -> NSSize?)?
     var onPageAreaChange: (() -> Void)?
     private(set) var pageArea = NSRect.zero
+    var heldSize: NSSize? {
+        didSet { if heldSize != oldValue { placeCurrent() } }
+    }
     private let devToolsEdge = NSView()
     private let devToolsBacking = NSView()
     private lazy var devToolsHeader = DevToolsHeaderView { [weak self] in self?.current?.closeDevTools() }
@@ -218,7 +221,11 @@ final class WebContainerView: NSView {
     }
 
     override func resizeSubviews(withOldSize oldSize: NSSize) {
+        let placed = current?.superview === self ? current : nil
+        let mask = placed?.autoresizingMask ?? []
+        placed?.autoresizingMask = []
         super.resizeSubviews(withOldSize: oldSize)
+        placed?.autoresizingMask = mask
         placeCurrent()
     }
 
@@ -342,17 +349,30 @@ extension WebContainerView {
         }
         guard let current else { return }
         guard let size = viewport?(current) else {
-            if current.frame != area { current.frame = area }
+            let frame = held(area)
+            if current.frame != frame { current.frame = frame }
             if current.layer?.cornerRadius != 0 { setPreview(current, radius: 0) }
             return
         }
-        let top = DevToolbarView.height, margin: CGFloat = 16
-        let width = min(size.width, area.width - 2 * margin)
-        let height = min(size.height, area.height - top - margin)
+        let top = DevToolbarView.height, margin: CGFloat = 16, room = held(area)
+        let width = min(size.width, room.width - 2 * margin)
+        let height = min(size.height, room.height - top - margin)
         let frame = NSRect(x: (area.minX + (area.width - width) / 2).rounded(), y: top,
                            width: max(width, 0), height: max(height, 0))
         if current.frame != frame { current.frame = frame }
         setPreview(current, radius: min(size.width, size.height) < 500 ? 24 : 12)
+    }
+
+    private func held(_ area: NSRect) -> NSRect {
+        guard let heldSize else { return area }
+        let docked = area.width < bounds.width
+        let width = docked ? (heldSize.width - devToolsWidth(in: heldSize.width)).rounded() : heldSize.width
+        return NSRect(x: area.minX, y: area.minY, width: max(area.width, width), height: max(area.height, heldSize.height))
+    }
+
+    private func devToolsWidth(in width: CGFloat) -> CGFloat {
+        let saved = CGFloat(UserDefaults.standard.double(forKey: DeveloperSettings.devToolsWidthKey))
+        return min(max(saved > 0 ? saved : 440, 280), max(width - 320, 280))
     }
 
     private func placeDevTools() -> NSRect {
@@ -364,9 +384,7 @@ extension WebContainerView {
             devToolsHandle.isHidden = true
             return bounds
         }
-        let saved = CGFloat(UserDefaults.standard.double(forKey: DeveloperSettings.devToolsWidthKey))
-        let width = min(max(saved > 0 ? saved : 440, 280), max(bounds.width - 320, 280))
-        let edge = (bounds.width - width).rounded()
+        let edge = (bounds.width - devToolsWidth(in: bounds.width)).rounded()
         if devToolsEdge.superview !== self {
             devToolsEdge.wantsLayer = true
             devToolsBacking.wantsLayer = true
@@ -394,7 +412,13 @@ extension WebContainerView {
         devToolsHeader.dark = dark
         let panel = NSRect(x: edge + 1, y: header, width: bounds.width - edge - 1, height: bounds.height - header)
         let frame = window.convertToScreen(convert(panel, to: nil))
-        if devTools.frame != frame { devTools.setFrame(frame, display: true) }
+        let kept = devTools.frame.size
+        if heldSize != nil, kept.width <= frame.width, kept.height <= frame.height {
+            let origin = NSPoint(x: frame.minX, y: frame.maxY - kept.height)
+            if devTools.frame.origin != origin { devTools.setFrameOrigin(origin) }
+        } else if devTools.frame != frame {
+            devTools.setFrame(frame, display: true)
+        }
         devTools.contentView?.layer?.cornerRadius = cornerRadius
         return NSRect(x: 0, y: 0, width: edge, height: bounds.height)
     }
