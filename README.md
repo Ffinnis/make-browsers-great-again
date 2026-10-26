@@ -93,7 +93,8 @@ How MBGA gets there, roughly in order of impact:
 - **A leaner engine.** The network service runs in the browser process,
   HTTP/3 is off, Blink and V8 run in low-memory mode, and there is no spare
   renderer, prerendering or optimization-hint fetching.
-- **Lazy loading.** After a restart only the visible tab loads.
+- **Lazy loading.** After a restart, spaces open with no tab selected.
+  Pick a tab to load it; each space remembers your choice until you quit.
 
 The costs: sites in the same process are less isolated from each other and
 a heavy page can slow others in its process; heavy JavaScript runs somewhat

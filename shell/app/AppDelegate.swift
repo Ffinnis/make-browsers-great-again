@@ -40,7 +40,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         AdBlocking.updateLists(core: core, loaded: AdBlocking.loadCached(core: core))
         let window = makeWindow(for: primary)
         primary.becomeFront()
-        _ = core.selectDefaultTab(spaceId: store.activeSpace.id)
         store.refresh()
         store.updateCleanupOffer()
         store.warmOtherSpaces()

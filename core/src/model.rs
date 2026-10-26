@@ -71,6 +71,7 @@ pub struct Space {
     pub profile_id: Id,
     pub pinned: Vec<Node>,
     pub today: Vec<Id>,
+    #[serde(skip)]
     pub active_tab: Option<Id>,
     #[serde(skip)]
     pub ephemeral: bool,

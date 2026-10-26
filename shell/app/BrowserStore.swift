@@ -250,13 +250,10 @@ final class BrowserStore: NSObject {
         Self.open.add(self)
         pager.pageCount = snapshot.spaces.count
         pager.setPosition(CGFloat(activeSpaceIndex), animated: false)
-        pager.onSettle = { [weak self] index in
-            guard let self, snapshot.spaces.indices.contains(index) else { return }
-            activateSpace(snapshot.spaces[index].id)
-        }
+        pager.onSettle = { [weak self] index in self?.activateSpace(at: index) }
         pager.onSwipeTowards = { [weak self] index in
-            guard let self, snapshot.spaces.indices.contains(index) else { return }
-            warmSpace(snapshot.spaces[index].id)
+            guard let self, self.snapshot.spaces.indices.contains(index) else { return }
+            warmSpace(self.snapshot.spaces[index].id)
         }
         webContainer.viewport = { [weak self] view in self?.devStates[view.tabID]?.viewport }
         NotificationCenter.default.addObserver(self, selector: #selector(defaultsChanged),
@@ -773,7 +770,6 @@ final class BrowserStore: NSObject {
 
     func activateSpace(_ id: UInt64) {
         guard id != snapshot.activeSpace else { return }
-        if isFront { _ = core.selectDefaultTab(spaceId: id) }
         choose(space: id, tab: nil)
         updateCleanupOffer()
     }
@@ -784,10 +780,9 @@ final class BrowserStore: NSObject {
     }
 
     func warmSpace(_ id: UInt64) {
-        guard id != snapshot.activeSpace else { return }
-        if let tab = core.selectDefaultTab(spaceId: id) ?? snapshot.spaces.first(where: { $0.id == id })?.activeTab {
-            warmTab(tab)
-        }
+        guard id != snapshot.activeSpace,
+              let tab = snapshot.spaces.first(where: { $0.id == id })?.activeTab else { return }
+        warmTab(tab)
     }
 
     func warmOtherSpaces() {
@@ -799,10 +794,6 @@ final class BrowserStore: NSObject {
                 self?.warmSpace(id)
             }
         }
-    }
-
-    func showDefaultTab() {
-        if core.selectDefaultTab(spaceId: activeSpace.id) != nil { refresh() }
     }
 
     func activateSpace(at index: Int) {
@@ -832,7 +823,6 @@ final class BrowserStore: NSObject {
     func deleteSpace(_ id: UInt64) {
         destroyViews(core.deleteSpace(id: id))
         refresh()
-        showDefaultTab()
     }
 
     func createProfile(_ name: String) -> UInt64 {
