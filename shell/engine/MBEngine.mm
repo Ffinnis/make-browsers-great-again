@@ -1783,6 +1783,15 @@ class WebClient : public BaseClient,
     FaviconCallback::Start(view_, browser, icon_urls);
   }
 
+  void OnStatusMessage(CefRefPtr<CefBrowser> browser,
+                       const CefString& value) override {
+    MBWebView* view = view_;
+    if ([view.delegate
+            respondsToSelector:@selector(webView:didChangeStatus:)]) {
+      [view.delegate webView:view didChangeStatus:ToNS(value)];
+    }
+  }
+
   void OnFullscreenModeChange(CefRefPtr<CefBrowser> browser,
                               bool fullscreen) override {
     MBWebView* view = view_;
