@@ -92,6 +92,7 @@ void (^g_download_handler)(MBDownload* download) = nil;
 std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>> g_downloads;
 std::map<std::pair<std::string, uint32_t>, uint32_t> g_download_ids;
 std::set<uint32_t> g_finished_downloads;
+std::set<std::string> g_save_as_urls;
 uint32_t g_last_download = 0;
 
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
@@ -375,7 +376,22 @@ class CodecDelivery {
 
 enum MenuCommand {
   kOpenLinkInNewTab = MENU_ID_USER_FIRST,
+  kOpenLinkInNewWindow,
+  kSaveLink,
   kCopyLink,
+  kOpenImage,
+  kSaveImage,
+  kCopyImage,
+  kCopyImageAddress,
+  kOpenMedia,
+  kSaveMedia,
+  kCopyMediaAddress,
+  kLoopMedia,
+  kShowMediaControls,
+  kSearchSelection,
+  kLookUpSelection,
+  kReload,
+  kEmoji,
   kInspect,
   kFirstExtensionItem,
 };
@@ -874,8 +890,9 @@ class BaseClient : public CefClient,
       CefRefPtr<CefDownloadItem> download_item,
       const CefString& suggested_name,
       CefRefPtr<CefBeforeDownloadCallback> callback) override {
+    bool ask = g_save_as_urls.erase(download_item->GetOriginalUrl()) > 0;
     callback->Continue(UniqueDownloadPath(ToNS(suggested_name)).UTF8String,
-                       false);
+                       ask);
     return true;
   }
 
@@ -1457,6 +1474,56 @@ class FaviconCallback : public CefDownloadImageCallback {
   IMPLEMENT_REFCOUNTING(FaviconCallback);
 };
 
+class CopyImageCallback : public CefDownloadImageCallback {
+ public:
+  void OnDownloadImageFinished(const CefString& image_url,
+                               int http_status_code,
+                               CefRefPtr<CefImage> image) override {
+    int width = 0;
+    int height = 0;
+    CefRefPtr<CefBinaryValue> png =
+        image && !image->IsEmpty() ? image->GetAsPNG(1.0f, true, width, height)
+                                   : nullptr;
+    if (!png || png->GetSize() == 0) {
+      NSBeep();
+      return;
+    }
+    NSMutableData* data = [NSMutableData dataWithLength:png->GetSize()];
+    png->GetData(data.mutableBytes, data.length, 0);
+    NSData* tiff = [NSBitmapImageRep imageRepWithData:data].TIFFRepresentation;
+    NSPasteboard* pasteboard = NSPasteboard.generalPasteboard;
+    [pasteboard clearContents];
+    [pasteboard declareTypes:@[ NSPasteboardTypePNG, NSPasteboardTypeTIFF ]
+                       owner:nil];
+    [pasteboard setData:data forType:NSPasteboardTypePNG];
+    if (tiff) {
+      [pasteboard setData:tiff forType:NSPasteboardTypeTIFF];
+    }
+  }
+
+  IMPLEMENT_REFCOUNTING(CopyImageCallback);
+};
+
+NSString* Quoted(const CefString& text) {
+  NSArray* words =
+      [ToNS(text) componentsSeparatedByCharactersInSet:
+                      NSCharacterSet.whitespaceAndNewlineCharacterSet];
+  NSString* joined = [[words
+      filteredArrayUsingPredicate:[NSPredicate
+                                      predicateWithFormat:@"length > 0"]]
+      componentsJoinedByString:@" "];
+  if (joined.length > 30) {
+    joined = [[joined substringToIndex:30] stringByAppendingString:@"…"];
+  }
+  return [NSString stringWithFormat:@"“%@”", joined];
+}
+
+void CopyString(const CefString& text) {
+  [NSPasteboard.generalPasteboard clearContents];
+  [NSPasteboard.generalPasteboard setString:ToNS(text)
+                                    forType:NSPasteboardTypeString];
+}
+
 class WebClient : public BaseClient,
                   public CefLifeSpanHandler,
                   public CefDisplayHandler,
@@ -1522,22 +1589,59 @@ class WebClient : public BaseClient,
                      CefBrowserSettings& settings,
                      CefRefPtr<CefDictionaryValue>& extra_info,
                      bool* no_javascript_access) override {
-    switch (target_disposition) {
+    if (OpensElsewhere(target_disposition)) {
+      Open(browser, ToNS(target_url), target_disposition);
+      return true;
+    }
+    windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+    client = AuxiliaryClient::Popups();
+    return false;
+  }
+
+  bool OnOpenURLFromTab(CefRefPtr<CefBrowser> browser,
+                        CefRefPtr<CefFrame> frame,
+                        const CefString& target_url,
+                        WindowOpenDisposition target_disposition,
+                        bool user_gesture) override {
+    if (!user_gesture || !OpensElsewhere(target_disposition)) {
+      return false;
+    }
+    NSString* url = ToNS(target_url);
+    CefRefPtr<WebClient> client(this);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      client->Open(browser, url, target_disposition);
+    });
+    return true;
+  }
+
+  static bool OpensElsewhere(WindowOpenDisposition disposition) {
+    switch (disposition) {
       case CEF_WOD_NEW_FOREGROUND_TAB:
       case CEF_WOD_NEW_BACKGROUND_TAB:
       case CEF_WOD_NEW_WINDOW:
-      case CEF_WOD_SINGLETON_TAB: {
-        MBWebView* view = view_;
-        [view.delegate webView:view
-            requestsNewTabWithURL:ToNS(target_url)
-                       foreground:target_disposition !=
-                                  CEF_WOD_NEW_BACKGROUND_TAB];
-        return true;
-      }
-      default:
-        windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
-        client = AuxiliaryClient::Popups();
-        return false;
+      case CEF_WOD_SINGLETON_TAB:
+      case CEF_WOD_SWITCH_TO_TAB:
+      case CEF_WOD_OFF_THE_RECORD:
+      case CEF_WOD_SAVE_TO_DISK: return true;
+      default: return false;
+    }
+  }
+
+  void Open(CefRefPtr<CefBrowser> browser,
+            NSString* url,
+            WindowOpenDisposition disposition) {
+    MBWebView* view = view_;
+    if (disposition == CEF_WOD_SAVE_TO_DISK) {
+      browser->GetHost()->StartDownload(url.UTF8String);
+    } else if (disposition == CEF_WOD_NEW_WINDOW &&
+               [view.delegate
+                   respondsToSelector:@selector(
+                                          webView:requestsNewWindowWithURL:)]) {
+      [view.delegate webView:view requestsNewWindowWithURL:url];
+    } else {
+      [view.delegate webView:view
+          requestsNewTabWithURL:url
+                     foreground:disposition != CEF_WOD_NEW_BACKGROUND_TAB];
     }
   }
 
@@ -2545,16 +2649,135 @@ class WebClient : public BaseClient,
                            CefRefPtr<CefFrame> frame,
                            CefRefPtr<CefContextMenuParams> params,
                            CefRefPtr<CefMenuModel> model) override {
-    if (!params->GetLinkUrl().empty()) {
-      model->InsertItemAt(0, kOpenLinkInNewTab, "Open Link in New Tab");
-      model->InsertItemAt(1, kCopyLink, "Copy Link Address");
-      model->InsertSeparatorAt(2);
+    int flags = params->GetTypeFlags();
+    bool link = !params->GetLinkUrl().empty();
+    bool image = params->GetMediaType() == CM_MEDIATYPE_IMAGE;
+    bool media = params->GetMediaType() == CM_MEDIATYPE_VIDEO ||
+                 params->GetMediaType() == CM_MEDIATYPE_AUDIO;
+    bool selection = (flags & CM_TYPEFLAG_SELECTION) != 0;
+    bool editable = (flags & CM_TYPEFLAG_EDITABLE) != 0;
+    if ((link || image || media) && !selection && !editable) {
+      model->Clear();
+    }
+    int at = 0;
+    auto add = [&](int command, const char* title) {
+      model->InsertItemAt(at++, command, title);
+    };
+    auto group = [&]() {
+      if (at > 0) {
+        model->InsertSeparatorAt(at++);
+      }
+    };
+    if (link) {
+      add(kOpenLinkInNewTab, "Open Link in New Tab");
+      add(kOpenLinkInNewWindow, "Open Link in New Window");
+      group();
+      add(kSaveLink, "Save Link As…");
+      add(kCopyLink, "Copy Link Address");
+    }
+    if (image) {
+      group();
+      add(kOpenImage, "Open Image in New Tab");
+      add(kSaveImage, "Save Image As…");
+      add(kCopyImage, "Copy Image");
+      add(kCopyImageAddress, "Copy Image Address");
+      model->SetEnabled(kCopyImage, params->HasImageContents());
+    }
+    if (media) {
+      AddMediaItems(params, model, at);
+    }
+    if (at > 0 && model->GetCount() > (size_t)at) {
+      model->InsertSeparatorAt(at);
+    }
+    if (selection && !editable) {
+      AddSelectionItems(params, model);
+    }
+    int forward = model->GetIndexOf(MENU_ID_FORWARD);
+    if (forward >= 0) {
+      model->InsertItemAt(forward + 1, kReload, "Reload");
+    }
+    if (editable) {
+      model->AddSeparator();
+      model->AddItem(kEmoji, "Emoji & Symbols");
     }
     if (model->GetCount() > 0) {
       model->AddSeparator();
     }
     AddExtensionItems(params, model);
     model->AddItem(kInspect, "Inspect");
+  }
+
+  void AddMediaItems(CefRefPtr<CefContextMenuParams> params,
+                     CefRefPtr<CefMenuModel> model,
+                     int& at) {
+    bool video = params->GetMediaType() == CM_MEDIATYPE_VIDEO;
+    int state = params->GetMediaStateFlags();
+    bool streamed = params->GetSourceUrl().ToString().rfind("blob:", 0) == 0;
+    if (at > 0) {
+      model->InsertSeparatorAt(at++);
+    }
+    if (params->GetFrameUrl() == params->GetPageUrl()) {
+      model->InsertCheckItemAt(at++, kLoopMedia, "Loop");
+      model->SetChecked(kLoopMedia, (state & CM_MEDIAFLAG_LOOP) != 0);
+      model->SetEnabled(kLoopMedia, (state & CM_MEDIAFLAG_CAN_LOOP) != 0);
+      model->InsertCheckItemAt(at++, kShowMediaControls, "Show Controls");
+      model->SetChecked(kShowMediaControls,
+                        (state & CM_MEDIAFLAG_CONTROLS) != 0);
+      model->SetEnabled(kShowMediaControls,
+                        (state & CM_MEDIAFLAG_CAN_TOGGLE_CONTROLS) != 0);
+    }
+    if (streamed || params->GetSourceUrl().empty()) {
+      return;
+    }
+    if (at > 0) {
+      model->InsertSeparatorAt(at++);
+    }
+    model->InsertItemAt(
+        at++, kOpenMedia,
+        video ? "Open Video in New Tab" : "Open Audio in New Tab");
+    model->InsertItemAt(at++, kSaveMedia,
+                        video ? "Save Video As…" : "Save Audio As…");
+    model->SetEnabled(kSaveMedia, (state & CM_MEDIAFLAG_CAN_SAVE) != 0);
+    model->InsertItemAt(at++, kCopyMediaAddress,
+                        video ? "Copy Video Address" : "Copy Audio Address");
+  }
+
+  void AddSelectionItems(CefRefPtr<CefContextMenuParams> params,
+                         CefRefPtr<CefMenuModel> model) {
+    MBWebView* view = view_;
+    NSString* quoted = Quoted(params->GetSelectionText());
+    int copy = model->GetIndexOf(MENU_ID_COPY);
+    int at = copy >= 0 ? copy + 1 : (int)model->GetCount();
+    if ([view.delegate
+            respondsToSelector:@selector(searchEngineNameForWebView:)]) {
+      NSString* engine = [view.delegate searchEngineNameForWebView:view];
+      NSString* title =
+          engine.length
+              ? [NSString stringWithFormat:@"Search %@ for %@", engine, quoted]
+              : [NSString stringWithFormat:@"Search the Web for %@", quoted];
+      model->InsertItemAt(at++, kSearchSelection, title.UTF8String);
+    }
+    model->InsertItemAt(
+        at, kLookUpSelection,
+        [NSString stringWithFormat:@"Look Up %@", quoted].UTF8String);
+  }
+
+  static void SaveAs(CefRefPtr<CefBrowser> browser, const CefString& url) {
+    g_save_as_urls.insert(url.ToString());
+    browser->GetHost()->StartDownload(url);
+  }
+
+  static void ToggleMedia(CefRefPtr<CefBrowser> browser,
+                          CefRefPtr<CefContextMenuParams> params,
+                          const char* property) {
+    double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
+    NSString* script = [NSString
+        stringWithFormat:
+            @"(() => { const m = document.elementsFromPoint(%f, %f).find("
+            @"e => e instanceof HTMLMediaElement); if (m) m.%s = !m.%s; })()",
+            params->GetXCoord() / zoom, params->GetYCoord() / zoom, property,
+            property];
+    browser->GetMainFrame()->ExecuteJavaScript(script.UTF8String, "", 0);
   }
 
   void AddExtensionItems(CefRefPtr<CefContextMenuParams> params,
@@ -2620,14 +2843,53 @@ class WebClient : public BaseClient,
     MBWebView* view = view_;
     switch (command_id) {
       case kOpenLinkInNewTab:
-        [view.delegate webView:view
-            requestsNewTabWithURL:ToNS(params->GetLinkUrl())
-                       foreground:NO];
+        Open(browser, ToNS(params->GetLinkUrl()), CEF_WOD_NEW_BACKGROUND_TAB);
         return true;
-      case kCopyLink:
-        [NSPasteboard.generalPasteboard clearContents];
-        [NSPasteboard.generalPasteboard setString:ToNS(params->GetLinkUrl())
-                                          forType:NSPasteboardTypeString];
+      case kOpenLinkInNewWindow:
+        Open(browser, ToNS(params->GetLinkUrl()), CEF_WOD_NEW_WINDOW);
+        return true;
+      case kOpenImage:
+      case kOpenMedia:
+        Open(browser, ToNS(params->GetSourceUrl()), CEF_WOD_NEW_BACKGROUND_TAB);
+        return true;
+      case kSaveLink: SaveAs(browser, params->GetLinkUrl()); return true;
+      case kSaveImage:
+      case kSaveMedia: SaveAs(browser, params->GetSourceUrl()); return true;
+      case kCopyLink: CopyString(params->GetLinkUrl()); return true;
+      case kCopyImageAddress:
+      case kCopyMediaAddress: CopyString(params->GetSourceUrl()); return true;
+      case kCopyImage:
+        browser->GetHost()->DownloadImage(params->GetSourceUrl(), false, 0,
+                                          false, new CopyImageCallback());
+        return true;
+      case kLoopMedia:
+      case kShowMediaControls:
+        ToggleMedia(browser, params,
+                    command_id == kLoopMedia ? "loop" : "controls");
+        return true;
+      case kSearchSelection:
+        if ([view.delegate
+                respondsToSelector:@selector(webView:searchesFor:)]) {
+          [view.delegate webView:view
+                     searchesFor:ToNS(params->GetSelectionText())];
+        }
+        return true;
+      case kLookUpSelection: {
+        NSAttributedString* text = [[NSAttributedString alloc]
+            initWithString:ToNS(params->GetSelectionText())];
+        NSPoint point = NSMakePoint(params->GetXCoord(), params->GetYCoord());
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [view showDefinitionForAttributedString:text atPoint:point];
+        });
+        return true;
+      }
+      case kReload: browser->Reload(); return true;
+      case kEmoji: [NSApp orderFrontCharacterPalette:nil]; return true;
+      case MENU_ID_VIEW_SOURCE:
+        Open(browser,
+             [@"view-source:"
+                 stringByAppendingString:ToNS(params->GetPageUrl())],
+             CEF_WOD_NEW_FOREGROUND_TAB);
         return true;
       case kInspect:
         if (inspector_picks_) {

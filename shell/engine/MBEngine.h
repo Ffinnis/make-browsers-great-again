@@ -67,6 +67,9 @@ typedef BOOL (^MBEarlyScript)(NSString* page);
 - (void)webView:(MBWebView*)view
     choseContextMenuItem:(NSString*)itemID
                  context:(NSDictionary*)context;
+- (void)webView:(MBWebView*)view requestsNewWindowWithURL:(NSString*)url;
+- (nullable NSString*)searchEngineNameForWebView:(MBWebView*)view;
+- (void)webView:(MBWebView*)view searchesFor:(NSString*)text;
 @end
 
 @interface MBCookie : NSObject

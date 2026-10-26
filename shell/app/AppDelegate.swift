@@ -188,15 +188,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
         closed.store.windowClosed()
     }
 
-    @objc func newWindow(_ sender: Any?) {
-        let store = BrowserStore(core: core, newWindow: true)
-        let window = makeWindow(for: store)
-        store.refresh()
-        window.makeKeyAndOrderFront(nil)
-        store.commandBar = .newTab
-    }
+    @objc func newWindow(_ sender: Any?) { openWindow().commandBar = .newTab }
 
-    private func makeWindow(for store: BrowserStore) -> NSWindow {
+    func makeWindow(for store: BrowserStore) -> NSWindow {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1280, height: 820),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
