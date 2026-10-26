@@ -37,7 +37,7 @@ enum Menus {
         if tab.live, !(favorite || pinned) {
             menu.add("Sleep Tab") { store.sleep(tab.id) }
         }
-        menu.add(favorite || pinned ? "Unload Tab" : "Close Tab") { store.close(tab.id) }
+        menu.add(favorite || pinned ? "Unload Tab" : "Close Tab") { store.closeAsking(tab.id) }
         return menu
     }
 

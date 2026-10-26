@@ -581,7 +581,7 @@ struct CommandAction {
                     store.openInLittleWindow(tab.id)
                 },
                 Self(id: "close", title: pinned ? "Unload Tab" : "Close Tab", symbol: "xmark", shortcut: "⌘W") {
-                    store.close(tab.id)
+                    store.closeAsking(tab.id)
                 },
                 Self(id: "devtools", title: "Developer Tools", symbol: "hammer", shortcut: "⌥⌘I", keywords: ["inspect", "console"]) {
                     store.showDevTools()

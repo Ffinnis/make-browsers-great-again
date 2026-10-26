@@ -538,7 +538,7 @@ final class TabCellView: NSTableCellView, HoverAware {
         close.layer?.cornerCurve = .continuous
         close.onAction { [weak self] in
             guard let self, let data else { return }
-            self.store.close(data.tab.id)
+            self.store.closeAsking(data.tab.id)
         }
         badge.image = .symbol("macwindow", size: 10, weight: .regular)
         badge.contentTintColor = .labelColor

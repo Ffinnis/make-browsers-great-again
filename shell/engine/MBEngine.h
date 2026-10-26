@@ -143,6 +143,8 @@ typedef NS_ENUM(NSInteger, MBChromeCommand) {
 + (void)runMessageLoop;
 
 + (void)closeAllAndQuit;
++ (void)quitAskingPages;
+@property(class, nonatomic, readonly) BOOL isQuitting;
 
 + (void)shutdown;
 
@@ -253,6 +255,7 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (void)setMediaPaused:(BOOL)paused;
 - (void)setFrozen:(BOOL)frozen;
 - (void)close;
+- (void)closeAskingPage:(void (^)(BOOL closed))reply;
 
 @end
 

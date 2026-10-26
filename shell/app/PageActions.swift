@@ -9,6 +9,28 @@ extension BrowserStore {
     func stopLoading() { visibleView?.stopLoading() }
     func printPage() { visibleView?.printPage() }
 
+    func closeVisibleTab() {
+        if let id = visibleTabID { closeAsking(id) }
+    }
+
+    func closeAsking(_ tabID: UInt64) {
+        guard let view = views[tabID] else { return close(tabID) }
+        view.closeAskingPage { [weak self] closed in
+            if closed { self?.close(tabID) }
+        }
+    }
+
+    func viewSource() {
+        guard let url = visibleTab?.url, !url.isEmpty, !url.hasPrefix("view-source:") else { return }
+        _ = core.openTab(spaceId: activeSpace.id, url: "view-source:" + url, activate: true)
+        refresh()
+    }
+
+    func openVisible(in app: URL) {
+        guard let url = visibleTab?.url, let page = URL(string: url) else { return }
+        NSWorkspace.shared.open([page], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
+    }
+
     nonisolated func webView(_ view: MBWebView, requestsNewWindowWithURL url: String) {
         MainActor.assumeIsolated {
             _ = (NSApp.delegate as? AppDelegate)?.openWindow(url: url)

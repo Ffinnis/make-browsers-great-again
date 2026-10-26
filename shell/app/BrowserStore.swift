@@ -480,10 +480,6 @@ final class BrowserStore: NSObject {
         refresh()
     }
 
-    func closeVisibleTab() {
-        if let id = visibleTabID { close(id) }
-    }
-
     func sleep(_ tabID: UInt64) {
         guard Self.holder(of: tabID) != nil else { return }
         destroyView(tabID)
@@ -1325,17 +1321,6 @@ extension BrowserStore {
         showToast(Toast(message: "Site data cleared", symbol: "trash"), duration: 1.6)
     }
 
-    func viewSource() {
-        guard let url = visibleTab?.url, !url.isEmpty, !url.hasPrefix("view-source:") else { return }
-        _ = core.openTab(spaceId: activeSpace.id, url: "view-source:" + url, activate: true)
-        refresh()
-    }
-
-    func openVisible(in app: URL) {
-        guard let url = visibleTab?.url, let page = URL(string: url) else { return }
-        NSWorkspace.shared.open([page], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
-    }
-
     func loadInVisibleTab(_ url: String) {
         open(url, mode: .editCurrent)
     }
@@ -1778,6 +1763,7 @@ extension BrowserStore: MBWebViewDelegate {
     nonisolated func webViewDidClose(_ view: MBWebView) {
         MainActor.assumeIsolated {
             view.removeFromSuperview()
+            if !MBEngine.isQuitting, views[view.tabID] === view { sleep(view.tabID) }
         }
     }
 }

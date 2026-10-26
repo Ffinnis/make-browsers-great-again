@@ -154,7 +154,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMe
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         _ = core.persist()
-        MBEngine.closeAllAndQuit()
+        MBEngine.quitAskingPages()
         return .terminateCancel
     }
 

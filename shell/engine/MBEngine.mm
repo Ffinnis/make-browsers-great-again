@@ -62,6 +62,7 @@
 - (void)engineDevToolsEvent:(NSString*)method params:(NSDictionary*)params;
 - (void)engineDidPickNode:(int)backendNodeId;
 - (void)engineInspectAt:(NSPoint)point;
+- (void)engineAskToLeave:(BOOL)reload reply:(void (^)(BOOL leave))reply;
 @end
 
 namespace {
@@ -76,6 +77,7 @@ bool g_extension_helper = false;
 void (^g_pipe_handler)(NSString* message) = nil;
 int g_browser_count = 0;
 bool g_quitting = false;
+bool g_asking_to_quit = false;
 bool g_strict_site_isolation = true;
 std::string g_isolated_origins;
 MBRequestFilter g_request_filter = nil;
@@ -1534,6 +1536,7 @@ class WebClient : public BaseClient,
                   public CefContextMenuHandler,
                   public CefDragHandler,
                   public CefFindHandler,
+                  public CefJSDialogHandler,
                   public CefDevToolsMessageObserver {
  public:
   using RawReply = std::function<void(bool, const std::string&)>;
@@ -1553,6 +1556,24 @@ class WebClient : public BaseClient,
   }
   CefRefPtr<CefDragHandler> GetDragHandler() override { return this; }
   CefRefPtr<CefFindHandler> GetFindHandler() override { return this; }
+  CefRefPtr<CefJSDialogHandler> GetJSDialogHandler() override { return this; }
+
+  bool OnBeforeUnloadDialog(CefRefPtr<CefBrowser> browser,
+                            const CefString& message_text,
+                            bool is_reload,
+                            CefRefPtr<CefJSDialogCallback> callback) override {
+    MBWebView* view = view_;
+    if (!view) {
+      return false;
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [view engineAskToLeave:is_reload
+                       reply:^(BOOL leave) {
+                         callback->Continue(leave, CefString());
+                       }];
+    });
+    return true;
+  }
 
   void OnFindResult(CefRefPtr<CefBrowser> browser,
                     int identifier,
@@ -3511,6 +3532,43 @@ class CookieKeys : public CefCookieVisitor {
   CefRunMessageLoop();
 }
 
++ (BOOL)isQuitting {
+  return g_quitting || g_asking_to_quit;
+}
+
++ (void)quitAskingPages {
+  if ([self isQuitting]) {
+    return;
+  }
+  NSArray<MBWebView*>* views = g_views.allObjects;
+  if (views.count == 0) {
+    [self closeAllAndQuit];
+    return;
+  }
+  g_asking_to_quit = true;
+  __block NSUInteger left = views.count;
+  for (MBWebView* view in views) {
+    [view closeAskingPage:^(BOOL closed) {
+      if (!g_asking_to_quit) {
+        return;
+      }
+      if (closed && --left > 0) {
+        return;
+      }
+      g_asking_to_quit = false;
+      if (closed) {
+        [MBEngine closeAllAndQuit];
+        return;
+      }
+      for (MBWebView* gone in views) {
+        if (gone.closing) {
+          [gone.delegate webViewDidClose:gone];
+        }
+      }
+    }];
+  }
+}
+
 + (void)closeAllAndQuit {
   if (g_quitting) {
     return;
@@ -3569,6 +3627,8 @@ class CookieKeys : public CefCookieVisitor {
   BOOL _cacheDisabled;
   double _latency;
   double _throughput;
+  void (^_closeReply)(BOOL closed);
+  BOOL _askingToLeave;
 }
 
 - (instancetype)initWithURL:(NSString*)url
@@ -4086,6 +4146,73 @@ class CookieKeys : public CefCookieVisitor {
   }
 }
 
+- (void)closeAskingPage:(void (^)(BOOL closed))reply {
+  if (!_browser || _closing) {
+    reply(YES);
+    return;
+  }
+  if (_closeReply) {
+    void (^previous)(BOOL) = _closeReply;
+    _closeReply = ^(BOOL closed) {
+      previous(closed);
+      reply(closed);
+    };
+    return;
+  }
+  if (_frozen) {
+    [self setFrozen:NO];
+  }
+  _closeReply = [reply copy];
+  _browser->GetHost()->CloseBrowser(false);
+  __weak MBWebView* weakSelf = self;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
+                 dispatch_get_main_queue(), ^{
+                   MBWebView* view = weakSelf;
+                   if (view && !view->_askingToLeave) {
+                     [view finishAskedClose:YES];
+                   }
+                 });
+}
+
+- (void)finishAskedClose:(BOOL)closed {
+  void (^reply)(BOOL) = _closeReply;
+  _closeReply = nil;
+  if (reply) {
+    reply(closed);
+  }
+}
+
+- (void)engineAskToLeave:(BOOL)reload reply:(void (^)(BOOL leave))reply {
+  if (g_quitting) {
+    reply(YES);
+    return;
+  }
+  _askingToLeave = YES;
+  NSAlert* alert = [[NSAlert alloc] init];
+  alert.messageText = reload ? @"Reload site?" : @"Leave site?";
+  alert.informativeText = @"Changes you made may not be saved.";
+  [alert addButtonWithTitle:reload ? @"Reload" : @"Leave"];
+  [alert addButtonWithTitle:@"Cancel"];
+  __weak MBWebView* weakSelf = self;
+  void (^answer)(NSModalResponse) = ^(NSModalResponse response) {
+    BOOL leave = response == NSAlertFirstButtonReturn;
+    reply(leave);
+    MBWebView* view = weakSelf;
+    if (!view) {
+      return;
+    }
+    view->_askingToLeave = NO;
+    if (!leave) {
+      [view finishAskedClose:NO];
+    }
+  };
+  if (self.window && !self.window.attachedSheet) {
+    [alert beginSheetModalForWindow:self.window completionHandler:answer];
+  } else {
+    answer([alert runModal]);
+  }
+}
+
 - (void)scheduleCloseFallback {
   __weak MBWebView* weakSelf = self;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
@@ -4161,6 +4288,11 @@ class CookieKeys : public CefCookieVisitor {
     NSLog(@"tab %llu: DoClose / teardown", _tabID);
   }
   _closing = YES;
+  if (_closeReply) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self finishAskedClose:YES];
+    });
+  }
   NSArray<dispatch_block_t>* pending = _pendingCommands;
   _pendingCommands = nil;
   for (dispatch_block_t command in pending) {
