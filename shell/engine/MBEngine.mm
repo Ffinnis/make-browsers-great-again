@@ -138,6 +138,7 @@ constexpr char kMediaProbeScript[] =
     "(function(){try{var p=false;"
     "document.querySelectorAll('video,audio').forEach(function(m){"
     "if(!m.paused&&!m.muted&&m.volume>0&&m.readyState>2)p=true;});"
+    "if(document.pictureInPictureElement)p=true;"
     "console.debug('__mbga_media:'+(p?1:0));}catch(e){}})();";
 
 constexpr char kPauseMediaScript[] =
@@ -390,6 +391,7 @@ enum MenuCommand {
   kCopyMediaAddress,
   kLoopMedia,
   kShowMediaControls,
+  kPictureInPicture,
   kSearchSelection,
   kLookUpSelection,
   kReload,
@@ -2783,6 +2785,13 @@ class WebClient : public BaseClient,
                         (state & CM_MEDIAFLAG_CONTROLS) != 0);
       model->SetEnabled(kShowMediaControls,
                         (state & CM_MEDIAFLAG_CAN_TOGGLE_CONTROLS) != 0);
+      if (video) {
+        model->InsertCheckItemAt(at++, kPictureInPicture, "Picture in Picture");
+        model->SetChecked(kPictureInPicture,
+                          (state & CM_MEDIAFLAG_PICTURE_IN_PICTURE) != 0);
+        model->SetEnabled(kPictureInPicture,
+                          (state & CM_MEDIAFLAG_CAN_PICTURE_IN_PICTURE) != 0);
+      }
     }
     if (streamed || params->GetSourceUrl().empty()) {
       return;
@@ -2823,6 +2832,23 @@ class WebClient : public BaseClient,
   static void SaveAs(CefRefPtr<CefBrowser> browser, const CefString& url) {
     g_save_as_urls.insert(url.ToString());
     browser->GetHost()->StartDownload(url);
+  }
+
+  static void TogglePictureInPicture(CefRefPtr<CefBrowser> browser,
+                                     CefRefPtr<CefContextMenuParams> params) {
+    double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
+    NSString* script = [NSString
+        stringWithFormat:
+            @"(() => { const v = document.elementsFromPoint(%f, %f).find("
+            @"e => e instanceof HTMLVideoElement); if (!v) return; "
+            @"document.pictureInPictureElement === v ? "
+            @"document.exitPictureInPicture() : "
+            @"v.requestPictureInPicture().catch(() => {}); })()",
+            params->GetXCoord() / zoom, params->GetYCoord() / zoom];
+    CefRefPtr<CefDictionaryValue> args = CefDictionaryValue::Create();
+    args->SetString("expression", script.UTF8String);
+    args->SetBool("userGesture", true);
+    browser->GetHost()->ExecuteDevToolsMethod(0, "Runtime.evaluate", args);
   }
 
   static void ToggleMedia(CefRefPtr<CefBrowser> browser,
@@ -2924,6 +2950,9 @@ class WebClient : public BaseClient,
       case kShowMediaControls:
         ToggleMedia(browser, params,
                     command_id == kLoopMedia ? "loop" : "controls");
+        return true;
+      case kPictureInPicture:
+        TogglePictureInPicture(browser, params);
         return true;
       case kSearchSelection:
         if ([view.delegate
