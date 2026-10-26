@@ -201,7 +201,7 @@ extension NSMenu {
                in: "Tabs", after: "Previous Tab", hidden: true)
         insert("Previous Tab", #selector(AppDelegate.previousTab(_:)), "{", target: NSApp.delegate as AnyObject?,
                in: "Tabs", after: "Previous Tab", hidden: true)
-        return self
+        return addingTranslateItems()
     }
 
     private func insert(

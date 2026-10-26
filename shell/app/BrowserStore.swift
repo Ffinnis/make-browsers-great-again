@@ -1619,13 +1619,13 @@ extension BrowserStore: MBWebViewDelegate {
         MainActor.assumeIsolated {
             guard isCurrent(view), let profile = core.profileOfTab(tabId: view.tabID) else { return [] }
             let context = context as? [String: Any] ?? [:]
-            return extensions.pageMenuItems(profile: extensions.profilePath(profile), context: context)
+            return pageMenuItems(profile: profile, context: context)
         }
     }
 
     nonisolated func webView(_ view: MBWebView, choseContextMenuItem itemID: String, context: [AnyHashable: Any]) {
         MainActor.assumeIsolated {
-            guard isCurrent(view), let profile = core.profileOfTab(tabId: view.tabID) else { return }
+            guard isCurrent(view), !translator.choose(itemID, in: view), let profile = core.profileOfTab(tabId: view.tabID) else { return }
             extensions.choosePageMenuItem(itemID, context: context as? [String: Any] ?? [:],
                                           profile: extensions.profilePath(profile), tab: view.tabID)
         }
@@ -1690,7 +1690,7 @@ extension BrowserStore: MBWebViewDelegate {
                 $0.status = Int(status)
                 $0.duration = duration
             }
-            passwords.pageLoaded(view)
+            pageLoaded(view)
             rememberPage(view)
         }
     }
