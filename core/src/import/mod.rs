@@ -386,6 +386,7 @@ fn new_tab(state: &mut State, item: &Item, pinned: bool, now: u64) -> Id {
             last_active_ms: now,
             always_awake: false,
             muted: false,
+            page: crate::page::PageState::default(),
             live: false,
             audible: false,
             frozen: false,

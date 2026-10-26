@@ -151,7 +151,8 @@ final class PageCommands: NSObject, NSMenuItemValidation {
                   let content = event.window?.contentView,
                   let page = Self.webView(in: content, at: event.locationInWindow)
             else { return event }
-            if event.buttonNumber == 3 { page.goBack() } else { page.goForward() }
+            let store = BrowserStore.holder(of: page.tabID)
+            if event.buttonNumber == 3 { store?.goBack(page) } else { store?.goForward(page) }
             return nil
         }
     }

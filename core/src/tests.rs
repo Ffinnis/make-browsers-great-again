@@ -189,6 +189,85 @@ fn omnibox_input_resolution() {
 }
 
 #[test]
+fn a_slept_tab_keeps_its_history_and_scroll_position() {
+    let dir = temp_dir("page-state");
+    let core = BrowserCore::new(dir.clone());
+    let sp = core.snapshot().active_space;
+    let t = core.open_tab(sp, "https://c.example.com/".into(), true).unwrap();
+    core.view_created(t);
+    core.record_navigation(
+        t,
+        "https://c.example.com/".into(),
+        vec!["https://a.example.com/".into(), "https://b.example.com/".into()],
+        vec!["https://d.example.com/".into()],
+    );
+    core.set_page_report(t, 420.0, false);
+    assert!(core.persist());
+    drop(core);
+
+    let core = BrowserCore::new(dir);
+    core.view_created(t);
+    assert_eq!(core.take_restored_scroll(t), Some(420.0));
+    assert_eq!(core.take_restored_scroll(t), None);
+    assert_eq!(core.restored_nav(t), RestoredNav { back: true, forward: true });
+    core.record_navigation(t, "https://c.example.com/".into(), vec![], vec![]);
+    assert_eq!(core.pop_restored_back(t, "https://c.example.com/".into()).as_deref(), Some("https://b.example.com/"));
+    core.record_navigation(t, "https://b.example.com/".into(), vec![], vec![]);
+    assert_eq!(core.pop_restored_forward(t).as_deref(), Some("https://c.example.com/"));
+    core.record_navigation(t, "https://c.example.com/".into(), vec!["https://b.example.com/".into()], vec![]);
+    assert_eq!(core.pop_restored_forward(t).as_deref(), Some("https://d.example.com/"));
+}
+
+#[test]
+fn following_a_link_drops_the_restored_forward_pages() {
+    let dir = temp_dir("page-forward");
+    let core = BrowserCore::new(dir);
+    let sp = core.snapshot().active_space;
+    let t = core.open_tab(sp, "https://b.example.com/".into(), true).unwrap();
+    core.view_created(t);
+    core.record_navigation(t, "https://b.example.com/".into(), vec![], vec!["https://c.example.com/".into()]);
+    core.view_created(t);
+    core.record_navigation(t, "https://b.example.com/".into(), vec![], vec![]);
+    assert!(core.restored_nav(t).forward);
+    core.record_navigation(t, "https://new.example.com/".into(), vec!["https://b.example.com/".into()], vec![]);
+    assert!(!core.restored_nav(t).forward);
+}
+
+#[test]
+fn tabs_with_unsaved_form_input_are_not_put_to_sleep() {
+    let dir = temp_dir("editing");
+    let core = BrowserCore::new(dir);
+    let sp = core.snapshot().active_space;
+    let draft = core.open_tab(sp, "https://draft.example.com/".into(), false).unwrap();
+    let idle = core.open_tab(sp, "https://idle.example.com/".into(), false).unwrap();
+    core.open_tab(sp, "https://front.example.com/".into(), true).unwrap();
+    for id in [draft, idle] {
+        core.set_live(id, true);
+    }
+    core.set_page_report(draft, 0.0, true);
+    let sleepers = core.collect_sleepers(MemoryPressure::Critical);
+    assert!(sleepers.contains(&idle));
+    assert!(!sleepers.contains(&draft));
+}
+
+#[test]
+fn duplicating_a_tab_copies_its_history() {
+    let dir = temp_dir("duplicate");
+    let core = BrowserCore::new(dir);
+    let sp = core.snapshot().active_space;
+    let t = core.open_tab(sp, "https://b.example.com/".into(), true).unwrap();
+    core.view_created(t);
+    core.record_navigation(t, "https://b.example.com/".into(), vec!["https://a.example.com/".into()], vec![]);
+    let copy = core.duplicate_tab(t, sp).unwrap();
+    core.view_created(copy);
+    assert_eq!(core.tab(copy).unwrap().url, "https://b.example.com/");
+    assert_eq!(
+        core.pop_restored_back(copy, "https://b.example.com/".into()).as_deref(),
+        Some("https://a.example.com/")
+    );
+}
+
+#[test]
 fn muted_tabs_stay_muted_after_a_restart() {
     let dir = temp_dir("muted");
     let core = BrowserCore::new(dir.clone());

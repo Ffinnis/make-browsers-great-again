@@ -367,6 +367,7 @@ final class BrowserStore: NSObject {
         if let state = devStates[tab.id] { view.apply(state) }
         views[tab.id] = view
         webContainer.add(view)
+        core.viewCreated(id: tab.id)
         core.setLive(id: tab.id, live: true)
         setNeedsRefresh()
     }
@@ -503,7 +504,7 @@ final class BrowserStore: NSObject {
     var canReopen: Bool { snapshot.canReopen }
 
     func duplicate(_ tab: TabInfo, in space: SpaceInfo) {
-        _ = core.openTab(spaceId: space.id, url: tab.url, activate: true)
+        _ = core.duplicateTab(id: tab.id, spaceId: space.id)
         refresh()
     }
 
@@ -653,8 +654,8 @@ final class BrowserStore: NSObject {
 
     var visibleView: MBWebView? { visibleTabID.flatMap { views[$0] } }
 
-    func goBack() { visibleView?.goBack() }
-    func goForward() { visibleView?.goForward() }
+    func goBack() { visibleView.map(goBack) }
+    func goForward() { visibleView.map(goForward) }
     func reloadOrStop() {
         if nav.isLoading { visibleView?.stopLoading() } else { visibleView?.reload() }
     }
@@ -1544,7 +1545,7 @@ extension BrowserStore: MBWebViewDelegate {
         MainActor.assumeIsolated {
             guard isCurrent(view) else { return }
             if loading, navStates[view.tabID]?.isLoading != true { consoleLogs[view.tabID] = nil }
-            let state = NavState(isLoading: loading, canGoBack: canGoBack, canGoForward: canGoForward)
+            let state = adjustedNav(view.tabID, NavState(isLoading: loading, canGoBack: canGoBack, canGoForward: canGoForward))
             if navStates[view.tabID]?.isLoading != loading { extensions.setNeedsSync() }
             navStates[view.tabID] = state
             if view.tabID == visibleTabID { nav = state }
@@ -1697,6 +1698,7 @@ extension BrowserStore: MBWebViewDelegate {
                 $0.duration = duration
             }
             passwords.pageLoaded(view)
+            rememberPage(view)
         }
     }
 

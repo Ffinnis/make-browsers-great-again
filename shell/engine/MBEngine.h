@@ -78,11 +78,19 @@ typedef void (^MBCredentialsHandler)(
 - (void)webView:(MBWebView*)view searchesFor:(NSString*)text;
 - (void)webView:(MBWebView*)view didChangeStatus:(NSString*)status;
 - (void)webView:(MBWebView*)view
+    didReportScroll:(double)scroll
+            editing:(BOOL)editing;
+- (void)webView:(MBWebView*)view
     requestsCredentialsForHost:(NSString*)host
                          realm:(NSString*)realm
                          proxy:(BOOL)proxy
                          reply:(void (^)(NSString* _Nullable user,
                                          NSString* _Nullable password))reply;
+@end
+
+@interface MBNavigationEntry : NSObject
+@property(nonatomic, copy) NSString* url;
+@property(nonatomic, copy) NSString* title;
 @end
 
 @interface MBCookie : NSObject
@@ -225,6 +233,11 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (void)printPage;
 - (void)exitFullscreen;
 @property(nonatomic) BOOL audioMuted;
+@property(nonatomic, readonly) BOOL canGoBack;
+@property(nonatomic, readonly) BOOL canGoForward;
+- (void)replaceURL:(NSString*)url;
+- (void)goBy:(NSInteger)offset;
+- (NSArray<MBNavigationEntry*>*)navigationEntries:(NSInteger*)current;
 - (void)saveURLAs:(NSString*)url;
 - (void)zoomIn;
 - (void)zoomOut;

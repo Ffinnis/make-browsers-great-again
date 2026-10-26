@@ -127,6 +127,7 @@ const char* RequestKind(cef_resource_type_t type) {
 }
 
 constexpr char kMediaProbePrefix[] = "__mbga_media:";
+constexpr char kPageReportPrefix[] = "__mbga_page:";
 constexpr char kThemePrefix[] = "__mbga_theme:";
 constexpr char kThemeColorScript[] =
     "(function(){try{var c='';var ms=document.querySelectorAll("
@@ -140,6 +141,12 @@ constexpr char kMediaProbeScript[] =
     "document.querySelectorAll('video,audio').forEach(function(m){"
     "if(!m.paused&&!m.muted&&m.volume>0&&m.readyState>2)p=true;});"
     "if(document.pictureInPictureElement)p=true;"
+    "var d=false;document.querySelectorAll('input,textarea').forEach("
+    "function(e){if(e.type==='checkbox'||e.type==='radio'){"
+    "if(e.checked!==e.defaultChecked)d=true;}else if(['hidden','submit',"
+    "'button','reset','image','file','search'].indexOf(e.type)<0&&"
+    "e.value!==''&&e.value!==e.defaultValue)d=true;});"
+    "console.debug('__mbga_page:'+Math.round(scrollY)+':'+(d?1:0));"
     "console.debug('__mbga_media:'+(p?1:0));}catch(e){}})();";
 
 constexpr char kPauseMediaScript[] =
@@ -1542,6 +1549,26 @@ class FaviconCallback : public CefDownloadImageCallback {
   IMPLEMENT_REFCOUNTING(FaviconCallback);
 };
 
+class HistoryVisitor : public CefNavigationEntryVisitor {
+ public:
+  explicit HistoryVisitor(void (^visit)(NSString* url,
+                                        NSString* title,
+                                        bool current))
+      : visit_(visit) {}
+
+  bool Visit(CefRefPtr<CefNavigationEntry> entry,
+             bool current,
+             int index,
+             int total) override {
+    visit_(ToNS(entry->GetURL()), ToNS(entry->GetTitle()), current);
+    return true;
+  }
+
+ private:
+  void (^visit_)(NSString* url, NSString* title, bool current);
+  IMPLEMENT_REFCOUNTING(HistoryVisitor);
+};
+
 class CopyImageCallback : public CefDownloadImageCallback {
  public:
   void OnDownloadImageFinished(const CefString& image_url,
@@ -1873,6 +1900,10 @@ class WebClient : public BaseClient,
       }
       return true;
     }
+    if (text.rfind(kPageReportPrefix, 0) == 0) {
+      ReportPage(text.substr(sizeof(kPageReportPrefix) - 1));
+      return true;
+    }
     if (text.rfind(kMediaProbePrefix, 0) != 0) {
       CountConsoleMessage(level);
       NSInteger severity = level >= LOGSEVERITY_ERROR     ? 3
@@ -1889,6 +1920,20 @@ class WebClient : public BaseClient,
     }
     [view_ engineSetMediaPlaying:text.back() == '1'];
     return true;
+  }
+
+  void ReportPage(const std::string& report) {
+    MBWebView* view = view_;
+    size_t colon = report.find(':');
+    if (colon == std::string::npos ||
+        ![view.delegate
+            respondsToSelector:@selector(webView:didReportScroll:editing:)]) {
+      return;
+    }
+    double scroll = atof(report.substr(0, colon).c_str());
+    [view.delegate webView:view
+           didReportScroll:scroll
+                   editing:report.substr(colon + 1) == "1"];
   }
 
   void CountConsoleMessage(cef_log_severity_t level) {
@@ -3111,6 +3156,9 @@ class WebClient : public BaseClient,
 
 }
 
+@implementation MBNavigationEntry
+@end
+
 @implementation MBPermissionPrompt {
   NSString* _message;
   void (^_done)(BOOL);
@@ -3985,6 +4033,48 @@ class CookieKeys : public CefCookieVisitor {
     _client->SetNetworkOverrides(_browser, _cacheDisabled, _latency,
                                  _throughput);
   }
+}
+
+- (NSArray<MBNavigationEntry*>*)navigationEntries:(NSInteger*)current {
+  NSMutableArray<MBNavigationEntry*>* entries = [NSMutableArray array];
+  __block NSInteger index = -1;
+  if (_browser) {
+    CefRefPtr<HistoryVisitor> visitor(
+        new HistoryVisitor(^(NSString* url, NSString* title, bool is_current) {
+          if (is_current) {
+            index = (NSInteger)entries.count;
+          }
+          MBNavigationEntry* entry = [[MBNavigationEntry alloc] init];
+          entry.url = url;
+          entry.title = title;
+          [entries addObject:entry];
+        }));
+    _browser->GetHost()->GetNavigationEntries(visitor, false);
+  }
+  *current = index;
+  return entries;
+}
+
+- (void)goBy:(NSInteger)offset {
+  [self runScript:[NSString stringWithFormat:@"history.go(%ld)", (long)offset]];
+}
+
+- (BOOL)canGoBack {
+  return _browser && _browser->CanGoBack();
+}
+
+- (BOOL)canGoForward {
+  return _browser && _browser->CanGoForward();
+}
+
+- (void)replaceURL:(NSString*)url {
+  NSData* json = [NSJSONSerialization dataWithJSONObject:@[ url ]
+                                                 options:0
+                                                   error:nil];
+  NSString* array = [[NSString alloc] initWithData:json
+                                          encoding:NSUTF8StringEncoding];
+  [self
+      runScript:[NSString stringWithFormat:@"location.replace(%@[0])", array]];
 }
 
 - (void)setAudioMuted:(BOOL)muted {

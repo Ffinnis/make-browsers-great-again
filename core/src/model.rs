@@ -27,6 +27,8 @@ pub struct Tab {
     pub always_awake: bool,
     #[serde(default)]
     pub muted: bool,
+    #[serde(default)]
+    pub page: crate::page::PageState,
     #[serde(skip)]
     pub live: bool,
     #[serde(skip)]
@@ -405,6 +407,7 @@ impl State {
                 last_active_ms: now,
                 always_awake: false,
                 muted: false,
+                page: crate::page::PageState::default(),
                 live: false,
                 audible: false,
                 frozen: false,
@@ -994,7 +997,7 @@ impl State {
         let mut sleepers = Vec::new();
         let mut remaining = live.len();
         for t in live {
-            if t.audible || self.stays_awake(t) {
+            if t.audible || t.page.editing || self.stays_awake(t) {
                 continue;
             }
             let idle = now.saturating_sub(t.last_used_ms()) >= timeout_ms;

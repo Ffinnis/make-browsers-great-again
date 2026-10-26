@@ -6,6 +6,7 @@ pub mod downloads;
 pub mod history;
 pub mod import;
 pub mod model;
+pub mod page;
 pub mod passwords;
 
 use model::{Container, Id, Node, Pressure, State, Tab};
@@ -84,6 +85,12 @@ pub struct HistoryItem {
     pub url: String,
     pub title: String,
     pub site_prefix: bool,
+}
+
+#[derive(uniffi::Record, Clone, Debug, PartialEq)]
+pub struct RestoredNav {
+    pub back: bool,
+    pub forward: bool,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -411,6 +418,10 @@ impl BrowserCore {
         inner.dirty = true;
         inner.revision += 1;
         r
+    }
+
+    fn page_of<R>(&self, id: u64, f: impl FnOnce(&mut page::PageState) -> R) -> Option<R> {
+        self.mutate(|s, _| s.tabs.get_mut(&id).map(|t| f(&mut t.page)))
     }
 }
 
@@ -790,6 +801,48 @@ impl BrowserCore {
 
     pub fn set_live(&self, id: u64, live: bool) {
         self.mutate(|s, now| s.set_live(id, live, now));
+    }
+
+    pub fn view_created(&self, id: u64) {
+        self.page_of(id, page::PageState::view_created);
+    }
+
+    pub fn record_navigation(&self, id: u64, url: String, back: Vec<String>, forward: Vec<String>) {
+        self.page_of(id, |p| p.record(&url, back, forward));
+    }
+
+    pub fn restored_nav(&self, id: u64) -> RestoredNav {
+        let inner = self.lock();
+        inner.state.tabs.get(&id).map_or(RestoredNav { back: false, forward: false }, |t| RestoredNav {
+            back: t.page.can_restore_back(),
+            forward: t.page.can_restore_forward(),
+        })
+    }
+
+    pub fn pop_restored_back(&self, id: u64, current: String) -> Option<String> {
+        self.page_of(id, |p| p.pop_older(&current)).flatten()
+    }
+
+    pub fn pop_restored_forward(&self, id: u64) -> Option<String> {
+        self.page_of(id, page::PageState::pop_newer).flatten()
+    }
+
+    pub fn set_page_report(&self, id: u64, scroll_y: f64, editing: bool) {
+        self.page_of(id, |p| {
+            p.scroll_y = scroll_y;
+            p.editing = editing;
+        });
+    }
+
+    pub fn take_restored_scroll(&self, id: u64) -> Option<f64> {
+        self.page_of(id, page::PageState::take_scroll).flatten()
+    }
+
+    pub fn duplicate_tab(&self, id: u64, space_id: u64) -> Option<u64> {
+        let tab = self.lock().state.tabs.get(&id).cloned()?;
+        let copy = self.open_tab(space_id, tab.url, true)?;
+        self.page_of(copy, |p| *p = tab.page.copied());
+        Some(copy)
     }
 
     pub fn set_muted(&self, id: u64, muted: bool) {
