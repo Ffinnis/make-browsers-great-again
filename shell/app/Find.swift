@@ -72,6 +72,29 @@ final class PageFinder {
         view.findText(state.query, forward: forward, next: true)
     }
 
+    func useSelection() {
+        guard let id = store.visibleTabID, let view = store.views[id] else { return }
+        let params = #"{"expression":"String(getSelection())","returnByValue":true}"#
+        view.sendDevToolsCommand("Runtime.evaluate", params: params) { [weak self] result, _ in
+            MainActor.assumeIsolated {
+                guard let self, let text = Self.stringValue(of: result), !text.isEmpty else { return }
+                let pasteboard = NSPasteboard(name: .find)
+                pasteboard.clearContents()
+                pasteboard.setString(text, forType: .string)
+                self.lastQuery = text
+                self.show()
+                self.search(text)
+            }
+        }
+    }
+
+    private static func stringValue(of result: String?) -> String? {
+        guard let data = result?.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let value = (json["result"] as? [String: Any])?["value"] as? String else { return nil }
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     func close(focusingPage: Bool = true) {
         guard let state else { return }
         let view = store.views[state.tabID]
@@ -100,6 +123,7 @@ extension BrowserStore {
 extension AppDelegate {
     @objc func showFind(_ sender: Any?) { if !MBEngine.performChromeCommand(.find) { store.finder.show() } }
     @objc func findNext(_ sender: Any?) { if !MBEngine.performChromeCommand(.findNext) { store.finder.next(forward: true) } }
+    @objc func useSelectionForFind(_ sender: Any?) { store.finder.useSelection() }
     @objc func findPrevious(_ sender: Any?) {
         if !MBEngine.performChromeCommand(.findPrevious) { store.finder.next(forward: false) }
     }
@@ -113,9 +137,11 @@ extension NSMenu {
             ("Find…", #selector(AppDelegate.showFind(_:)), [.command]),
             ("Find Next", #selector(AppDelegate.findNext(_:)), [.command]),
             ("Find Previous", #selector(AppDelegate.findPrevious(_:)), [.command, .shift]),
+            ("Use Selection for Find", #selector(AppDelegate.useSelectionForFind(_:)), [.command]),
         ]
+        let keys = ["Find…": "f", "Use Selection for Find": "e"]
         for (title, action, modifiers) in entries {
-            let item = NSMenuItem(title: title, action: action, keyEquivalent: title == "Find…" ? "f" : "g")
+            let item = NSMenuItem(title: title, action: action, keyEquivalent: keys[title] ?? "g")
             item.keyEquivalentModifierMask = modifiers
             item.target = target
             edit.addItem(item)
