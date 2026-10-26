@@ -218,6 +218,56 @@ fn persists_and_reloads_through_ffi() {
 }
 
 #[test]
+fn spaces_start_each_session_empty_and_remember_choices_during_the_session() {
+    let dir = temp_dir("session-selections");
+    let core = BrowserCore::new(dir.clone());
+    let initial = core.snapshot();
+    let first = initial.active_space;
+    let second = core.create_space("Second".into(), "2".into(), 0, initial.profiles[0].id);
+    let first_tab = core.open_tab(first, "https://first.example".into(), true).unwrap();
+    let second_tab = core.open_tab(second, "https://second.example".into(), true).unwrap();
+    core.set_active_space(second);
+    assert_eq!(core.snapshot().spaces[0].active_tab, Some(first_tab));
+    assert_eq!(core.snapshot().spaces[1].active_tab, Some(second_tab));
+    assert!(core.persist());
+    drop(core);
+
+    let core = BrowserCore::new(dir.clone());
+    let restored = core.snapshot();
+    assert_eq!(restored.active_space, second);
+    assert!(restored.spaces.iter().all(|space| space.active_tab.is_none()));
+    assert_eq!(restored.spaces[0].today[0].id, first_tab);
+    assert_eq!(restored.spaces[1].today[0].id, second_tab);
+    core.set_active_space(first);
+    assert!(core.snapshot().spaces[0].active_tab.is_none());
+    core.activate_tab(first, first_tab);
+    core.set_active_space(second);
+    assert!(core.snapshot().spaces[1].active_tab.is_none());
+    core.activate_tab(second, second_tab);
+    core.set_active_space(first);
+    assert_eq!(core.snapshot().spaces[0].active_tab, Some(first_tab));
+    core.set_active_space(second);
+    assert_eq!(core.snapshot().spaces[1].active_tab, Some(second_tab));
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn saved_selections_from_older_versions_do_not_select_tabs_on_launch() {
+    let mut state = State::new_default();
+    let first = home(&state);
+    let second = state.create_space("Second", "2", 0, state.profiles[0].id);
+    let first_tab = state.open_tab(first, "https://first.example", true, 1).unwrap();
+    let second_tab = state.open_tab(second, "https://second.example", true, 2).unwrap();
+    let mut saved = serde_json::to_value(&state).unwrap();
+    saved["spaces"][0]["active_tab"] = serde_json::json!(first_tab);
+    saved["spaces"][1]["active_tab"] = serde_json::json!(second_tab);
+    let restored: State = serde_json::from_value(saved).unwrap();
+    assert!(restored.spaces.iter().all(|space| space.active_tab.is_none()));
+    assert_eq!(restored.spaces[0].today, vec![first_tab]);
+    assert_eq!(restored.spaces[1].today, vec![second_tab]);
+}
+
+#[test]
 fn corrupt_state_is_backed_up() {
     let dir = temp_dir("corrupt");
     fs::create_dir_all(&dir).unwrap();

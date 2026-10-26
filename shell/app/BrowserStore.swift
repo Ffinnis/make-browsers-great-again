@@ -796,10 +796,6 @@ final class BrowserStore: NSObject {
         }
     }
 
-    func showDefaultTab() {
-        if core.selectDefaultTab(spaceId: activeSpace.id) != nil { refresh() }
-    }
-
     func activateSpace(at index: Int) {
         if snapshot.spaces.indices.contains(index) { activateSpace(snapshot.spaces[index].id) }
     }
@@ -827,7 +823,6 @@ final class BrowserStore: NSObject {
     func deleteSpace(_ id: UInt64) {
         destroyViews(core.deleteSpace(id: id))
         refresh()
-        showDefaultTab()
     }
 
     func createProfile(_ name: String) -> UInt64 {
