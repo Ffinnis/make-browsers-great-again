@@ -22,7 +22,7 @@ final class HistoryMenu: NSObject, NSMenuDelegate {
             menu.removeItem(item)
         }
         guard let store else { return }
-        let closed = store.canReopen ? store.core.closedTabs(limit: 10) : []
+        let closed = store.canReopen ? store.closedTabs(limit: 10) : []
         let recentlyClosed = NSMenuItem(title: "Recently Closed", action: nil, keyEquivalent: "")
         recentlyClosed.tag = Self.dynamicTag
         recentlyClosed.submenu = NSMenu(title: "Recently Closed")

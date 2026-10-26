@@ -124,6 +124,7 @@ typedef NS_ENUM(NSInteger, MBDownloadState) {
 @property(nonatomic, readonly) int64_t total;
 @property(nonatomic, readonly) int64_t speed;
 @property(nonatomic, readonly) MBDownloadState state;
+@property(nonatomic, readonly) BOOL ephemeral;
 @end
 
 typedef NS_ENUM(NSInteger, MBChromeCommand) {
@@ -187,6 +188,7 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
                 pageScript:(nullable MBPageScript)script;
 
 + (void)prepareProfilePath:(NSString*)profilePath;
++ (void)forgetProfilePath:(NSString*)profilePath;
 
 + (BOOL)isExtensionsWindow:(NSWindow*)window;
 

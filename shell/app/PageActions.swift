@@ -105,6 +105,10 @@ private struct SignInPrompt {
 extension AppDelegate {
     @discardableResult
     func openWindow(url: String? = nil, in space: UInt64? = nil) -> BrowserStore {
+        if let url, let space, let store = BrowserStore.windows.first(where: { $0.privateSpace == space }) {
+            store.openInPrivateSpace(url)
+            return store
+        }
         let store = BrowserStore(core: core, newWindow: true)
         let window = makeWindow(for: store)
         store.refresh()

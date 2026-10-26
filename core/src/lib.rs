@@ -3,6 +3,7 @@ uniffi::setup_scaffolding!();
 pub mod blocker;
 pub mod crypto;
 pub mod downloads;
+pub mod ephemeral;
 pub mod history;
 pub mod import;
 pub mod model;
@@ -54,6 +55,7 @@ pub struct SpaceInfo {
     pub pinned: Vec<PinnedRow>,
     pub today: Vec<TabInfo>,
     pub active_tab: Option<u64>,
+    pub ephemeral: bool,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -442,6 +444,7 @@ impl BrowserCore {
         for id in std::mem::take(&mut state.doomed_profiles) {
             let _ = fs::remove_dir_all(profile_dir_in(&data_dir, id));
         }
+        let _ = fs::remove_dir_all(ephemeral::favicon_dir(&data_dir));
         Arc::new(BrowserCore {
             inner: Mutex::new(Inner {
                 state,
@@ -490,12 +493,14 @@ impl BrowserCore {
                     pinned,
                     today: space.today.iter().filter_map(|id| s.tabs.get(id).map(|t| tab_info(s, t))).collect(),
                     active_tab: space.active_tab,
+                    ephemeral: space.ephemeral,
                 }
             })
             .collect();
         let profiles = s
             .profiles
             .iter()
+            .filter(|p| !p.ephemeral)
             .map(|p| ProfileInfo {
                 id: p.id,
                 name: p.name.clone(),
@@ -533,7 +538,11 @@ impl BrowserCore {
     }
 
     pub fn profile_dir(&self, profile_id: u64) -> String {
-        profile_dir_in(&self.lock().data_dir, profile_id).to_string_lossy().into_owned()
+        let inner = self.lock();
+        if inner.state.is_ephemeral_profile(profile_id) {
+            return format!("private-{profile_id}");
+        }
+        profile_dir_in(&inner.data_dir, profile_id).to_string_lossy().into_owned()
     }
 
     pub fn profile_of_tab(&self, tab_id: u64) -> Option<u64> {
@@ -584,8 +593,10 @@ impl BrowserCore {
     pub fn open_tab(&self, space_id: u64, url: String, activate: bool) -> Option<u64> {
         let id = self.mutate(|s, now| s.open_tab(space_id, &url, activate, now))?;
         let mut inner = self.lock();
-        inner.history.record(&url, now_ms());
-        inner.history_dirty = true;
+        if !inner.state.is_ephemeral_tab(id) {
+            inner.history.record(&url, now_ms());
+            inner.history_dirty = true;
+        }
         Some(id)
     }
 
@@ -604,6 +615,9 @@ impl BrowserCore {
             inner.state.update_tab(id, url.as_deref(), title.as_deref());
             inner.dirty = true;
             inner.revision += 1;
+            if inner.state.is_ephemeral_tab(id) {
+                return;
+            }
             let page = inner.state.tabs[&id].url.clone();
             if url_changed {
                 inner.history.record(&page, now_ms());
@@ -643,10 +657,10 @@ impl BrowserCore {
         self.lock().downloads.items().to_vec()
     }
 
-    pub fn start_download(&self, url: String, path: String) -> u64 {
+    pub fn start_download(&self, url: String, path: String, ephemeral: bool) -> u64 {
         let mut inner = self.lock();
         inner.downloads_dirty = true;
-        inner.downloads.start(&url, &path, now_ms())
+        inner.downloads.start(&url, &path, ephemeral, now_ms())
     }
 
     pub fn update_download(&self, id: u64, path: String, received: u64, total: u64, state: downloads::DownloadState) {
@@ -679,8 +693,8 @@ impl BrowserCore {
         self.mutate(|s, _| s.clear_today(space_id))
     }
 
-    pub fn undo_close(&self) -> Option<ReopenOutcome> {
-        self.mutate(|s, _| s.reopen_last()).map(|(space_id, tabs)| ReopenOutcome { space_id, tabs })
+    pub fn undo_close(&self, private_space: Option<u64>) -> Option<ReopenOutcome> {
+        self.mutate(|s, _| s.reopen_last(private_space)).map(|(space_id, tabs)| ReopenOutcome { space_id, tabs })
     }
 
     pub fn reopen_tab(&self, id: u64) -> Option<u64> {
@@ -710,10 +724,10 @@ impl BrowserCore {
         self.mutate(|s, now| s.step_away(id, now))
     }
 
-    pub fn closed_tabs(&self, limit: u32) -> Vec<TabInfo> {
+    pub fn closed_tabs(&self, limit: u32, private_space: Option<u64>) -> Vec<TabInfo> {
         let inner = self.lock();
         let s = &inner.state;
-        s.closed_tabs().take(limit as usize).map(|t| tab_info(s, t)).collect()
+        s.closed_tabs(private_space).take(limit as usize).map(|t| tab_info(s, t)).collect()
     }
 
     pub fn idle_today_count(&self, space_id: u64, hours: u32) -> u32 {
@@ -747,7 +761,11 @@ impl BrowserCore {
         let Some(tab) = inner.state.tabs.get(&tab_id) else {
             return;
         };
-        let dir = inner.data_dir.join("favicons");
+        let dir = if inner.state.is_ephemeral_tab(tab_id) {
+            ephemeral::favicon_dir(&inner.data_dir)
+        } else {
+            inner.data_dir.join("favicons")
+        };
         let path = dir.join(format!("{:016x}.png", fnv1a(host_of(&tab.url))));
         let unchanged = fs::metadata(&path).is_ok_and(|m| m.len() == png.len() as u64);
         if !unchanged {
@@ -1145,7 +1163,9 @@ impl BrowserCore {
 
     pub fn password_offer(&self, profile_id: u64, url: String, username: String, password: String) -> PasswordOffer {
         let inner = self.lock();
-        let Some(key) = inner.password_key.as_ref() else { return PasswordOffer::Nothing };
+        let Some(key) = inner.password_key.as_ref().filter(|_| !inner.state.is_ephemeral_profile(profile_id)) else {
+            return PasswordOffer::Nothing;
+        };
         match inner.passwords.offer(key, profile_id, &url, &username, &password) {
             passwords::Offer::Nothing => PasswordOffer::Nothing,
             passwords::Offer::Save => PasswordOffer::Save,
@@ -1155,6 +1175,9 @@ impl BrowserCore {
 
     pub fn save_login(&self, profile_id: u64, url: String, username: String, password: String) -> Option<u64> {
         let mut inner = self.lock();
+        if inner.state.is_ephemeral_profile(profile_id) {
+            return None;
+        }
         let key = inner.password_key.clone()?;
         let id = inner.passwords.save(&key, profile_id, &url, &username, &password, now_ms())?;
         inner.passwords_dirty = true;
@@ -1176,6 +1199,9 @@ impl BrowserCore {
 
     pub fn never_save_passwords(&self, profile_id: u64, url: String) {
         let mut inner = self.lock();
+        if inner.state.is_ephemeral_profile(profile_id) {
+            return;
+        }
         inner.passwords.never_save(profile_id, &url);
         inner.passwords_dirty = true;
     }
@@ -1242,7 +1268,7 @@ impl BrowserCore {
             }
         }
         if inner.dirty {
-            if write_atomic(&inner.data_dir, STATE_FILE, &inner.state) {
+            if write_atomic(&inner.data_dir, STATE_FILE, &*inner.state.persisted()) {
                 inner.dirty = false;
             } else {
                 ok = false;

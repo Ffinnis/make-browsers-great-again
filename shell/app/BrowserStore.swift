@@ -234,10 +234,12 @@ final class BrowserStore: NSObject {
     private var mirroredTab: UInt64?
     private var mirrorTimer: Timer?
     private var mirrorPending = false
+    let privateSpace: UInt64?
 
-    init(core: BrowserCore, newWindow: Bool = false) {
+    init(core: BrowserCore, newWindow: Bool = false, privateSpace: UInt64? = nil) {
         self.core = core
-        let snapshot = core.snapshot()
+        self.privateSpace = privateSpace
+        let snapshot = core.snapshot().seen(fromPrivateSpace: privateSpace)
         coreSnapshot = snapshot
         ownSpace = snapshot.activeSpace
         ownTabs = Dictionary(uniqueKeysWithValues: snapshot.spaces.map { ($0.id, $0.activeTab) })
@@ -303,7 +305,7 @@ final class BrowserStore: NSObject {
     func refresh(animation: Motion.Curve? = nil) {
         refreshPending = false
         if core.revision() != snapshot.revision {
-            noteCore(core.snapshot())
+            noteCore(core.snapshot().seen(fromPrivateSpace: privateSpace))
             applyChoices(animation: animation)
             schedulePersist()
             for store in Self.open.allObjects where store !== self { store.setNeedsRefresh() }
@@ -491,7 +493,7 @@ final class BrowserStore: NSObject {
 
     func undoClose() {
         toast = nil
-        guard let outcome = core.undoClose() else { return }
+        guard let outcome = core.undoClose(privateSpace: privateSpace) else { return }
         refresh()
         if outcome.tabs.count == 1, let id = outcome.tabs.first { select(id, in: outcome.spaceId) }
     }
@@ -963,16 +965,6 @@ final class BrowserStore: NSObject {
         }
     }
 
-    func tintColors(matchPage: Bool, dark: Bool) -> [UInt32] {
-        var colors = snapshot.spaces.map(\.color)
-        guard matchPage, colors.indices.contains(activeSpaceIndex),
-              let site = visibleTab?.site, let page = pageColors[site],
-              dark ? page.luminance <= 0.7 : page.luminance >= 0.2
-        else { return colors }
-        colors[activeSpaceIndex] = page.hex
-        return colors
-    }
-
     var blockAds: Bool { snapshot.blockAds }
 
     func setBlockAds(_ enabled: Bool) {
@@ -1145,7 +1137,7 @@ extension BrowserStore {
                 core.activateTab(spaceId: space.id, tabId: tab)
             }
         }
-        coreSnapshot = core.snapshot()
+        coreSnapshot = core.snapshot().seen(fromPrivateSpace: privateSpace)
         refresh()
         Self.windowsChanged()
     }
@@ -1162,6 +1154,7 @@ extension BrowserStore {
             dropView(id)
             core.setLive(id: id, live: false)
         }
+        discardPrivateSpace()
         Self.windowsChanged()
     }
 

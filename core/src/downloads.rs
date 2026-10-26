@@ -26,12 +26,19 @@ pub struct Download {
     pub total: u64,
     pub state: DownloadState,
     pub started_ms: u64,
+    #[serde(skip)]
+    pub ephemeral: bool,
 }
 
 #[derive(Serialize, Deserialize, Default, Debug)]
 pub struct Downloads {
     next_id: u64,
+    #[serde(serialize_with = "lasting")]
     items: Vec<Download>,
+}
+
+fn lasting<S: serde::Serializer>(items: &[Download], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(items.iter().filter(|d| !d.ephemeral))
 }
 
 impl Downloads {
@@ -39,7 +46,7 @@ impl Downloads {
         &self.items
     }
 
-    pub fn start(&mut self, url: &str, path: &str, now: u64) -> u64 {
+    pub fn start(&mut self, url: &str, path: &str, ephemeral: bool, now: u64) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.items.insert(
@@ -52,6 +59,7 @@ impl Downloads {
                 total: 0,
                 state: DownloadState::Running,
                 started_ms: now,
+                ephemeral,
             },
         );
         self.trim();
@@ -97,6 +105,10 @@ impl Downloads {
         let before = self.items.len();
         self.items.retain(|d| d.state.is_active());
         self.items.len() != before
+    }
+
+    pub fn forget_ephemeral(&mut self) {
+        self.items.retain(|d| !d.ephemeral);
     }
 
     pub fn interrupt(&mut self) -> bool {

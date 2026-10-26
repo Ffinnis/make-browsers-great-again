@@ -220,7 +220,7 @@ final class PasswordFiller {
 
     private func confirm(_ tab: UInt64, view: MBWebView) {
         guard let pending = sent.removeValue(forKey: tab),
-              let profile = store.core.profileOfTab(tabId: tab) else { return }
+              let profile = store.core.profileOfTab(tabId: tab), !store.core.isPrivateTab(id: tab) else { return }
         let core = store.core
         Task {
             guard await PasswordKey.unlock(core) else { return }

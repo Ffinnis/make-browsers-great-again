@@ -38,7 +38,8 @@
 @interface MBDownload ()
 - (instancetype)initWithItem:(CefRefPtr<CefDownloadItem>)item
                   identifier:(uint32_t)identifier
-                       state:(MBDownloadState)state;
+                       state:(MBDownloadState)state
+                   ephemeral:(BOOL)ephemeral;
 @end
 
 @interface MBWebView ()
@@ -599,14 +600,34 @@ NSString* DocumentScriptFor(const std::string& url) {
   return nil;
 }
 
+bool IsEphemeralPath(const std::string& path) {
+  return path.empty() || path[0] != '/';
+}
+
+std::string ContextKey(CefRefPtr<CefBrowser> browser) {
+  if (!browser) {
+    return std::string();
+  }
+  CefRefPtr<CefRequestContext> context =
+      browser->GetHost()->GetRequestContext();
+  for (const auto& [key, known] : g_contexts) {
+    if (IsEphemeralPath(key) && known->IsSame(context)) {
+      return key;
+    }
+  }
+  return context->GetCachePath().ToString();
+}
+
 CefRefPtr<CefRequestContext> ContextForPath(const std::string& path) {
   auto it = g_contexts.find(path);
   if (it != g_contexts.end()) {
     return it->second;
   }
   CefRequestContextSettings settings;
-  CefString(&settings.cache_path) = path;
-  settings.persist_session_cookies = true;
+  if (!IsEphemeralPath(path)) {
+    CefString(&settings.cache_path) = path;
+    settings.persist_session_cookies = true;
+  }
   CefRefPtr<CefRequestContext> context =
       CefRequestContext::CreateContext(settings, new ContextHandler(path));
   g_contexts[path] = context;
@@ -888,11 +909,7 @@ class BrowserApp : public CefApp {
 };
 
 std::string SaveAsKey(CefRefPtr<CefBrowser> browser, const std::string& url) {
-  std::string context =
-      browser
-          ? browser->GetHost()->GetRequestContext()->GetCachePath().ToString()
-          : std::string();
-  return context + "\n" + url;
+  return ContextKey(browser) + "\n" + url;
 }
 
 void StartSaveAs(CefRefPtr<CefBrowser> browser, const std::string& url) {
@@ -944,10 +961,7 @@ class BaseClient : public CefClient,
                          CefRefPtr<CefDownloadItem> download_item,
                          CefRefPtr<CefDownloadItemCallback> callback) override {
     MBDownloadState state = DownloadState(download_item);
-    std::string context =
-        browser
-            ? browser->GetHost()->GetRequestContext()->GetCachePath().ToString()
-            : std::string();
+    std::string context = ContextKey(browser);
     uint32_t& identifier = g_download_ids[{context, download_item->GetId()}];
     if (!identifier) {
       identifier = ++g_last_download;
@@ -967,9 +981,11 @@ class BaseClient : public CefClient,
                         object:ToNS(download_item->GetFullPath())];
     }
     if (g_download_handler) {
-      g_download_handler([[MBDownload alloc] initWithItem:download_item
-                                               identifier:identifier
-                                                    state:state]);
+      g_download_handler([[MBDownload alloc]
+          initWithItem:download_item
+            identifier:identifier
+                 state:state
+             ephemeral:browser && IsEphemeralPath(context)]);
     }
   }
 
@@ -1429,7 +1445,7 @@ class ExtensionsClient : public BaseClient, public CefLifeSpanHandler {
 
  private:
   static std::string Path(CefRefPtr<CefBrowser> browser) {
-    return browser->GetHost()->GetRequestContext()->GetCachePath().ToString();
+    return ContextKey(browser);
   }
 
   IMPLEMENT_REFCOUNTING(ExtensionsClient);
@@ -2779,9 +2795,7 @@ class WebClient : public BaseClient,
       bool& disable_default_handling) override {
     if (g_extension_bridge &&
         request->GetURL().ToString().rfind(kBridgeOrigin, 0) == 0) {
-      return BridgeHandlerFor(
-          browser->GetHost()->GetRequestContext()->GetCachePath().ToString(),
-          request, request_initiator);
+      return BridgeHandlerFor(ContextKey(browser), request, request_initiator);
     }
     return g_request_filter && !is_download ? this : nullptr;
   }
@@ -3351,8 +3365,10 @@ class CookieKeys : public CefCookieVisitor {
 
 - (instancetype)initWithItem:(CefRefPtr<CefDownloadItem>)item
                   identifier:(uint32_t)identifier
-                       state:(MBDownloadState)state {
+                       state:(MBDownloadState)state
+                   ephemeral:(BOOL)ephemeral {
   if ((self = [super init])) {
+    _ephemeral = ephemeral;
     _identifier = identifier;
     _url = ToNS(item->GetURL());
     _path = ToNS(item->GetFullPath());
@@ -3383,6 +3399,10 @@ class CookieKeys : public CefCookieVisitor {
 
 + (void)prepareProfilePath:(NSString*)profilePath {
   ContextForPath(profilePath.UTF8String);
+}
+
++ (void)forgetProfilePath:(NSString*)profilePath {
+  g_contexts.erase(profilePath.UTF8String);
 }
 
 + (BOOL)isExtensionsPage:(NSString*)url {

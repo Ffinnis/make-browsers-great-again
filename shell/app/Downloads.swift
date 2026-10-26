@@ -71,7 +71,8 @@ final class DownloadCenter {
         guard let core else { return }
         let state = Self.state(download.state)
         let started = coreIDs[download.identifier] == nil
-        let id = coreIDs[download.identifier] ?? core.startDownload(url: download.url, path: download.path)
+        let id = coreIDs[download.identifier]
+            ?? core.startDownload(url: download.url, path: download.path, ephemeral: download.ephemeral)
         coreIDs[download.identifier] = id
         engineIDs[id] = download.identifier
         speeds[id] = download.speed

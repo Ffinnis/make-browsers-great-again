@@ -250,7 +250,7 @@ final class CommandBarView: NSView, NSTextFieldDelegate, NSTableViewDataSource, 
             .prefix(5)
             .map { .page($0) }
         let closed: [Item] = store.canReopen
-            ? store.core.closedTabs(limit: 25).filter { matches(query, $0.title, $0.url) }.prefix(3).map { .closed($0) }
+            ? store.closedTabs(limit: 25).filter { matches(query, $0.title, $0.url) }.prefix(3).map { .closed($0) }
             : []
         return [(nil, top), ("Tabs", tabs), ("Spaces", spaceItems), ("Actions", actionItems),
                 ("History", pages), ("Recently Closed", closed)].filter { !$0.1.isEmpty }

@@ -569,8 +569,8 @@ fn downloads_are_listed_newest_first_and_interrupted_ones_fail_after_a_restart()
     use downloads::DownloadState;
     let dir = temp_dir("downloads");
     let core = BrowserCore::new(dir.clone());
-    let first = core.start_download("https://a.example.com/a.zip".into(), "/tmp/a.zip".into());
-    let second = core.start_download("https://b.example.com/b.pdf".into(), String::new());
+    let first = core.start_download("https://a.example.com/a.zip".into(), "/tmp/a.zip".into(), false);
+    let second = core.start_download("https://b.example.com/b.pdf".into(), String::new(), false);
     core.update_download(first, String::new(), 50, 0, DownloadState::Done);
     core.update_download(second, "/tmp/b.pdf".into(), 10, 100, DownloadState::Running);
     let listed = core.downloads();
@@ -585,7 +585,7 @@ fn downloads_are_listed_newest_first_and_interrupted_ones_fail_after_a_restart()
     let listed = reopened.downloads();
     assert_eq!(listed[0].state, DownloadState::Failed);
     assert_eq!(listed[1].state, DownloadState::Done);
-    let third = reopened.start_download("https://c.example.com/c".into(), String::new());
+    let third = reopened.start_download("https://c.example.com/c".into(), String::new(), false);
     assert!(third > second);
     reopened.clear_downloads();
     assert_eq!(reopened.downloads().iter().map(|d| d.id).collect::<Vec<_>>(), vec![third]);
@@ -601,9 +601,9 @@ fn downloads_are_listed_newest_first_and_interrupted_ones_fail_after_a_restart()
 fn old_finished_downloads_make_room_but_running_ones_stay() {
     use downloads::{DownloadState, Downloads};
     let mut list = Downloads::default();
-    let running = list.start("https://a.example.com/big", "", 0);
+    let running = list.start("https://a.example.com/big", "", false, 0);
     for n in 1..=150 {
-        let id = list.start("https://a.example.com/small", "", n);
+        let id = list.start("https://a.example.com/small", "", false, n);
         list.update(id, "", 1, 1, DownloadState::Done);
     }
     assert_eq!(list.items().len(), 100);
@@ -611,7 +611,7 @@ fn old_finished_downloads_make_room_but_running_ones_stay() {
     assert_eq!(list.items()[0].started_ms, 150);
 
     let mut busy = Downloads::default();
-    let ids: Vec<u64> = (0..105).map(|n| busy.start("https://a.example.com/many", "", n)).collect();
+    let ids: Vec<u64> = (0..105).map(|n| busy.start("https://a.example.com/many", "", false, n)).collect();
     assert_eq!(busy.items().len(), 105);
     for id in ids {
         busy.update(id, "", 1, 1, DownloadState::Done);
@@ -627,13 +627,13 @@ fn closing_clearing_and_deleting_folders_can_be_undone() {
     let b = s.open_tab(sp, "https://b.com", false, 2).unwrap();
     let c = s.open_tab(sp, "https://c.com", false, 3).unwrap();
     s.close_tab(b, 4);
-    assert_eq!(s.reopen_last(), Some((sp, vec![b])));
+    assert_eq!(s.reopen_last(None), Some((sp, vec![b])));
     assert_eq!(s.spaces[0].today, vec![c, b, a]);
 
     s.clear_today(sp);
     assert!(s.spaces[0].today.is_empty());
-    assert_eq!(s.closed_tabs().map(|t| t.id).collect::<Vec<_>>(), vec![c, b, a]);
-    assert_eq!(s.reopen_last(), Some((sp, vec![c, b, a])));
+    assert_eq!(s.closed_tabs(None).map(|t| t.id).collect::<Vec<_>>(), vec![c, b, a]);
+    assert_eq!(s.reopen_last(None), Some((sp, vec![c, b, a])));
     assert_eq!(s.spaces[0].today, vec![c, b, a]);
     assert!(!s.tabs[&a].live);
 
@@ -641,9 +641,9 @@ fn closing_clearing_and_deleting_folders_can_be_undone() {
     s.move_item(a, Container::Pinned { space_id: sp, folder_id: Some(folder) }, 0);
     s.delete_folder(folder);
     assert!(!s.tabs.contains_key(&a));
-    assert_eq!(s.reopen_last(), Some((sp, vec![a])));
+    assert_eq!(s.reopen_last(None), Some((sp, vec![a])));
     assert_eq!(s.locate(a), Some(Container::Pinned { space_id: sp, folder_id: Some(folder) }));
-    assert!(s.reopen_last().is_none());
+    assert!(s.reopen_last(None).is_none());
 }
 
 #[test]
@@ -655,8 +655,8 @@ fn one_closed_tab_can_be_reopened_from_a_cleared_list() {
     s.clear_today(sp);
     assert_eq!(s.reopen_tab(a), Some(sp));
     assert_eq!(s.spaces[0].today, vec![a]);
-    assert_eq!(s.closed_tabs().map(|t| t.id).collect::<Vec<_>>(), vec![b]);
-    assert_eq!(s.reopen_last(), Some((sp, vec![b])));
+    assert_eq!(s.closed_tabs(None).map(|t| t.id).collect::<Vec<_>>(), vec![b]);
+    assert_eq!(s.reopen_last(None), Some((sp, vec![b])));
     assert_eq!(s.spaces[0].today, vec![b, a]);
 }
 
@@ -685,7 +685,7 @@ fn idle_today_tabs_are_archived_by_policy_and_restorable() {
     s.policy.archive_after_hours = 24;
     assert_eq!(s.archive_by_policy(30 * hour), vec![old]);
     assert_eq!(s.spaces[0].today, vec![fresh, kept]);
-    assert_eq!(s.reopen_last(), Some((sp, vec![old])));
+    assert_eq!(s.reopen_last(None), Some((sp, vec![old])));
     assert_eq!(s.spaces[0].today, vec![fresh, kept, old]);
 }
 
@@ -925,4 +925,127 @@ fn imported_passwords_merge_by_site_and_username() {
     assert_eq!(core.login_password(b[0].id).as_deref(), Some("b-newer"));
     assert_eq!(core.never_saved_sites(profile), ["https://ads.example"]);
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn private_spaces_are_left_out_of_the_saved_state_and_skip_history() {
+    let dir = temp_dir("private-state");
+    let core = BrowserCore::new(dir.clone());
+    let home = core.snapshot().spaces[0].id;
+    let normal = core.open_tab(home, "https://normal.example/".into(), true).unwrap();
+    let private = core.open_private_space();
+    let snapshot = core.snapshot();
+    let space = snapshot.spaces.iter().find(|s| s.id == private).unwrap();
+    assert!(space.ephemeral);
+    assert_eq!(snapshot.profiles.len(), 1);
+    assert!(core.profile_dir(space.profile_id).starts_with("private-"));
+    core.set_active_space(private);
+    let secret = core.open_tab(private, "https://secret.example/".into(), true).unwrap();
+    core.update_tab(secret, Some("https://secret.example/next".into()), Some("Secret".into()));
+    assert!(core.is_private_tab(secret));
+    assert!(!core.is_private_tab(normal));
+    assert!(core.suggest_history("secret".into(), 5).is_empty());
+    assert_eq!(core.suggest_history("normal".into(), 5).len(), 1);
+    assert!(core.persist());
+
+    let saved = fs::read_to_string(Path::new(&dir).join(STATE_FILE)).unwrap();
+    assert!(!saved.contains("secret.example"));
+    assert!(!saved.contains("\"Private\""));
+    let history = fs::read_to_string(Path::new(&dir).join(HISTORY_FILE)).unwrap();
+    assert!(!history.contains("secret"));
+
+    let reopened = BrowserCore::new(dir.clone());
+    let snapshot = reopened.snapshot();
+    assert_eq!(snapshot.spaces.len(), 1);
+    assert_eq!(snapshot.active_space, home);
+    assert!(reopened.tab(secret).is_none());
+    assert!(reopened.tab(normal).is_some());
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn closing_a_private_space_discards_its_tabs_profile_and_closed_tabs() {
+    let mut s = State::new_default();
+    let home = home(&s);
+    let private = s.open_private_space();
+    let profile = s.space(private).unwrap().profile_id;
+    let a = s.open_tab(private, "https://a.example/", true, 1).unwrap();
+    let b = s.open_tab(private, "https://b.example/", true, 2).unwrap();
+    s.close_tab(a, 3);
+    assert!(s.move_item(b, Container::Favorites { profile_id: profile }, 0).is_some());
+    let c = s.open_tab(private, "https://c.example/", true, 4).unwrap();
+    s.set_active_space(private, 5);
+    let mut closed = s.close_private_space(private).unwrap();
+    closed.sort_unstable();
+    assert_eq!(closed, vec![b, c]);
+    assert!(s.tabs.is_empty());
+    assert!(s.closed.is_empty());
+    assert!(!s.has_ephemeral());
+    assert!(!s.favorites.contains_key(&profile));
+    assert_eq!(s.active_space, home);
+    assert!(s.close_private_space(home).is_none());
+}
+
+#[test]
+fn private_spaces_keep_to_themselves() {
+    let mut s = State::new_default();
+    let home = home(&s);
+    let normal_profile = s.profiles[0].id;
+    let private = s.open_private_space();
+    let private_profile = s.space(private).unwrap().profile_id;
+    let secret = s.open_tab(private, "https://secret.example/", true, 1).unwrap();
+    let normal = s.open_tab(home, "https://normal.example/", true, 2).unwrap();
+    assert!(s.move_item(secret, Container::Today { space_id: home }, 0).is_none());
+    assert!(s.move_item(normal, Container::Favorites { profile_id: private_profile }, 0).is_none());
+    assert!(s.set_space_profile(private, normal_profile).is_empty());
+    assert_eq!(s.space(private).unwrap().profile_id, private_profile);
+    assert!(s.set_space_profile(home, private_profile).is_empty());
+    let other = s.create_space("Work", "💼", 0, private_profile);
+    assert_eq!(s.space(other).unwrap().profile_id, normal_profile);
+    assert!(s.delete_space(private).is_none());
+    assert!(s.delete_space(other).is_some());
+    assert!(s.delete_space(home).is_none());
+    assert!(s.delete_profile(private_profile).is_none());
+}
+
+#[test]
+fn private_windows_offer_no_password_saving_and_private_downloads_are_forgotten() {
+    use downloads::DownloadState;
+    let dir = temp_dir("private-extras");
+    let core = BrowserCore::new(dir.clone());
+    core.unlock_passwords(vec![3; 32]);
+    let private = core.open_private_space();
+    let profile = core.snapshot().spaces.iter().find(|s| s.id == private).unwrap().profile_id;
+    let url = "https://a.example/login".to_string();
+    assert_eq!(core.password_offer(profile, url.clone(), "me".into(), "pw".into()), PasswordOffer::Nothing);
+    assert!(core.save_login(profile, url.clone(), "me".into(), "pw".into()).is_none());
+    core.never_save_passwords(profile, url);
+    assert!(core.never_saved_sites(profile).is_empty());
+
+    let kept = core.start_download("https://a.example/a.zip".into(), "/tmp/a.zip".into(), false);
+    let secret = core.start_download("https://secret.example/s.zip".into(), "/tmp/s.zip".into(), true);
+    core.update_download(secret, String::new(), 5, 5, DownloadState::Done);
+    assert_eq!(core.downloads().len(), 2);
+    assert!(core.persist());
+    let saved = fs::read_to_string(Path::new(&dir).join(DOWNLOADS_FILE)).unwrap();
+    assert!(!saved.contains("secret.example"));
+    core.close_private_space(private);
+    assert_eq!(core.downloads().iter().map(|d| d.id).collect::<Vec<_>>(), vec![kept]);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn closed_private_tabs_reopen_only_in_their_window() {
+    let mut s = State::new_default();
+    let home = home(&s);
+    let private = s.open_private_space();
+    let normal = s.open_tab(home, "https://normal.example/", true, 1).unwrap();
+    let secret = s.open_tab(private, "https://secret.example/", true, 2).unwrap();
+    s.close_tab(normal, 3);
+    s.close_tab(secret, 4);
+    assert_eq!(s.closed_tabs(None).map(|t| t.id).collect::<Vec<_>>(), vec![normal]);
+    assert_eq!(s.closed_tabs(Some(private)).map(|t| t.id).collect::<Vec<_>>(), vec![secret]);
+    assert_eq!(s.reopen_last(None), Some((home, vec![normal])));
+    assert!(s.reopen_last(None).is_none());
+    assert_eq!(s.reopen_last(Some(private)), Some((private, vec![secret])));
 }

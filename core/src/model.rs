@@ -10,6 +10,8 @@ pub const STATE_VERSION: u32 = 1;
 pub struct Profile {
     pub id: Id,
     pub name: String,
+    #[serde(skip)]
+    pub ephemeral: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -70,6 +72,8 @@ pub struct Space {
     pub pinned: Vec<Node>,
     pub today: Vec<Id>,
     pub active_tab: Option<Id>,
+    #[serde(skip)]
+    pub ephemeral: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -152,7 +156,7 @@ pub enum Container {
     Today { space_id: Id },
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct State {
     pub version: u32,
     pub next_id: Id,
@@ -183,6 +187,8 @@ pub struct State {
     pub closed: Vec<Closed>,
     #[serde(skip)]
     pub shown_elsewhere: Vec<Id>,
+    #[serde(skip)]
+    pub normal_space: Option<Id>,
 }
 
 fn default_search_template() -> String {
@@ -224,6 +230,7 @@ impl State {
             convert_video: true,
             closed: Vec::new(),
             shown_elsewhere: Vec::new(),
+            normal_space: None,
         };
         let profile = s.create_profile("Personal");
         let space = s.create_space("Home", "🏠", SPACE_COLORS[0], profile);
@@ -277,7 +284,7 @@ impl State {
 
     pub fn create_profile(&mut self, name: &str) -> Id {
         let id = self.alloc();
-        self.profiles.push(Profile { id, name: name.to_string() });
+        self.profiles.push(Profile { id, name: name.to_string(), ephemeral: false });
         self.favorites.insert(id, Vec::new());
         id
     }
@@ -289,7 +296,8 @@ impl State {
     }
 
     pub fn delete_profile(&mut self, id: Id) -> Option<Vec<Id>> {
-        if self.profiles.len() <= 1 || self.spaces.iter().any(|s| s.profile_id == id) {
+        let lasting = self.profiles.iter().filter(|p| !p.ephemeral).count();
+        if lasting <= 1 || self.is_ephemeral_profile(id) || self.spaces.iter().any(|s| s.profile_id == id) {
             return None;
         }
         self.profiles.retain(|p| p.id != id);
@@ -302,8 +310,11 @@ impl State {
     }
 
     pub fn create_space(&mut self, name: &str, icon: &str, color: u32, profile_id: Id) -> Id {
-        let profile_id =
-            if self.profiles.iter().any(|p| p.id == profile_id) { profile_id } else { self.profiles[0].id };
+        let profile_id = if self.profiles.iter().any(|p| p.id == profile_id && !p.ephemeral) {
+            profile_id
+        } else {
+            self.profiles.iter().find(|p| !p.ephemeral).map_or(self.profiles[0].id, |p| p.id)
+        };
         let id = self.alloc();
         self.spaces.push(Space {
             id,
@@ -314,6 +325,7 @@ impl State {
             pinned: Vec::new(),
             today: Vec::new(),
             active_tab: None,
+            ephemeral: false,
         });
         id
     }
@@ -327,7 +339,7 @@ impl State {
     }
 
     pub fn set_space_profile(&mut self, id: Id, profile_id: Id) -> Vec<Id> {
-        if !self.profiles.iter().any(|p| p.id == profile_id) {
+        if !self.profiles.iter().any(|p| p.id == profile_id && !p.ephemeral) || self.is_ephemeral_space(id) {
             return Vec::new();
         }
         let Some(space) = self.space_mut(id) else {
@@ -354,7 +366,7 @@ impl State {
     }
 
     pub fn delete_space(&mut self, id: Id) -> Option<Vec<Id>> {
-        if self.spaces.len() <= 1 {
+        if self.spaces.iter().filter(|s| !s.ephemeral).count() <= 1 || self.is_ephemeral_space(id) {
             return None;
         }
         let index = self.spaces.iter().position(|s| s.id == id)?;
@@ -366,6 +378,9 @@ impl State {
         }
         if self.active_space == id {
             self.active_space = self.spaces[index.min(self.spaces.len() - 1)].id;
+        }
+        if self.normal_space == Some(id) {
+            self.normal_space = None;
         }
         Some(closed)
     }
@@ -383,6 +398,9 @@ impl State {
             return;
         }
         self.touch_visible(now);
+        if !self.is_ephemeral_space(self.active_space) {
+            self.normal_space = Some(self.active_space);
+        }
         self.active_space = id;
         self.touch_visible(now);
     }
@@ -590,12 +608,20 @@ impl State {
         }
     }
 
-    pub fn closed_tabs(&self) -> impl Iterator<Item = &Tab> {
-        self.closed.iter().rev().flat_map(|c| c.tabs.iter())
+    fn closed_in(&self, closed: &Closed, private_space: Option<Id>) -> bool {
+        match private_space {
+            Some(space) => closed.space_id == space,
+            None => !self.is_ephemeral_space(closed.space_id),
+        }
     }
 
-    pub fn reopen_last(&mut self) -> Option<(Id, Vec<Id>)> {
-        let closed = self.closed.pop()?;
+    pub fn closed_tabs(&self, private_space: Option<Id>) -> impl Iterator<Item = &Tab> {
+        self.closed.iter().rev().filter(move |c| self.closed_in(c, private_space)).flat_map(|c| c.tabs.iter())
+    }
+
+    pub fn reopen_last(&mut self, private_space: Option<Id>) -> Option<(Id, Vec<Id>)> {
+        let index = self.closed.iter().rposition(|c| self.closed_in(c, private_space))?;
+        let closed = self.closed.remove(index);
         let space_id = if self.space(closed.space_id).is_some() { closed.space_id } else { self.active_space };
         let ids: Vec<Id> = closed.tabs.iter().map(|t| t.id).collect();
         for mut tab in closed.tabs {
@@ -740,6 +766,9 @@ impl State {
         }
         let source_profile = self.container_profile(source)?;
         let target_profile = self.container_profile(target)?;
+        if self.is_ephemeral_profile(source_profile) != self.is_ephemeral_profile(target_profile) {
+            return None;
+        }
         if let Container::Pinned { space_id, folder_id: Some(folder) } = target {
             let space = self.space(space_id)?;
             let moved = find_node(&space.pinned, id);
