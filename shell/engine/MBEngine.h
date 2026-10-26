@@ -70,6 +70,12 @@ typedef BOOL (^MBEarlyScript)(NSString* page);
 - (void)webView:(MBWebView*)view requestsNewWindowWithURL:(NSString*)url;
 - (nullable NSString*)searchEngineNameForWebView:(MBWebView*)view;
 - (void)webView:(MBWebView*)view searchesFor:(NSString*)text;
+- (void)webView:(MBWebView*)view
+    requestsCredentialsForHost:(NSString*)host
+                         realm:(NSString*)realm
+                         proxy:(BOOL)proxy
+                         reply:(void (^)(NSString* _Nullable user,
+                                         NSString* _Nullable password))reply;
 @end
 
 @interface MBCookie : NSObject

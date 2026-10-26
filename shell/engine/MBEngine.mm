@@ -848,6 +848,7 @@ class BrowserApp : public CefApp {
     AppendToListSwitch(command_line, "enable-features",
                        "NetworkServiceInProcess2");
     AppendDefaultSwitch(command_line, "disable-quic");
+    command_line->AppendSwitch("disable-chrome-login-prompt");
     AppendToListSwitch(command_line, "disable-features",
                        "SpareRendererForSitePerProcess,OptimizationHints,"
                        "AudioServiceOutOfProcess,Prerender2");
@@ -2635,6 +2636,42 @@ class WebClient : public BaseClient,
       });
     }
     return RV_CANCEL;
+  }
+
+  bool GetAuthCredentials(CefRefPtr<CefBrowser> browser,
+                          const CefString& origin_url,
+                          bool isProxy,
+                          const CefString& host,
+                          int port,
+                          const CefString& realm,
+                          const CefString& scheme,
+                          CefRefPtr<CefAuthCallback> callback) override {
+    __weak MBWebView* weak_view = view_;
+    NSString* name = ToNS(host);
+    NSString* area = ToNS(realm);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      MBWebView* view = weak_view;
+      if (![view.delegate
+              respondsToSelector:@selector(webView:requestsCredentialsForHost:
+                                           realm:proxy:reply:)]) {
+        callback->Cancel();
+        return;
+      }
+      [view.delegate webView:view
+          requestsCredentialsForHost:name
+                               realm:area
+                               proxy:isProxy
+                               reply:^(NSString* user, NSString* password) {
+                                 if (user) {
+                                   callback->Continue(
+                                       user.UTF8String,
+                                       password.UTF8String ?: "");
+                                 } else {
+                                   callback->Cancel();
+                                 }
+                               }];
+    });
+    return true;
   }
 
   void OnRenderProcessTerminated(CefRefPtr<CefBrowser> browser,

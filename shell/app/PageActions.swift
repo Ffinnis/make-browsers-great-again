@@ -28,6 +28,51 @@ extension BrowserStore {
             webView(view, requestsNewTabWithURL: core.searchUrl(text: text), foreground: true)
         }
     }
+
+    nonisolated func webView(
+        _ view: MBWebView,
+        requestsCredentialsForHost host: String,
+        realm: String,
+        proxy: Bool,
+        reply: @escaping (String?, String?) -> Void
+    ) {
+        MainActor.assumeIsolated {
+            guard let window = view.window ?? window else { return reply(nil, nil) }
+            SignInPrompt(host: host, realm: realm, proxy: proxy).show(in: window, reply: reply)
+        }
+    }
+}
+
+@MainActor
+private struct SignInPrompt {
+    let host: String
+    let realm: String
+    let proxy: Bool
+
+    func show(in window: NSWindow, reply: @escaping (String?, String?) -> Void) {
+        let alert = NSAlert()
+        alert.messageText = proxy ? "Sign in to proxy \(host)" : "Sign in to \(host)"
+        alert.informativeText = realm.isEmpty ? "" : "The site says: “\(realm)”"
+        let user = NSTextField(frame: NSRect(x: 0, y: 30, width: 260, height: 24))
+        user.placeholderString = "Username"
+        let password = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        password.placeholderString = "Password"
+        let fields = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 54))
+        fields.addSubview(user)
+        fields.addSubview(password)
+        alert.accessoryView = fields
+        alert.addButton(withTitle: "Sign In")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = user
+        user.nextKeyView = password
+        alert.beginSheetModal(for: window) { response in
+            if response == .alertFirstButtonReturn {
+                reply(user.stringValue, password.stringValue)
+            } else {
+                reply(nil, nil)
+            }
+        }
+    }
 }
 
 extension AppDelegate {
