@@ -191,6 +191,9 @@ final class WebContainerView: NSView {
         }
     }
     private var afterHold: [@MainActor () -> Void] = []
+    private var liveSize: NSSize?
+    private var liveSettle: Timer?
+    private var liveEnd: Any?
     private let devToolsEdge = NSView()
     private let devToolsBacking = NSView()
     private lazy var devToolsHeader = DevToolsHeaderView { [weak self] in self?.current?.closeDevTools() }
@@ -223,6 +226,11 @@ final class WebContainerView: NSView {
     override func layout() {
         super.layout()
         placeCurrent()
+    }
+
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        endLive()
     }
 
     override func resizeSubviews(withOldSize oldSize: NSSize) {
@@ -346,6 +354,7 @@ extension WebContainerView {
     func placeCurrent() {
         let area = placeDevTools()
         if area != pageArea {
+            if area.size != pageArea.size, pageArea != .zero { followLive(from: pageArea.size, to: area.size) }
             pageArea = area
             onPageAreaChange?()
         }
@@ -380,10 +389,49 @@ extension WebContainerView {
     }
 
     private func held(_ area: NSRect) -> NSRect {
-        guard let heldSize else { return area }
-        let docked = area.width < bounds.width
-        let width = docked ? (heldSize.width - devToolsWidth(in: heldSize.width)).rounded() : heldSize.width
-        return NSRect(x: area.minX, y: area.minY, width: max(area.width, width), height: max(area.height, heldSize.height))
+        var size = area.size
+        if let heldSize {
+            let docked = area.width < bounds.width
+            let width = docked ? (heldSize.width - devToolsWidth(in: heldSize.width)).rounded() : heldSize.width
+            size = NSSize(width: max(size.width, width), height: max(size.height, heldSize.height))
+        }
+        if let liveSize { size = NSSize(width: max(size.width, liveSize.width), height: max(size.height, liveSize.height)) }
+        return NSRect(origin: area.origin, size: size)
+    }
+
+    private func followLive(from old: NSSize, to new: NSSize) {
+        guard heldSize == nil, inLiveResize || NSEvent.pressedMouseButtons & 1 != 0 else { return }
+        var size = liveSize ?? old
+        if new.width > size.width { size.width = new.width + 160 }
+        if new.height > size.height { size.height = new.height + 160 }
+        liveSize = size
+        if liveEnd == nil {
+            liveEnd = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+                DispatchQueue.main.async { self?.endLive() }
+                return event
+            }
+        }
+        liveSettle?.invalidate()
+        let timer = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.liveSize != nil else { return }
+                guard self.inLiveResize || NSEvent.pressedMouseButtons & 1 != 0 else { return self.endLive() }
+                self.liveSize = self.pageArea.size
+                self.placeCurrent()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        liveSettle = timer
+    }
+
+    private func endLive() {
+        liveSettle?.invalidate()
+        liveSettle = nil
+        if let liveEnd { NSEvent.removeMonitor(liveEnd) }
+        liveEnd = nil
+        guard liveSize != nil else { return }
+        liveSize = nil
+        placeCurrent()
     }
 
     private func devToolsWidth(in width: CGFloat) -> CGFloat {
