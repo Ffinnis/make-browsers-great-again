@@ -3747,6 +3747,13 @@ class CookieKeys : public CefCookieVisitor {
   }
 }
 
+- (void)saveURLAs:(NSString*)url {
+  if (_browser) {
+    g_save_as_urls.insert(url.UTF8String);
+    _browser->GetHost()->StartDownload(url.UTF8String);
+  }
+}
+
 - (void)zoomIn {
   if (_browser) {
     _browser->GetHost()->Zoom(CEF_ZOOM_COMMAND_IN);

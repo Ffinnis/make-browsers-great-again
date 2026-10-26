@@ -611,6 +611,15 @@ impl BrowserCore {
             .collect()
     }
 
+    pub fn recent_history(&self, limit: u32) -> Vec<HistoryItem> {
+        self.lock()
+            .history
+            .recent(limit as usize)
+            .into_iter()
+            .map(|m| HistoryItem { url: m.url, title: m.title, site_prefix: m.site_prefix })
+            .collect()
+    }
+
     pub fn clear_history(&self) {
         let mut inner = self.lock();
         inner.history.clear();

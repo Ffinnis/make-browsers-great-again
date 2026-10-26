@@ -53,6 +53,16 @@ impl History {
         }
     }
 
+    pub fn recent(&self, limit: usize) -> Vec<Match> {
+        let mut visits: Vec<&Visit> = self.visits.iter().collect();
+        visits.sort_by(|a, b| b.last_ms.cmp(&a.last_ms));
+        visits
+            .into_iter()
+            .take(limit)
+            .map(|v| Match { url: v.url.clone(), title: v.title.clone(), site_prefix: false })
+            .collect()
+    }
+
     pub fn suggest(&self, query: &str, limit: usize, now: u64) -> Vec<Match> {
         let query = query.trim().to_lowercase();
         let words: Vec<&str> = query.split_whitespace().collect();

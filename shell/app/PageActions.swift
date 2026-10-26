@@ -145,8 +145,16 @@ extension NSMenu {
     func addingPageItems() -> NSMenu {
         let commands = PageCommands.shared
         commands.monitorMouseButtons()
-        insert("Print…", #selector(PageCommands.printPage(_:)), "p", target: commands,
+        let history = HistoryMenu.shared
+        insert("Open File…", #selector(HistoryMenu.openFile(_:)), "o", target: history,
+               in: "File", after: "Open Location…")
+        insert("Save Page As…", #selector(HistoryMenu.savePage(_:)), "s", [.command, .shift], target: history,
                in: "File", after: nil)
+        insert("Print…", #selector(PageCommands.printPage(_:)), "p", target: commands,
+               in: "File", after: "Save Page As…")
+        insert("Downloads", #selector(HistoryMenu.showDownloads(_:)), "l", [.command, .option], target: history,
+               in: "Window", after: nil)
+        if let menu = items.first(where: { $0.title == "History" })?.submenu { history.install(in: menu) }
         insert("Paste and Match Style", Selector(("pasteAndMatchStyle:")), "v", [.command, .option, .shift],
                target: nil, in: "Edit", after: "Paste")
         insert("Stop", #selector(PageCommands.stopLoading(_:)), ".", target: commands,

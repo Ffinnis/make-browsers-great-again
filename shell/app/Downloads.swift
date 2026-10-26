@@ -301,6 +301,22 @@ final class DownloadsButton: HoverView {
         if bounds.contains(convert(event.locationInWindow, from: nil)) { toggle() }
     }
 
+    static func toggle(in window: NSWindow) {
+        if let button = window.contentView?.firstSubview(of: Self.self), !button.isHiddenOrHasHiddenAncestor,
+           button.visibleRect.width > 0 {
+            button.toggle()
+            return
+        }
+        guard let content = window.contentView else { return }
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.animates = !Motion.reduced
+        popover.contentViewController = DownloadsViewController { [weak popover] in popover?.close() }
+        let anchor = NSRect(x: content.bounds.maxX - 60, y: content.isFlipped ? 8 : content.bounds.maxY - 8,
+                            width: 1, height: 1)
+        popover.show(relativeTo: anchor, of: content, preferredEdge: content.isFlipped ? .maxY : .minY)
+    }
+
     private func toggle() {
         if let popover {
             popover.close()

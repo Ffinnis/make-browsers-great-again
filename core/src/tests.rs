@@ -428,6 +428,18 @@ fn history_ranks_sites_starting_with_the_query_first() {
 }
 
 #[test]
+fn recent_history_lists_the_latest_visits_first() {
+    use history::History;
+    let mut h = History::default();
+    h.record("https://a.example.com/", 1);
+    h.record("https://b.example.com/", 2);
+    h.record("https://c.example.com/", 3);
+    h.record("https://a.example.com/", 4);
+    let urls: Vec<String> = h.recent(2).into_iter().map(|m| m.url).collect();
+    assert_eq!(urls, ["https://a.example.com/", "https://c.example.com/"]);
+}
+
+#[test]
 fn frequent_visits_last_month_beat_one_visit_today() {
     use history::History;
     let day = 86_400_000;
