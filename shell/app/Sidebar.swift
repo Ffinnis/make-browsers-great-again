@@ -164,6 +164,8 @@ private final class SidebarToolbarView: WindowDragView {
         forward = SymbolButton("arrow.right") { store.goForward() }
         reload = SymbolButton("arrow.clockwise") { store.reloadOrStop() }
         super.init(frame: .zero)
+        back.menuSource = { [weak store] show in store?.navigationMenu(back: true, show) }
+        forward.menuSource = { [weak store] show in store?.navigationMenu(back: false, show) }
         toggle.toolTip = "Focus Mode  ⌘S"
         for view in [toggle, back, forward, reload, extensions] as [NSView] { addSubview(view) }
         update()

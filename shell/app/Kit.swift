@@ -245,6 +245,9 @@ extension NSImage {
 
 final class SymbolButton: HoverView {
     var action: (() -> Void)?
+    var menuSource: ((@escaping (NSMenu) -> Void) -> Void)?
+    private var pressTimer: Timer?
+    private var showedMenu = false
     var isEnabled = true {
         didSet { alphaValue = isEnabled ? 0.8 : 0.35; needsDisplay = true }
     }
@@ -283,12 +286,35 @@ final class SymbolButton: HoverView {
     override func mouseDown(with event: NSEvent) {
         guard isEnabled else { return }
         alphaValue = 0.55
+        showedMenu = false
+        guard menuSource != nil else { return }
+        pressTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.showedMenu = true
+                self?.showMenu()
+            }
+        }
     }
 
     override func mouseUp(with event: NSEvent) {
+        pressTimer?.invalidate()
+        pressTimer = nil
         guard isEnabled else { return }
         alphaValue = 0.8
-        if bounds.contains(convert(event.locationInWindow, from: nil)) { action?() }
+        if !showedMenu, bounds.contains(convert(event.locationInWindow, from: nil)) { action?() }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        guard isEnabled, menuSource != nil else { return super.rightMouseDown(with: event) }
+        showMenu()
+    }
+
+    private func showMenu() {
+        menuSource? { [weak self] menu in
+            guard let self, window != nil else { return }
+            alphaValue = isEnabled ? 0.8 : 0.35
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
+        }
     }
 }
 
