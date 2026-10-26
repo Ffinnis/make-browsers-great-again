@@ -6,9 +6,6 @@ extension BrowserStore {
         "yandex": "Yandex", "brave": "Brave", "startpage": "Startpage", "perplexity": "Perplexity", "yahoo": "Yahoo",
     ]
 
-    func stopLoading() { visibleView?.stopLoading() }
-    func printPage() { visibleView?.printPage() }
-
     func closeVisibleTab() {
         if let id = visibleTabID { closeAsking(id) }
     }
@@ -33,7 +30,8 @@ extension BrowserStore {
 
     nonisolated func webView(_ view: MBWebView, requestsNewWindowWithURL url: String) {
         MainActor.assumeIsolated {
-            _ = (NSApp.delegate as? AppDelegate)?.openWindow(url: url)
+            let space = space(owning: view.tabID)?.id ?? activeSpace.id
+            _ = (NSApp.delegate as? AppDelegate)?.openWindow(url: url, in: space)
         }
     }
 
@@ -99,12 +97,16 @@ private struct SignInPrompt {
 
 extension AppDelegate {
     @discardableResult
-    func openWindow(url: String? = nil) -> BrowserStore {
+    func openWindow(url: String? = nil, in space: UInt64? = nil) -> BrowserStore {
         let store = BrowserStore(core: core, newWindow: true)
         let window = makeWindow(for: store)
         store.refresh()
         window.makeKeyAndOrderFront(nil)
-        if let url { store.openFromSystem(url) }
+        if let url, let space, let id = core.openTab(spaceId: space, url: url, activate: false) {
+            store.select(id, in: space)
+        } else if let url {
+            store.openFromSystem(url)
+        }
         return store
     }
 
@@ -121,22 +123,36 @@ final class PageCommands: NSObject, NSMenuItemValidation {
 
     private var store: BrowserStore? { BrowserStore.front }
 
-    @objc func stopLoading(_ sender: Any?) { store?.stopLoading() }
-    @objc func printPage(_ sender: Any?) { store?.printPage() }
+    private var page: MBWebView? {
+        if let key = NSApp.keyWindow, key !== store?.window, let view = key.contentView?.firstSubview(of: MBWebView.self) {
+            return view
+        }
+        return store?.visibleView
+    }
+
+    @objc func stopLoading(_ sender: Any?) { page?.stopLoading() }
+    @objc func printPage(_ sender: Any?) { page?.printPage() }
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        guard let store else { return false }
-        return item.action != #selector(stopLoading(_:)) || store.nav.isLoading
+        guard let page else { return false }
+        return item.action != #selector(stopLoading(_:)) || store?.navStates[page.tabID]?.isLoading == true
     }
 
     func monitorMouseButtons() {
         mouseButtonMonitor = NSEvent.addLocalMonitorForEvents(matching: .otherMouseUp) { event in
             guard event.buttonNumber == 3 || event.buttonNumber == 4,
-                  let store = BrowserStore.front, let window = event.window, store.window === window
+                  let content = event.window?.contentView,
+                  let page = Self.webView(in: content, at: event.locationInWindow)
             else { return event }
-            if event.buttonNumber == 3 { store.goBack() } else { store.goForward() }
+            if event.buttonNumber == 3 { page.goBack() } else { page.goForward() }
             return nil
         }
+    }
+
+    private static func webView(in content: NSView, at point: NSPoint) -> MBWebView? {
+        var view = content.hitTest(content.superview?.convert(point, from: nil) ?? point)
+        while let current = view, !(current is MBWebView) { view = current.superview }
+        return view as? MBWebView
     }
 }
 

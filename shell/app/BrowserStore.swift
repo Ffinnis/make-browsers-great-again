@@ -288,7 +288,7 @@ final class BrowserStore: NSObject {
         space.pinned.contains { $0.id == id }
     }
 
-    private func space(owning tabID: UInt64) -> SpaceInfo? {
+    func space(owning tabID: UInt64) -> SpaceInfo? {
         snapshot.spaces.first { s in
             s.today.contains { $0.id == tabID } || s.pinned.contains { $0.id == tabID }
         }

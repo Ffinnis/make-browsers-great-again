@@ -94,7 +94,7 @@ void (^g_download_handler)(MBDownload* download) = nil;
 std::map<uint32_t, CefRefPtr<CefDownloadItemCallback>> g_downloads;
 std::map<std::pair<std::string, uint32_t>, uint32_t> g_download_ids;
 std::set<uint32_t> g_finished_downloads;
-std::set<std::string> g_save_as_urls;
+std::multiset<std::string> g_save_as_urls;
 uint32_t g_last_download = 0;
 
 constexpr char kCosmeticPrefix[] = "__mbga_cosmetic:";
@@ -879,6 +879,32 @@ class BrowserApp : public CefApp {
   IMPLEMENT_REFCOUNTING(BrowserApp);
 };
 
+std::string SaveAsKey(CefRefPtr<CefBrowser> browser, const std::string& url) {
+  std::string context =
+      browser
+          ? browser->GetHost()->GetRequestContext()->GetCachePath().ToString()
+          : std::string();
+  return context + "\n" + url;
+}
+
+void StartSaveAs(CefRefPtr<CefBrowser> browser, const std::string& url) {
+  g_save_as_urls.insert(SaveAsKey(browser, url));
+  browser->GetHost()->StartDownload(url);
+}
+
+NSString* MediaAtPoint(CefRefPtr<CefBrowser> browser,
+                       CefRefPtr<CefContextMenuParams> params,
+                       const char* type) {
+  double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
+  return [NSString
+      stringWithFormat:
+          @"const find = r => { for (const e of r.elementsFromPoint(%f, %f)) "
+          @"{ if (e instanceof %s) return e; const m = e.shadowRoot && "
+          @"e.shadowRoot !== r && find(e.shadowRoot); if (m) return m; } }; "
+          @"const m = find(document);",
+          params->GetXCoord() / zoom, params->GetYCoord() / zoom, type];
+}
+
 class BaseClient : public CefClient,
                    public CefDownloadHandler,
                    public CefPermissionHandler,
@@ -895,7 +921,12 @@ class BaseClient : public CefClient,
       CefRefPtr<CefDownloadItem> download_item,
       const CefString& suggested_name,
       CefRefPtr<CefBeforeDownloadCallback> callback) override {
-    bool ask = g_save_as_urls.erase(download_item->GetOriginalUrl()) > 0;
+    auto pending = g_save_as_urls.find(
+        SaveAsKey(browser, download_item->GetOriginalUrl().ToString()));
+    bool ask = pending != g_save_as_urls.end();
+    if (ask) {
+      g_save_as_urls.erase(pending);
+    }
     callback->Continue(UniqueDownloadPath(ToNS(suggested_name)).UTF8String,
                        ask);
     return true;
@@ -2830,21 +2861,17 @@ class WebClient : public BaseClient,
   }
 
   static void SaveAs(CefRefPtr<CefBrowser> browser, const CefString& url) {
-    g_save_as_urls.insert(url.ToString());
-    browser->GetHost()->StartDownload(url);
+    StartSaveAs(browser, url.ToString());
   }
 
   static void TogglePictureInPicture(CefRefPtr<CefBrowser> browser,
                                      CefRefPtr<CefContextMenuParams> params) {
-    double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
     NSString* script = [NSString
-        stringWithFormat:
-            @"(() => { const v = document.elementsFromPoint(%f, %f).find("
-            @"e => e instanceof HTMLVideoElement); if (!v) return; "
-            @"document.pictureInPictureElement === v ? "
-            @"document.exitPictureInPicture() : "
-            @"v.requestPictureInPicture().catch(() => {}); })()",
-            params->GetXCoord() / zoom, params->GetYCoord() / zoom];
+        stringWithFormat:@"(() => { %@ if (!m) return; "
+                         @"document.pictureInPictureElement === m ? "
+                         @"document.exitPictureInPicture() : "
+                         @"m.requestPictureInPicture().catch(() => {}); })()",
+                         MediaAtPoint(browser, params, "HTMLVideoElement")];
     CefRefPtr<CefDictionaryValue> args = CefDictionaryValue::Create();
     args->SetString("expression", script.UTF8String);
     args->SetBool("userGesture", true);
@@ -2854,13 +2881,10 @@ class WebClient : public BaseClient,
   static void ToggleMedia(CefRefPtr<CefBrowser> browser,
                           CefRefPtr<CefContextMenuParams> params,
                           const char* property) {
-    double zoom = pow(1.2, browser->GetHost()->GetZoomLevel());
     NSString* script = [NSString
-        stringWithFormat:
-            @"(() => { const m = document.elementsFromPoint(%f, %f).find("
-            @"e => e instanceof HTMLMediaElement); if (m) m.%s = !m.%s; })()",
-            params->GetXCoord() / zoom, params->GetYCoord() / zoom, property,
-            property];
+        stringWithFormat:@"(() => { %@ if (m) m.%s = !m.%s; })()",
+                         MediaAtPoint(browser, params, "HTMLMediaElement"),
+                         property, property];
     browser->GetMainFrame()->ExecuteJavaScript(script.UTF8String, "", 0);
   }
 
@@ -3778,8 +3802,7 @@ class CookieKeys : public CefCookieVisitor {
 
 - (void)saveURLAs:(NSString*)url {
   if (_browser) {
-    g_save_as_urls.insert(url.UTF8String);
-    _browser->GetHost()->StartDownload(url.UTF8String);
+    StartSaveAs(_browser, url.UTF8String);
   }
 }
 
