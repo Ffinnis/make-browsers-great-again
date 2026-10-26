@@ -1578,6 +1578,7 @@ extension BrowserStore: MBWebViewDelegate {
             }
             let space = space(owning: view.tabID)?.id ?? activeSpace.id
             let id = core.openTab(spaceId: space, url: url, activate: foreground && isFront)
+            if !foreground, let id, let tab = core.tab(id: id) { createView(for: tab) }
             if foreground, !isFront, let id {
                 select(id, in: space)
             } else {
