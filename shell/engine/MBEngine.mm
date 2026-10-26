@@ -51,6 +51,9 @@
 
 @interface MBWebView ()
 - (void)engineSecurityMayHaveChanged;
+- (instancetype)initPopupWithTabID:(uint64_t)tabID NS_DESIGNATED_INITIALIZER;
+- (CefRefPtr<CefClient>)engineClient;
+- (void)enginePopupAborted;
 - (void)engineAddPrompt:(MBPermissionPrompt*)prompt;
 - (void)engineDidCreateBrowser:(CefRefPtr<CefBrowser>)browser;
 - (void)engineWillCloseBrowser;
@@ -1824,6 +1827,26 @@ class WebClient : public BaseClient,
       return true;
     }
     windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+    MBWebView* view = view_;
+    if ([view.delegate
+            respondsToSelector:@selector(webView:hostsPopup:size:)]) {
+      MBWebView* popup = [[MBWebView alloc] initPopupWithTabID:0];
+      NSSize size =
+          NSMakeSize(popupFeatures.widthSet ? popupFeatures.width : 0,
+                     popupFeatures.heightSet ? popupFeatures.height : 0);
+      if ([view.delegate webView:view hostsPopup:popup size:size]) {
+        NSSize frame = popup.bounds.size;
+        windowInfo.SetAsChild((__bridge CefWindowHandle)popup,
+                              CefRect(0, 0, frame.width, frame.height));
+        client = [popup engineClient];
+        std::erase_if(pending_popups_, [](const auto& entry) {
+          return !entry.second || entry.second.browserIdentifier != 0;
+        });
+        pending_popups_[popup_id] = popup;
+        return false;
+      }
+      [popup enginePopupAborted];
+    }
     client = AuxiliaryClient::Popups();
     return false;
   }
@@ -1873,6 +1896,17 @@ class WebClient : public BaseClient,
           requestsNewTabWithURL:url
                      foreground:disposition != CEF_WOD_NEW_BACKGROUND_TAB];
     }
+  }
+
+  void OnBeforePopupAborted(CefRefPtr<CefBrowser> browser,
+                            int popup_id) override {
+    auto entry = pending_popups_.find(popup_id);
+    if (entry == pending_popups_.end()) {
+      return;
+    }
+    MBWebView* popup = entry->second;
+    pending_popups_.erase(entry);
+    [popup enginePopupAborted];
   }
 
   void OnAfterCreated(CefRefPtr<CefBrowser> browser) override {
@@ -3004,25 +3038,27 @@ class WebClient : public BaseClient,
     NSString* area = ToNS(realm);
     dispatch_async(dispatch_get_main_queue(), ^{
       MBWebView* view = weak_view;
-      if (![view.delegate
+      void (^reply)(NSString*, NSString*) =
+          ^(NSString* user, NSString* password) {
+            if (user) {
+              callback->Continue(user.UTF8String, password.UTF8String ?: "");
+            } else {
+              callback->Cancel();
+            }
+          };
+      if ([view.delegate
               respondsToSelector:@selector(webView:requestsCredentialsForHost:
                                            realm:proxy:reply:)]) {
+        [view.delegate webView:view
+            requestsCredentialsForHost:name
+                                 realm:area
+                                 proxy:isProxy
+                                 reply:reply];
+      } else if (g_credentials_handler) {
+        g_credentials_handler(name, area, isProxy, view.window, reply);
+      } else {
         callback->Cancel();
-        return;
       }
-      [view.delegate webView:view
-          requestsCredentialsForHost:name
-                               realm:area
-                               proxy:isProxy
-                               reply:^(NSString* user, NSString* password) {
-                                 if (user) {
-                                   callback->Continue(
-                                       user.UTF8String,
-                                       password.UTF8String ?: "");
-                                 } else {
-                                   callback->Cancel();
-                                 }
-                               }];
     });
     return true;
   }
@@ -3333,6 +3369,7 @@ class WebClient : public BaseClient,
   std::string document_script_;
   std::string deferred_url_;
   std::vector<std::string> favicon_urls_;
+  std::map<int, __weak MBWebView*> pending_popups_;
   CFAbsoluteTime created_;
   std::string prepared_url_;
   int pending_add_ = 0;
@@ -4043,6 +4080,8 @@ class CookieKeys : public CefCookieVisitor {
   _tabID = tabID;
   self.wantsLayer = YES;
   _client = new WebClient(self);
+  [g_views addObject:self];
+  g_browser_count++;
 
   CefWindowInfo info;
   info.SetAsChild((__bridge CefWindowHandle)self, CefRect(0, 0, 800, 600));
@@ -4050,8 +4089,6 @@ class CookieKeys : public CefCookieVisitor {
   CefBrowserSettings settings;
   settings.background_color = 0xFFFFFFFF;
 
-  [g_views addObject:self];
-  g_browser_count++;
   std::string start = url.UTF8String;
   bool web = [url hasPrefix:@"https://"] || [url hasPrefix:@"http://"];
   bool extension = [url hasPrefix:@"chrome-extension://"];
@@ -4067,6 +4104,33 @@ class CookieKeys : public CefCookieVisitor {
     BrowserGone();
   }
   return self;
+}
+
+- (instancetype)initPopupWithTabID:(uint64_t)tabID {
+  self = [super initWithFrame:NSMakeRect(0, 0, 800, 600)];
+  if (!self) {
+    return nil;
+  }
+  _tabID = tabID;
+  self.wantsLayer = YES;
+  _client = new WebClient(self);
+  [g_views addObject:self];
+  g_browser_count++;
+  return self;
+}
+
+- (CefRefPtr<CefClient>)engineClient {
+  return _client;
+}
+
+- (void)enginePopupAborted {
+  if (_browser || ![g_views containsObject:self]) {
+    return;
+  }
+  _closing = YES;
+  [g_views removeObject:self];
+  BrowserGone();
+  [self.delegate webViewDidClose:self];
 }
 
 - (BOOL)isFlipped {
