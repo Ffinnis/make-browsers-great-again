@@ -654,7 +654,7 @@ final class BrowserStore: NSObject {
         select(tabs[next].id)
     }
 
-    private var visibleView: MBWebView? { visibleTabID.flatMap { views[$0] } }
+    var visibleView: MBWebView? { visibleTabID.flatMap { views[$0] } }
 
     func goBack() { visibleView?.goBack() }
     func goForward() { visibleView?.goForward() }

@@ -206,6 +206,7 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (void)goForward;
 - (void)reload;
 - (void)stopLoading;
+- (void)printPage;
 - (void)zoomIn;
 - (void)zoomOut;
 - (void)resetZoom;

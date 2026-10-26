@@ -3638,6 +3638,12 @@ class CookieKeys : public CefCookieVisitor {
   }
 }
 
+- (void)printPage {
+  if (_browser) {
+    _browser->GetHost()->Print();
+  }
+}
+
 - (void)zoomIn {
   if (_browser) {
     _browser->GetHost()->Zoom(CEF_ZOOM_COMMAND_IN);
