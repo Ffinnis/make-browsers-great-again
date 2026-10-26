@@ -1891,13 +1891,7 @@ class WebClient : public BaseClient,
       return true;
     }
     if (text.rfind(kFormPrefix, 0) == 0) {
-      std::string signed_prefix = kFormPrefix + form_token_ + ":";
-      if (!form_token_.empty() && text.rfind(signed_prefix, 0) == 0) {
-        MBWebView* view = view_;
-        [view.delegate webView:view
-            didReceiveFormMessage:@(text.c_str() + signed_prefix.size())
-                              url:ToNS(browser->GetMainFrame()->GetURL())];
-      }
+      ReceiveForm(browser, text.substr(strlen(kFormPrefix)));
       return true;
     }
     if (text.rfind(kPageReportPrefix, 0) == 0) {
@@ -1920,6 +1914,42 @@ class WebClient : public BaseClient,
     }
     [view_ engineSetMediaPlaying:text.back() == '1'];
     return true;
+  }
+
+  void ReceiveForm(CefRefPtr<CefBrowser> browser,
+                   const std::string& signed_text) {
+    size_t colon = signed_text.find(':');
+    if (colon == std::string::npos) {
+      return;
+    }
+    std::string token = signed_text.substr(0, colon);
+    CefRefPtr<CefFrame> frame;
+    std::string frame_id;
+    if (!form_token_.empty() && token == form_token_) {
+      frame = browser->GetMainFrame();
+    } else if (auto known = frame_tokens_.find(token);
+               known != frame_tokens_.end()) {
+      frame_id = known->second;
+      frame = browser->GetFrameByIdentifier(frame_id);
+    }
+    if (!frame || !frame->IsValid()) {
+      return;
+    }
+    MBWebView* view = view_;
+    [view.delegate webView:view
+        didReceiveFormMessage:@(signed_text.c_str() + colon + 1)
+                          url:ToNS(frame->GetURL())
+                        frame:@(frame_id.c_str())];
+  }
+
+  void InjectForms(CefRefPtr<CefFrame> frame, std::string& token) {
+    token = NSUUID.UUID.UUIDString.UTF8String;
+    std::string form = g_form_script;
+    for (size_t at = form.find(kFormTokenPlaceholder); at != std::string::npos;
+         at = form.find(kFormTokenPlaceholder, at)) {
+      form.replace(at, strlen(kFormTokenPlaceholder), token);
+    }
+    frame->ExecuteJavaScript(form, "", 0);
   }
 
   void ReportPage(const std::string& report) {
@@ -1970,8 +2000,16 @@ class WebClient : public BaseClient,
                    CefRefPtr<CefFrame> frame,
                    TransitionType transition_type) override {
     if (!frame->IsMain()) {
+      std::string url = frame->GetURL().ToString();
+      if (!g_form_script.empty() &&
+          (url.rfind("https://", 0) == 0 || url.rfind("http://", 0) == 0)) {
+        std::string token;
+        InjectForms(frame, token);
+        frame_tokens_[token] = frame->GetIdentifier().ToString();
+      }
       return;
     }
+    frame_tokens_.clear();
     blocked_ = 0;
     [view_ engineSetBlockedCount:0];
     codec_.Reset();
@@ -1993,13 +2031,7 @@ class WebClient : public BaseClient,
     }
     form_token_.clear();
     if (web && !g_form_script.empty()) {
-      form_token_ = NSUUID.UUID.UUIDString.UTF8String;
-      std::string form = g_form_script;
-      for (size_t at = form.find(kFormTokenPlaceholder);
-           at != std::string::npos; at = form.find(kFormTokenPlaceholder, at)) {
-        form.replace(at, strlen(kFormTokenPlaceholder), form_token_);
-      }
-      frame->ExecuteJavaScript(form, "", 0);
+      InjectForms(frame, form_token_);
     }
   }
 
@@ -3130,6 +3162,7 @@ class WebClient : public BaseClient,
   NSUInteger console_warnings_ = 0;
   bool console_report_pending_ = false;
   std::string form_token_;
+  std::map<std::string, std::string> frame_tokens_;
   CFAbsoluteTime navigation_started_ = 0;
   int load_error_ = 0;
   std::map<int, Reply> replies_;
@@ -4304,6 +4337,18 @@ class CookieKeys : public CefCookieVisitor {
 - (void)runScript:(NSString*)script {
   if (_browser) {
     _browser->GetMainFrame()->ExecuteJavaScript(script.UTF8String, "", 0);
+  }
+}
+
+- (void)runScript:(NSString*)script inFrame:(NSString*)frameID {
+  if (frameID.length == 0) {
+    [self runScript:script];
+    return;
+  }
+  CefRefPtr<CefFrame> frame =
+      _browser ? _browser->GetFrameByIdentifier(frameID.UTF8String) : nullptr;
+  if (frame && frame->IsValid()) {
+    frame->ExecuteJavaScript(script.UTF8String, "", 0);
   }
 }
 

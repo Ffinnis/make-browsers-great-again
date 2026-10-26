@@ -1762,10 +1762,10 @@ extension BrowserStore: MBWebViewDelegate {
         }
     }
 
-    nonisolated func webView(_ view: MBWebView, didReceiveFormMessage message: String, url: String) {
+    nonisolated func webView(_ view: MBWebView, didReceiveFormMessage message: String, url: String, frame: String) {
         MainActor.assumeIsolated {
             guard isCurrent(view) else { return }
-            passwords.receive(message, url: url, from: view)
+            passwords.receive(message, url: url, frame: frame, from: view)
         }
     }
 

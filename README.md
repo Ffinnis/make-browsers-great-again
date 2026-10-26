@@ -120,7 +120,7 @@ engine events back. Nothing in the UI keeps browser state of its own.
 ### Not yet built
 
 - Importing history, and open tabs from Firefox and Safari.
-- Passwords in cross-site frames, generated passwords and passkeys.
+- Generated passwords and passkeys.
 - Split view, Peek, Little Arc, Boosts, link routing to spaces, the archive
   view and multi-color gradient themes.
 - Scriptlets newer than uBlock Origin 1.48, redirect resources (such rules

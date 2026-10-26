@@ -262,7 +262,7 @@ final class ExtensionPopup: NSObject, NSPopoverDelegate, MBWebViewDelegate {
     nonisolated func webView(_ view: MBWebView, didReceiveDevToolsEvent method: String, params: [AnyHashable: Any]) {}
     nonisolated func webView(_ view: MBWebView, didPickNode backendNodeId: Int) {}
     nonisolated func webView(_ view: MBWebView, inspectsElementAt point: NSPoint) {}
-    nonisolated func webView(_ view: MBWebView, didReceiveFormMessage message: String, url: String) {}
+    nonisolated func webView(_ view: MBWebView, didReceiveFormMessage message: String, url: String, frame: String) {}
     nonisolated func webView(_ view: MBWebView, opensExtensionsPage url: String, fromPage page: String) {
         MainActor.assumeIsolated { store?.showExtensions(url: url) }
     }

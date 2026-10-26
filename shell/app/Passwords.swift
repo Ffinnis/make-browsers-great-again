@@ -85,6 +85,7 @@ final class PasswordFiller {
         weak var view: MBWebView?
         let tab: UInt64
         let url: String
+        let frame: String
     }
     private var field: Field?
     private var hideTimer: Timer?
@@ -107,13 +108,13 @@ final class PasswordFiller {
         }
     }
 
-    func receive(_ message: String, url: String, from view: MBWebView) {
+    func receive(_ message: String, url: String, frame: String, from view: MBWebView) {
         guard let data = message.data(using: .utf8),
               let m = (try? JSONSerialization.jsonObject(with: data)) as? JSON, let type = m.str("t") else { return }
         let tab = view.tabID
         switch type {
         case "focus":
-            showSuggestions(m, url: url, in: view)
+            showSuggestions(m, url: url, frame: frame, in: view)
         case "blur":
             hideTimer?.invalidate()
             hideTimer = Timer.scheduledTimer(withTimeInterval: 0.12, repeats: false) { [weak self] _ in
@@ -179,16 +180,19 @@ final class PasswordFiller {
         if offer.tabID == tab { offer.dismiss() }
     }
 
-    private func showSuggestions(_ m: JSON, url: String, in view: MBWebView) {
+    private func showSuggestions(_ m: JSON, url: String, frame: String, in view: MBWebView) {
         hideTimer?.invalidate()
         guard let window = view.window, !view.isHiddenOrHasHiddenAncestor, window.isKeyWindow,
               !store.agentActiveTabs.contains(view.tabID),
               let profile = store.core.profileOfTab(tabId: view.tabID) else { return hideSuggestions() }
         let logins = store.core.loginsForPage(profileId: profile, url: url)
-        guard !logins.isEmpty, let rect = Self.screenRect(m, in: view) else { return hideSuggestions() }
-        field = Field(view: view, tab: view.tabID, url: url)
-        suggestions.show(logins, page: Self.site(url), under: rect, in: window)
-        view.runScript("window.__mbgaForms && __mbgaForms.open(true)")
+        guard !logins.isEmpty else { return hideSuggestions() }
+        FrameOffset.find(url, frame: frame, in: view) { [weak self] offset in
+            guard let self, let rect = Self.screenRect(m, offset: offset, in: view) else { return }
+            field = Field(view: view, tab: view.tabID, url: url, frame: frame)
+            suggestions.show(logins, page: Self.site(url), under: rect, in: window)
+            view.runScript("window.__mbgaForms && __mbgaForms.open(true)", inFrame: frame)
+        }
     }
 
     private func hideSuggestions() {
@@ -196,7 +200,7 @@ final class PasswordFiller {
         guard let field else { return }
         self.field = nil
         suggestions.dismiss()
-        field.view?.runScript("window.__mbgaForms && __mbgaForms.open(false)")
+        field.view?.runScript("window.__mbgaForms && __mbgaForms.open(false)", inFrame: field.frame)
     }
 
     private func fill(_ login: SavedLogin) {
@@ -209,7 +213,7 @@ final class PasswordFiller {
                 return
             }
             let args = [origin, login.username, password].map(FormScript.literal).joined(separator: ",")
-            view.runScript("window.__mbgaForms && __mbgaForms.fill(\(args))")
+            view.runScript("window.__mbgaForms && __mbgaForms.fill(\(args))", inFrame: field.frame)
             core.markLoginUsed(id: login.id)
         }
     }
@@ -258,12 +262,12 @@ final class PasswordFiller {
         return host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
     }
 
-    private static func screenRect(_ m: JSON, in view: MBWebView) -> NSRect? {
+    private static func screenRect(_ m: JSON, offset: CGPoint, in view: MBWebView) -> NSRect? {
         guard let window = view.window,
               let x = m["x"] as? Double, let y = m["y"] as? Double, let w = m["w"] as? Double, let h = m["h"] as? Double
         else { return nil }
         let k = (m["dpr"] as? Double ?? window.backingScaleFactor) / window.backingScaleFactor
-        var rect = NSRect(x: x * k, y: y * k, width: w * k, height: h * k)
+        var rect = NSRect(x: (x + offset.x) * k, y: (y + offset.y) * k, width: w * k, height: h * k)
         if !view.isFlipped { rect.origin.y = view.bounds.height - rect.maxY }
         guard view.bounds.intersects(rect) else { return nil }
         return window.convertToScreen(view.convert(rect, to: nil))

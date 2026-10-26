@@ -61,7 +61,8 @@ typedef void (^MBCredentialsHandler)(
 - (void)webView:(MBWebView*)view inspectsElementAt:(NSPoint)point;
 - (void)webView:(MBWebView*)view
     didReceiveFormMessage:(NSString*)message
-                      url:(NSString*)url;
+                      url:(NSString*)url
+                    frame:(NSString*)frameID;
 
 @optional
 - (void)webView:(MBWebView*)view
@@ -275,6 +276,7 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 @property(nonatomic) BOOL picksForInspector;
 - (void)focusContent;
 - (void)runScript:(NSString*)script;
+- (void)runScript:(NSString*)script inFrame:(NSString*)frameID;
 - (void)probeMedia;
 - (void)setMediaPaused:(BOOL)paused;
 - (void)setFrozen:(BOOL)frozen;
