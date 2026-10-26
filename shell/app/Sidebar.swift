@@ -202,7 +202,7 @@ private final class AddressPillView: HoverView {
     private var shownTab: UInt64?
     private let store: BrowserStore
     private let fill = FillLayer()
-    private let lock = NSImageView()
+    private lazy var lock = SiteSecurityBadge(store: store)
     private let host = Label.make()
     private let spinner = NSProgressIndicator()
     private let shield = NSImageView()
@@ -214,9 +214,6 @@ private final class AddressPillView: HoverView {
         super.init(frame: .zero)
         fill.cornerRadius = 10
         layer?.addSublayer(fill)
-        lock.image = .symbol("lock.fill", size: 10, weight: .regular)
-        lock.contentTintColor = .labelColor
-        lock.alphaValue = 0.5
         spinner.style = .spinning
         spinner.controlSize = .mini
         spinner.isDisplayedWhenStopped = false
@@ -235,7 +232,7 @@ private final class AddressPillView: HoverView {
 
     func update() {
         let tab = store.visibleTab
-        lock.isHidden = !(tab?.url.hasPrefix("https://") ?? false)
+        lock.update()
         host.stringValue = tab?.host ?? "Search or Enter URL…"
         host.alphaValue = tab == nil ? 0.5 : 0.85
         if store.nav.isLoading { spinner.startAnimation(nil) } else { spinner.stopAnimation(nil) }
@@ -268,7 +265,7 @@ private final class AddressPillView: HoverView {
         CATransaction.commit()
         var x: CGFloat = 10
         if !lock.isHidden {
-            lock.frame = NSRect(x: x, y: bounds.midY - 6, width: 10, height: 12)
+            lock.frame = NSRect(x: x - 4, y: bounds.midY - 9, width: 18, height: 18)
             x += 16
         }
         var trailing = bounds.width - 10

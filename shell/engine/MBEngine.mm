@@ -24,6 +24,9 @@
 #include "include/cef_request_context.h"
 #include "include/cef_request_context_handler.h"
 #include "include/cef_resource_handler.h"
+#include "include/cef_ssl_info.h"
+#include "include/cef_ssl_status.h"
+#include "include/cef_x509_certificate.h"
 #include "include/wrapper/cef_library_loader.h"
 
 @interface MBPermissionPrompt : NSObject
@@ -42,7 +45,12 @@
                    ephemeral:(BOOL)ephemeral;
 @end
 
+@interface MBCertificate ()
+- (instancetype)initWithCertificate:(CefRefPtr<CefX509Certificate>)certificate;
+@end
+
 @interface MBWebView ()
+- (void)engineSecurityMayHaveChanged;
 - (void)engineAddPrompt:(MBPermissionPrompt*)prompt;
 - (void)engineDidCreateBrowser:(CefRefPtr<CefBrowser>)browser;
 - (void)engineWillCloseBrowser;
@@ -730,6 +738,94 @@ NSString* DescribePrompt(uint32_t permissions) {
     return @"see text and images copied to the clipboard";
   }
   return @"use additional permissions";
+}
+
+constexpr uint32_t kCertErrors =
+    CERT_STATUS_COMMON_NAME_INVALID | CERT_STATUS_DATE_INVALID |
+    CERT_STATUS_AUTHORITY_INVALID | CERT_STATUS_REVOKED | CERT_STATUS_INVALID |
+    CERT_STATUS_WEAK_SIGNATURE_ALGORITHM | CERT_STATUS_NON_UNIQUE_NAME |
+    CERT_STATUS_WEAK_KEY | CERT_STATUS_PINNED_KEY_MISSING |
+    CERT_STATUS_NAME_CONSTRAINT_VIOLATION | CERT_STATUS_VALIDITY_TOO_LONG |
+    CERT_STATUS_CT_COMPLIANCE_FAILED;
+
+struct PageSecurity {
+  MBConnectionSecurity level = MBConnectionSecurityNone;
+  CefRefPtr<CefX509Certificate> certificate;
+  NSString* problem = nil;
+};
+
+bool IsCertError(int code) {
+  return code <= ERR_CERT_COMMON_NAME_INVALID && code > ERR_CERT_END;
+}
+
+NSString* DescribeCertProblem(int code, uint32_t status) {
+  if (code == ERR_CERT_DATE_INVALID || (status & CERT_STATUS_DATE_INVALID)) {
+    return @"The site's certificate has expired or isn't valid yet.";
+  }
+  if (code == ERR_CERT_AUTHORITY_INVALID ||
+      (status & CERT_STATUS_AUTHORITY_INVALID)) {
+    return @"The site's certificate isn't issued by an authority your Mac "
+           @"trusts.";
+  }
+  if (code == ERR_CERT_COMMON_NAME_INVALID ||
+      (status & CERT_STATUS_COMMON_NAME_INVALID)) {
+    return @"The site's certificate belongs to a different site.";
+  }
+  if (code == ERR_CERT_REVOKED || (status & CERT_STATUS_REVOKED)) {
+    return @"The site's certificate has been revoked.";
+  }
+  return @"The site's certificate isn't valid.";
+}
+
+cef_content_setting_types_t ContentSettingFor(MBSitePermission permission) {
+  switch (permission) {
+    case MBSitePermissionCamera:
+      return CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_CAMERA;
+    case MBSitePermissionMicrophone:
+      return CEF_CONTENT_SETTING_TYPE_MEDIASTREAM_MIC;
+    case MBSitePermissionLocation: return CEF_CONTENT_SETTING_TYPE_GEOLOCATION;
+    case MBSitePermissionNotifications:
+      return CEF_CONTENT_SETTING_TYPE_NOTIFICATIONS;
+    case MBSitePermissionPopups: return CEF_CONTENT_SETTING_TYPE_POPUPS;
+  }
+  return CEF_CONTENT_SETTING_TYPE_NOTIFICATIONS;
+}
+
+void AllowPopupsByDefault(CefRefPtr<CefRequestContext> context) {
+  if (context->GetContentSetting("", "", CEF_CONTENT_SETTING_TYPE_POPUPS) !=
+      CEF_CONTENT_SETTING_VALUE_ALLOW) {
+    context->SetContentSetting("", "", CEF_CONTENT_SETTING_TYPE_POPUPS,
+                               CEF_CONTENT_SETTING_VALUE_ALLOW);
+  }
+}
+
+bool BlocksPopups(CefRefPtr<CefBrowser> browser, const std::string& opener) {
+  CefRefPtr<CefRequestContext> context =
+      browser->GetHost()->GetRequestContext();
+  return context->GetContentSetting("", "", CEF_CONTENT_SETTING_TYPE_POPUPS) ==
+             CEF_CONTENT_SETTING_VALUE_ALLOW &&
+         context->GetContentSetting(opener, opener,
+                                    CEF_CONTENT_SETTING_TYPE_POPUPS) ==
+             CEF_CONTENT_SETTING_VALUE_BLOCK;
+}
+
+NSDate* DateFrom(const CefBaseTime& time) {
+  cef_time_t exploded;
+  double seconds = 0;
+  if (time.val == 0 || !cef_time_from_basetime(time, &exploded) ||
+      !cef_time_to_doublet(&exploded, &seconds)) {
+    return nil;
+  }
+  return [NSDate dateWithTimeIntervalSince1970:seconds];
+}
+
+void AppendDER(NSMutableArray<NSData*>* chain, CefRefPtr<CefBinaryValue> der) {
+  if (!der || der->GetSize() == 0) {
+    return;
+  }
+  NSMutableData* data = [NSMutableData dataWithLength:der->GetSize()];
+  der->GetData(data.mutableBytes, data.length, 0);
+  [chain addObject:data];
 }
 
 bool IsExtensionsPage(const std::string& url) {
@@ -1719,6 +1815,10 @@ class WebClient : public BaseClient,
                      CefBrowserSettings& settings,
                      CefRefPtr<CefDictionaryValue>& extra_info,
                      bool* no_javascript_access) override {
+    if (!user_gesture &&
+        BlocksPopups(browser, browser->GetMainFrame()->GetURL().ToString())) {
+      return true;
+    }
     if (OpensElsewhere(target_disposition)) {
       Open(browser, ToNS(target_url), target_disposition);
       return true;
@@ -1833,6 +1933,7 @@ class WebClient : public BaseClient,
     if (frame->IsMain() && deferred_url_.empty()) {
       MBWebView* view = view_;
       [view.delegate webView:view didChangeURL:ToNS(url)];
+      [view engineSecurityMayHaveChanged];
     }
   }
 
@@ -2059,6 +2160,7 @@ class WebClient : public BaseClient,
       [view_
           engineDidFinishLoad:load_error_ != 0 ? load_error_ : httpStatusCode
                      duration:CFAbsoluteTimeGetCurrent() - navigation_started_];
+      [view_ engineSecurityMayHaveChanged];
       if (DebugEvents()) {
         NSLog(@"load end %s (%d) after %.0f ms",
               frame->GetURL().ToString().c_str(), httpStatusCode,
@@ -2074,10 +2176,73 @@ class WebClient : public BaseClient,
                    const CefString& failedUrl) override {
     if (frame->IsMain() && errorCode != ERR_ABORTED) {
       load_error_ = errorCode;
+      if (IsCertError(errorCode) && cert_error_.url != failedUrl.ToString()) {
+        cert_error_ = {failedUrl.ToString(), errorCode, nullptr};
+      }
       [view_
           engineDidFinishLoad:errorCode
                      duration:CFAbsoluteTimeGetCurrent() - navigation_started_];
+      [view_ engineSecurityMayHaveChanged];
     }
+  }
+
+  bool OnCertificateError(CefRefPtr<CefBrowser> browser,
+                          cef_errorcode_t cert_error,
+                          const CefString& request_url,
+                          CefRefPtr<CefSSLInfo> ssl_info,
+                          CefRefPtr<CefCallback> callback) override {
+    cert_error_ = {request_url.ToString(), cert_error,
+                   ssl_info ? ssl_info->GetX509Certificate() : nullptr};
+    return false;
+  }
+
+  PageSecurity Security(CefRefPtr<CefBrowser> browser) {
+    PageSecurity result;
+    CefRefPtr<CefNavigationEntry> entry =
+        browser->GetHost()->GetVisibleNavigationEntry();
+    bool valid = entry && entry->IsValid();
+    std::string url = valid ? entry->GetURL().ToString()
+                            : browser->GetMainFrame()->GetURL().ToString();
+    if (url.rfind("http://", 0) == 0) {
+      result.level = MBConnectionSecurityInsecure;
+      result.problem = @"Information you send or receive on this site, like "
+                       @"passwords, can be seen by others on the network.";
+      return result;
+    }
+    if (url.rfind("https://", 0) != 0) {
+      return result;
+    }
+    CefRefPtr<CefSSLStatus> ssl = valid ? entry->GetSSLStatus() : nullptr;
+    if (ssl) {
+      result.certificate = ssl->GetX509Certificate();
+    }
+    uint32_t status = ssl ? ssl->GetCertStatus() : CERT_STATUS_NONE;
+    bool failed = cert_error_.url == url;
+    if (failed || (status & kCertErrors)) {
+      result.level = MBConnectionSecurityBroken;
+      if (!result.certificate && failed) {
+        result.certificate = cert_error_.certificate;
+      }
+      result.problem = DescribeCertProblem(failed ? cert_error_.code : 0,
+                                           status & kCertErrors);
+      return result;
+    }
+    if (!ssl || !ssl->IsSecureConnection()) {
+      return result;
+    }
+    int content = ssl->GetContentStatus();
+    if (content & SSL_CONTENT_RAN_INSECURE_CONTENT) {
+      result.level = MBConnectionSecurityMixed;
+      result.problem = @"This page runs code loaded over an insecure "
+                       @"connection, so others on the network could change it.";
+    } else if (content & SSL_CONTENT_DISPLAYED_INSECURE_CONTENT) {
+      result.level = MBConnectionSecurityMixed;
+      result.problem = @"Parts of this page, like images, load over an "
+                       @"insecure connection.";
+    } else {
+      result.level = MBConnectionSecuritySecure;
+    }
+    return result;
   }
 
   void OnLoadingStateChange(CefRefPtr<CefBrowser> browser,
@@ -2089,6 +2254,7 @@ class WebClient : public BaseClient,
           didChangeLoading:isLoading
                  canGoBack:canGoBack
               canGoForward:canGoForward];
+    [view engineSecurityMayHaveChanged];
   }
 
   bool OnBeforeBrowse(CefRefPtr<CefBrowser> browser,
@@ -2118,6 +2284,7 @@ class WebClient : public BaseClient,
     if (frame->IsMain()) {
       navigation_started_ = CFAbsoluteTimeGetCurrent();
       load_error_ = 0;
+      cert_error_ = {};
       SyncMediaShim(browser);
       std::string url = request->GetURL().ToString();
       if (url == prepared_url_) {
@@ -3179,6 +3346,12 @@ class WebClient : public BaseClient,
   std::map<std::string, std::string> frame_tokens_;
   CFAbsoluteTime navigation_started_ = 0;
   int load_error_ = 0;
+  struct CertError {
+    std::string url;
+    int code = 0;
+    CefRefPtr<CefX509Certificate> certificate;
+  };
+  CertError cert_error_;
   std::map<int, Reply> replies_;
   std::map<int, RawReply> raw_replies_;
   bool picking_ = false;
@@ -3383,6 +3556,35 @@ class CookieKeys : public CefCookieVisitor {
 @end
 
 @implementation MBCookie
+@end
+
+@implementation MBCertificate
+
+- (instancetype)initWithCertificate:(CefRefPtr<CefX509Certificate>)certificate {
+  if ((self = [super init])) {
+    CefRefPtr<CefX509CertPrincipal> subject = certificate->GetSubject();
+    CefRefPtr<CefX509CertPrincipal> issuer = certificate->GetIssuer();
+    _subject = subject ? ToNS(subject->GetDisplayName()) : @"";
+    std::vector<CefString> organizations;
+    if (subject) {
+      subject->GetOrganizationNames(organizations);
+    }
+    _organization = organizations.empty() ? @"" : ToNS(organizations.front());
+    _issuer = issuer ? ToNS(issuer->GetDisplayName()) : @"";
+    _validFrom = DateFrom(certificate->GetValidStart());
+    _validUntil = DateFrom(certificate->GetValidExpiry());
+    NSMutableArray<NSData*>* chain = [NSMutableArray array];
+    AppendDER(chain, certificate->GetDEREncoded());
+    CefX509Certificate::IssuerChainBinaryList issuers;
+    certificate->GetDEREncodedIssuerChain(issuers);
+    for (const CefRefPtr<CefBinaryValue>& der : issuers) {
+      AppendDER(chain, der);
+    }
+    _chain = chain;
+  }
+  return self;
+}
+
 @end
 
 @implementation MBEngine
@@ -3828,6 +4030,7 @@ class CookieKeys : public CefCookieVisitor {
   double _throughput;
   void (^_closeReply)(BOOL closed);
   BOOL _askingToLeave;
+  NSString* _securityKey;
 }
 
 - (instancetype)initWithURL:(NSString*)url
@@ -4177,6 +4380,105 @@ class CookieKeys : public CefCookieVisitor {
                 [browser](CefRefPtr<CefDictionaryValue>) {
                   browser->ReloadIgnoreCache();
                 });
+}
+
+- (MBConnectionSecurity)security {
+  return _browser ? _client->Security(_browser).level
+                  : MBConnectionSecurityNone;
+}
+
+- (MBCertificate*)certificate {
+  if (!_browser) {
+    return nil;
+  }
+  CefRefPtr<CefX509Certificate> certificate =
+      _client->Security(_browser).certificate;
+  return certificate ? [[MBCertificate alloc] initWithCertificate:certificate]
+                     : nil;
+}
+
+- (NSString*)securityProblem {
+  return _browser ? _client->Security(_browser).problem : nil;
+}
+
+- (void)engineSecurityMayHaveChanged {
+  if (!_browser) {
+    return;
+  }
+  PageSecurity security = _client->Security(_browser);
+  CefRefPtr<CefBinaryValue> der =
+      security.certificate ? security.certificate->GetDEREncoded() : nullptr;
+  NSString* key = [NSString
+      stringWithFormat:@"%ld %zu %@", (long)security.level,
+                       der ? der->GetSize() : 0, security.problem ?: @""];
+  if ([key isEqualToString:_securityKey]) {
+    return;
+  }
+  _securityKey = key;
+  if ([self.delegate respondsToSelector:@selector(webViewDidChangeSecurity:)]) {
+    [self.delegate webViewDidChangeSecurity:self];
+  }
+}
+
+- (std::string)permissionOrigin {
+  if (!_browser) {
+    return std::string();
+  }
+  CefURLParts parts;
+  if (!CefParseURL(_browser->GetMainFrame()->GetURL(), parts)) {
+    return std::string();
+  }
+  std::string scheme = CefString(&parts.scheme).ToString();
+  if (scheme != "http" && scheme != "https") {
+    return std::string();
+  }
+  return CefString(&parts.origin).ToString();
+}
+
+- (MBPermissionState)stateForPermission:(MBSitePermission)permission {
+  std::string origin = [self permissionOrigin];
+  if (origin.empty()) {
+    return MBPermissionStateAsk;
+  }
+  CefRefPtr<CefRequestContext> context =
+      _browser->GetHost()->GetRequestContext();
+  if (permission == MBSitePermissionPopups) {
+    AllowPopupsByDefault(context);
+  }
+  switch (context->GetContentSetting(origin, origin,
+                                     ContentSettingFor(permission))) {
+    case CEF_CONTENT_SETTING_VALUE_ALLOW: return MBPermissionStateAllow;
+    case CEF_CONTENT_SETTING_VALUE_BLOCK: return MBPermissionStateBlock;
+    default: return MBPermissionStateAsk;
+  }
+}
+
+- (void)setState:(MBPermissionState)state
+    forPermission:(MBSitePermission)permission {
+  std::string origin = [self permissionOrigin];
+  if (origin.empty()) {
+    return;
+  }
+  CefRefPtr<CefRequestContext> context =
+      _browser->GetHost()->GetRequestContext();
+  if (permission == MBSitePermissionPopups) {
+    AllowPopupsByDefault(context);
+  }
+  cef_content_setting_values_t value =
+      state == MBPermissionStateAllow   ? CEF_CONTENT_SETTING_VALUE_ALLOW
+      : state == MBPermissionStateBlock ? CEF_CONTENT_SETTING_VALUE_BLOCK
+                                        : CEF_CONTENT_SETTING_VALUE_DEFAULT;
+  context->SetContentSetting(origin, origin, ContentSettingFor(permission),
+                             value);
+}
+
+- (void)resetPermissions {
+  for (MBSitePermission permission :
+       {MBSitePermissionCamera, MBSitePermissionMicrophone,
+        MBSitePermissionLocation, MBSitePermissionNotifications,
+        MBSitePermissionPopups}) {
+    [self setState:MBPermissionStateAsk forPermission:permission];
+  }
 }
 
 - (void)captureFullPage:(void (^)(NSData* _Nullable))completion {

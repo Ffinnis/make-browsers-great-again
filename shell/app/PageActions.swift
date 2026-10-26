@@ -193,6 +193,8 @@ extension NSMenu {
                target: nil, in: "Edit", after: "Paste")
         insert("Stop", #selector(PageCommands.stopLoading(_:)), ".", target: commands,
                in: "View", after: "Reload Without Cache")
+        insert("Site Information", #selector(SiteInfoCommands.showSiteInformation(_:)), "", target: SiteInfoCommands.shared,
+               in: "View", after: "Actual Size")
         insert("Zoom In", #selector(AppDelegate.zoomIn(_:)), "+", target: NSApp.delegate as AnyObject?,
                in: "View", after: "Zoom In", hidden: true)
         insert("Next Tab", #selector(AppDelegate.nextTab(_:)), "}", target: NSApp.delegate as AnyObject?,

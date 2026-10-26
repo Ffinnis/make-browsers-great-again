@@ -81,6 +81,7 @@ typedef void (^MBCredentialsHandler)(
 - (void)webView:(MBWebView*)view
     didReportScroll:(double)scroll
             editing:(BOOL)editing;
+- (void)webViewDidChangeSecurity:(MBWebView*)view;
 - (void)webView:(MBWebView*)view
     requestsCredentialsForHost:(NSString*)host
                          realm:(NSString*)realm
@@ -126,6 +127,37 @@ typedef NS_ENUM(NSInteger, MBDownloadState) {
 @property(nonatomic, readonly) MBDownloadState state;
 @property(nonatomic, readonly) BOOL ephemeral;
 @end
+
+typedef NS_ENUM(NSInteger, MBConnectionSecurity) {
+  MBConnectionSecurityNone,
+  MBConnectionSecurityInsecure,
+  MBConnectionSecuritySecure,
+  MBConnectionSecurityMixed,
+  MBConnectionSecurityBroken,
+};
+
+@interface MBCertificate : NSObject
+@property(nonatomic, readonly, copy) NSString* subject;
+@property(nonatomic, readonly, copy) NSString* organization;
+@property(nonatomic, readonly, copy) NSString* issuer;
+@property(nonatomic, readonly, nullable) NSDate* validFrom;
+@property(nonatomic, readonly, nullable) NSDate* validUntil;
+@property(nonatomic, readonly) NSArray<NSData*>* chain;
+@end
+
+typedef NS_ENUM(NSInteger, MBSitePermission) {
+  MBSitePermissionCamera,
+  MBSitePermissionMicrophone,
+  MBSitePermissionLocation,
+  MBSitePermissionNotifications,
+  MBSitePermissionPopups,
+};
+
+typedef NS_ENUM(NSInteger, MBPermissionState) {
+  MBPermissionStateAsk,
+  MBPermissionStateAllow,
+  MBPermissionStateBlock,
+};
 
 typedef NS_ENUM(NSInteger, MBChromeCommand) {
   MBChromeCommandBack = 33000,
@@ -259,6 +291,15 @@ typedef void (^MBExtensionBridge)(NSString* profilePath,
 - (void)setScriptsDisabled:(BOOL)disabled;
 - (void)emulateNetworkWithLatency:(double)latency throughput:(double)throughput;
 - (void)clearSiteDataAndReload;
+
+@property(nonatomic, readonly) MBConnectionSecurity security;
+@property(nonatomic, readonly, nullable) MBCertificate* certificate;
+@property(nonatomic, readonly, nullable) NSString* securityProblem;
+- (MBPermissionState)stateForPermission:(MBSitePermission)permission;
+- (void)setState:(MBPermissionState)state
+    forPermission:(MBSitePermission)permission;
+- (void)resetPermissions;
+
 - (void)captureFullPage:(void (^)(NSData* _Nullable png))completion;
 
 - (void)sendDevToolsCommand:(NSString*)method
