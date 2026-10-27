@@ -160,24 +160,10 @@ final class RootView: NSView {
 
     private var chrome: Bool { !store.contentFullscreen }
     private var sidebarWidth: CGFloat { handle.width }
-    private var inset: CGFloat { store.layout == .focus ? 5 : 8 }
-
-    private func cardFrame(for layout: SidebarLayout) -> NSRect {
-        guard chrome else { return bounds }
-        let inset: CGFloat = layout == .focus ? 5 : 8
-        let leading: CGFloat = switch layout {
-        case .full: sidebarWidth + 8
-        case .compact: SidebarRail.width
-        case .focus: inset
-        }
-        return NSRect(x: leading, y: inset, width: max(bounds.width - leading - inset, 0),
-                      height: max(bounds.height - inset * 2, 0))
-    }
-
     override func layout() {
         super.layout()
         backdrop.frame = bounds
-        card.frame = currentCardFrame
+        card.frame = NSIntegralRectWithOptions(currentCardFrame, .alignAllEdgesNearest)
         card.isCard = chrome
         let panels = min(sidebarSpring.value + railSpring.value, 1)
         card.cornerRadius = max(store.windowRadius - (5 + 3 * panels), 6)
@@ -232,14 +218,25 @@ final class RootView: NSView {
     private var railShown: CGFloat { railSpring.value }
 
     private var currentCardFrame: NSRect {
+        cardFrame(sidebar: sidebarSpring.value, rail: railSpring.value, inspector: inspectorSpring.value)
+    }
+
+    private func cardFrame(sidebar: CGFloat, rail: CGFloat, inspector: CGFloat) -> NSRect {
         guard chrome else { return bounds }
-        let sidebar = sidebarSpring.value, rail = railSpring.value
         let panels = min(sidebar + rail, 1)
         let inset = 5 + 3 * panels
         let leading = sidebar * (sidebarWidth + 8) + rail * SidebarRail.width + (1 - panels) * 5
-        let trailing = inspectorSpring.value * (inspectorWidth + 8)
+        let trailing = inspector * (inspectorWidth + 8)
         return NSRect(x: leading, y: inset, width: max(bounds.width - leading - inset - trailing, 0),
                       height: max(bounds.height - inset * 2, 0))
+    }
+
+    private func holdPage() {
+        let target = cardFrame(sidebar: sidebarSpring.target, rail: railSpring.target, inspector: inspectorSpring.target)
+        let held = store.webContainer.heldSize ?? .zero, now = card.frame.size
+        let then = NSIntegralRectWithOptions(target, .alignAllEdgesNearest).size
+        store.webContainer.heldSize = NSSize(width: max(held.width, now.width, then.width),
+                                             height: max(held.height, now.height, then.height))
     }
 
     private func transitionLayout() {
@@ -260,6 +257,7 @@ final class RootView: NSView {
             finishLayoutMove()
             return
         }
+        holdPage()
         if !layoutTicker.isRunning { lastLayoutStep = nil }
         layoutTicker.start(on: self)
         needsLayout = true
@@ -282,6 +280,7 @@ final class RootView: NSView {
 
     private func finishLayoutMove() {
         layoutTicker.stop()
+        store.webContainer.heldSize = nil
         needsLayout = true
         layoutSubtreeIfNeeded()
     }
@@ -313,6 +312,7 @@ final class RootView: NSView {
             finishLayoutMove()
             return
         }
+        holdPage()
         if !layoutTicker.isRunning { lastLayoutStep = nil }
         layoutTicker.start(on: self)
         needsLayout = true

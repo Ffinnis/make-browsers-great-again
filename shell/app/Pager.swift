@@ -183,6 +183,17 @@ final class WebContainerView: NSView {
     var viewport: ((MBWebView) -> NSSize?)?
     var onPageAreaChange: (() -> Void)?
     private(set) var pageArea = NSRect.zero
+    var heldSize: NSSize? {
+        didSet {
+            guard heldSize != oldValue else { return }
+            placeCurrent()
+            if heldSize == nil { settled() }
+        }
+    }
+    private var afterHold: [@MainActor () -> Void] = []
+    private var liveSize: NSSize?
+    private var liveSettle: Timer?
+    private var liveEnd: Any?
     private let devToolsEdge = NSView()
     private let devToolsBacking = NSView()
     private lazy var devToolsHeader = DevToolsHeaderView { [weak self] in self?.current?.closeDevTools() }
@@ -217,8 +228,17 @@ final class WebContainerView: NSView {
         placeCurrent()
     }
 
+    override func viewDidEndLiveResize() {
+        super.viewDidEndLiveResize()
+        endLive()
+    }
+
     override func resizeSubviews(withOldSize oldSize: NSSize) {
+        let placed = current?.superview === self ? current : nil
+        let mask = placed?.autoresizingMask ?? []
+        placed?.autoresizingMask = []
         super.resizeSubviews(withOldSize: oldSize)
+        placed?.autoresizingMask = mask
         placeCurrent()
     }
 
@@ -334,6 +354,7 @@ extension WebContainerView {
     func placeCurrent() {
         let area = placeDevTools()
         if area != pageArea {
+            if area.size != pageArea.size, pageArea != .zero { followLive(from: pageArea.size, to: area.size) }
             pageArea = area
             onPageAreaChange?()
         }
@@ -342,17 +363,80 @@ extension WebContainerView {
         }
         guard let current else { return }
         guard let size = viewport?(current) else {
-            if current.frame != area { current.frame = area }
+            let frame = held(area)
+            if current.frame != frame { current.frame = frame }
             if current.layer?.cornerRadius != 0 { setPreview(current, radius: 0) }
             return
         }
-        let top = DevToolbarView.height, margin: CGFloat = 16
-        let width = min(size.width, area.width - 2 * margin)
-        let height = min(size.height, area.height - top - margin)
+        let top = DevToolbarView.height, margin: CGFloat = 16, room = held(area)
+        let width = min(size.width, room.width - 2 * margin)
+        let height = min(size.height, room.height - top - margin)
         let frame = NSRect(x: (area.minX + (area.width - width) / 2).rounded(), y: top,
                            width: max(width, 0), height: max(height, 0))
         if current.frame != frame { current.frame = frame }
         setPreview(current, radius: min(size.width, size.height) < 500 ? 24 : 12)
+    }
+
+    func whenSettled(_ work: @escaping @MainActor () -> Void) {
+        guard heldSize != nil else { return work() }
+        afterHold.append(work)
+    }
+
+    private func settled() {
+        let work = afterHold
+        afterHold = []
+        for item in work { item() }
+    }
+
+    private func held(_ area: NSRect) -> NSRect {
+        var size = area.size
+        if let heldSize {
+            let docked = area.width < bounds.width
+            let width = docked ? (heldSize.width - devToolsWidth(in: heldSize.width)).rounded() : heldSize.width
+            size = NSSize(width: max(size.width, width), height: max(size.height, heldSize.height))
+        }
+        if let liveSize { size = NSSize(width: max(size.width, liveSize.width), height: max(size.height, liveSize.height)) }
+        return NSRect(origin: area.origin, size: size)
+    }
+
+    private func followLive(from old: NSSize, to new: NSSize) {
+        guard heldSize == nil, inLiveResize || NSEvent.pressedMouseButtons & 1 != 0 else { return }
+        var size = liveSize ?? old
+        if new.width > size.width { size.width = new.width + 160 }
+        if new.height > size.height { size.height = new.height + 160 }
+        liveSize = size
+        if liveEnd == nil {
+            liveEnd = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+                DispatchQueue.main.async { self?.endLive() }
+                return event
+            }
+        }
+        liveSettle?.invalidate()
+        let timer = Timer(timeInterval: 0.15, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.liveSize != nil else { return }
+                guard self.inLiveResize || NSEvent.pressedMouseButtons & 1 != 0 else { return self.endLive() }
+                self.liveSize = self.pageArea.size
+                self.placeCurrent()
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        liveSettle = timer
+    }
+
+    private func endLive() {
+        liveSettle?.invalidate()
+        liveSettle = nil
+        if let liveEnd { NSEvent.removeMonitor(liveEnd) }
+        liveEnd = nil
+        guard liveSize != nil else { return }
+        liveSize = nil
+        placeCurrent()
+    }
+
+    private func devToolsWidth(in width: CGFloat) -> CGFloat {
+        let saved = CGFloat(UserDefaults.standard.double(forKey: DeveloperSettings.devToolsWidthKey))
+        return min(max(saved > 0 ? saved : 440, 280), max(width - 320, 280))
     }
 
     private func placeDevTools() -> NSRect {
@@ -364,9 +448,7 @@ extension WebContainerView {
             devToolsHandle.isHidden = true
             return bounds
         }
-        let saved = CGFloat(UserDefaults.standard.double(forKey: DeveloperSettings.devToolsWidthKey))
-        let width = min(max(saved > 0 ? saved : 440, 280), max(bounds.width - 320, 280))
-        let edge = (bounds.width - width).rounded()
+        let edge = (bounds.width - devToolsWidth(in: bounds.width)).rounded()
         if devToolsEdge.superview !== self {
             devToolsEdge.wantsLayer = true
             devToolsBacking.wantsLayer = true
@@ -394,7 +476,13 @@ extension WebContainerView {
         devToolsHeader.dark = dark
         let panel = NSRect(x: edge + 1, y: header, width: bounds.width - edge - 1, height: bounds.height - header)
         let frame = window.convertToScreen(convert(panel, to: nil))
-        if devTools.frame != frame { devTools.setFrame(frame, display: true) }
+        let kept = devTools.frame.size
+        if heldSize != nil, kept.width <= frame.width, kept.height <= frame.height {
+            let origin = NSPoint(x: frame.minX, y: frame.maxY - kept.height)
+            if devTools.frame.origin != origin { devTools.setFrameOrigin(origin) }
+        } else if devTools.frame != frame {
+            devTools.setFrame(frame, display: true)
+        }
         devTools.contentView?.layer?.cornerRadius = cornerRadius
         return NSRect(x: 0, y: 0, width: edge, height: bounds.height)
     }
