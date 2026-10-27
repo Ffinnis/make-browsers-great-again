@@ -1300,6 +1300,11 @@ final class StylesView: FlippedView {
         layoutBlocks()
     }
 
+    override func viewDidHide() {
+        super.viewDidHide()
+        shownResult = nil
+    }
+
     func forcedChanged() {
         guard let node else { return }
         hov.isOn = !(sidebar?.forcedStates[node.id]?.isEmpty ?? true)
