@@ -794,6 +794,11 @@ cef_content_setting_types_t ContentSettingFor(MBSitePermission permission) {
   return CEF_CONTENT_SETTING_TYPE_NOTIFICATIONS;
 }
 
+void ReleasePopupWait(CefRefPtr<CefBrowser> opener) {
+  opener->GetHost()->ExecuteDevToolsMethod(0, "Runtime.runIfWaitingForDebugger",
+                                           nullptr);
+}
+
 void AllowPopupsByDefault(CefRefPtr<CefRequestContext> context) {
   if (context->GetContentSetting("", "", CEF_CONTENT_SETTING_TYPE_POPUPS) !=
       CEF_CONTENT_SETTING_VALUE_ALLOW) {
@@ -1436,6 +1441,7 @@ class AuxiliaryClient : public BaseClient,
                      CefRefPtr<CefDictionaryValue>& extra_info,
                      bool* no_javascript_access) override {
     windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+    ReleasePopupWait(browser);
     return false;
   }
 
@@ -1827,6 +1833,7 @@ class WebClient : public BaseClient,
       return true;
     }
     windowInfo.runtime_style = CEF_RUNTIME_STYLE_ALLOY;
+    ReleasePopupWait(browser);
     MBWebView* view = view_;
     if ([view.delegate
             respondsToSelector:@selector(webView:hostsPopup:size:)]) {
