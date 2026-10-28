@@ -2533,6 +2533,16 @@ class WebClient : public BaseClient,
         return;
       }
       if ([info[@"type"] isEqualToString:@"page"]) {
+        if (waiting) {
+          std::string child = session.UTF8String;
+          std::string parent = from ? from.UTF8String : "";
+          CefRefPtr<WebClient> client(this);
+          SendInSession(
+              browser, "Runtime.runIfWaitingForDebugger", "", child,
+              [client, browser, child, parent](bool, const std::string&) {
+                client->Detach(browser, child, parent);
+              });
+        }
         return;
       }
       if (![info[@"type"] isEqualToString:@"iframe"]) {
