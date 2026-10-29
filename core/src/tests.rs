@@ -386,21 +386,24 @@ fn profile_dirs_are_direct_children_of_engine_root() {
 }
 
 #[test]
-fn freezes_only_idle_hidden_today_tabs() {
+fn freezes_idle_hidden_tabs_unless_they_play_or_notify() {
     let mut s = State::new_default();
     let sp = home(&s);
     s.policy.freeze_after_secs = 60;
-    let pinned = s.open_tab(sp, "https://mail.example", true, 0).unwrap();
+    let pinned = s.open_tab(sp, "https://dashboard.example", true, 0).unwrap();
     s.move_item(pinned, Container::Pinned { space_id: sp, folder_id: None }, 0).unwrap();
+    let mail = s.open_tab(sp, "https://mail.example", true, 0).unwrap();
+    s.move_item(mail, Container::Pinned { space_id: sp, folder_id: None }, 1).unwrap();
     let old = s.open_tab(sp, "https://a.example", true, 1_000).unwrap();
     let audible = s.open_tab(sp, "https://music.example", true, 2_000).unwrap();
     let visible = s.open_tab(sp, "https://b.example", true, 3_000).unwrap();
-    for id in [pinned, old, audible, visible] {
+    for id in [pinned, mail, old, audible, visible] {
         s.set_live(id, true, 0);
     }
     s.set_audible(audible, true);
+    s.set_notifies_or_calls(mail, true);
     assert!(s.collect_freezers(30_000).is_empty());
-    assert_eq!(s.collect_freezers(70_000), vec![old]);
+    assert_eq!(s.collect_freezers(70_000), vec![pinned, old]);
     assert!(s.collect_freezers(80_000).is_empty(), "already frozen");
     assert!(s.thaw(old));
     assert!(!s.thaw(old));

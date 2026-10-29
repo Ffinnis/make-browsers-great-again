@@ -998,6 +998,10 @@ impl BrowserCore {
         inner.state.note_use(id, now_ms());
     }
 
+    pub fn set_notifies_or_calls(&self, id: u64, notifies_or_calls: bool) {
+        self.lock().state.set_notifies_or_calls(id, notifies_or_calls);
+    }
+
     pub fn collect_over_limit(&self, count: u32) -> Vec<u64> {
         let mut inner = self.lock();
         let sleepers = inner.state.collect_over_limit(count as usize);

@@ -40,6 +40,8 @@ pub struct Tab {
     #[serde(skip)]
     pub woke_ms: u64,
     #[serde(skip)]
+    pub notifies_or_calls: bool,
+    #[serde(skip)]
     pub used_ms: u64,
 }
 
@@ -440,6 +442,7 @@ impl State {
                 audible: false,
                 frozen: false,
                 woke_ms: 0,
+                notifies_or_calls: false,
                 used_ms: 0,
             },
         );
@@ -903,18 +906,26 @@ impl State {
         }
     }
 
+    pub fn set_notifies_or_calls(&mut self, id: Id, notifies_or_calls: bool) {
+        if let Some(t) = self.tabs.get_mut(&id) {
+            t.notifies_or_calls = notifies_or_calls;
+        }
+    }
+
     pub fn collect_freezers(&mut self, now: u64) -> Vec<Id> {
         let visible = self.visible_tab();
         let after_ms = self.policy.freeze_after_secs * 1000;
-        let today: Vec<Id> = self.spaces.iter().flat_map(|s| s.today.iter().copied()).collect();
+        let mut ids: Vec<Id> = self.tabs.keys().copied().collect();
+        ids.sort_unstable();
         let keep_awake = &self.keep_awake;
         let elsewhere = &self.shown_elsewhere;
         let mut frozen = Vec::new();
-        for id in today {
+        for id in ids {
             let Some(t) = self.tabs.get_mut(&id) else { continue };
             if t.live
                 && !t.frozen
                 && !t.audible
+                && !t.notifies_or_calls
                 && !t.always_awake
                 && !covers(keep_awake, &site_of(&t.url))
                 && !elsewhere.contains(&id)

@@ -44,6 +44,12 @@ extension BrowserStore {
 
     func prepareForSleep() {
         core.setAgentSpace(spaceId: agentPreferences.ownSpace ? agentPreferences.spaceID : nil)
+        for store in Self.open.allObjects {
+            for (id, view) in store.views {
+                let allowed = [MBSitePermission.notifications, .camera, .microphone].contains { view.state(for: $0) == .allow }
+                core.setNotifiesOrCalls(id: id, notifiesOrCalls: allowed)
+            }
+        }
     }
 
     func enforceMemoryLimit() {

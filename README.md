@@ -88,9 +88,9 @@ How MBGA gets there, roughly in order of impact:
   agent opened sleep 5 minutes after it stops using them. Tabs playing audio
   or using the camera, microphone or screen stay awake, and you can keep any
   tab or site awake from its menu. Settings ▸ General changes the limits.
-- **Today tabs freeze.** A Today tab hidden for a minute keeps its state but
-  runs no JavaScript until shown again. Pinned tabs and favorites keep
-  running so their notifications work.
+- **Hidden tabs freeze.** A tab hidden for 5 minutes keeps its state but runs
+  no JavaScript until shown again. Sites allowed to show notifications or use
+  the camera or microphone keep running, so mail, chat and calls keep working.
 - **Hidden renderers purge** their caches and return free memory.
 - **A leaner engine.** The network service runs in the browser process,
   HTTP/3 is off, Blink and V8 run in low-memory mode, and there is no spare
