@@ -1056,7 +1056,8 @@ impl State {
         for &id in &agents {
             let Some(t) = self.tabs.get(&id) else { continue };
             if t.live
-                && !t.always_awake
+                && !t.page.editing
+                && !self.stays_awake(t)
                 && Some(id) != visible
                 && !self.shown_elsewhere.contains(&id)
                 && now.saturating_sub(t.last_used_ms()) >= AGENT_SLEEP_AFTER_MS
@@ -1093,6 +1094,9 @@ impl State {
             if let Some(tab) = self.tabs.get_mut(id) {
                 tab.live = false;
             }
+        }
+        if !sleepers.is_empty() {
+            self.limit_slept_ms = now;
         }
         sleepers
     }
