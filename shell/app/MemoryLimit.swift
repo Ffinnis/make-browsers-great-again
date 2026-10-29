@@ -42,6 +42,10 @@ extension BrowserStore {
         enforceMemoryLimit()
     }
 
+    func prepareForSleep() {
+        core.setAgentSpace(spaceId: agentPreferences.ownSpace ? agentPreferences.spaceID : nil)
+    }
+
     func enforceMemoryLimit() {
         let limit = Int(memoryLimitMB)
         guard limit > 0, Date().timeIntervalSince(Self.limitSleptAt) >= 45 else { return }

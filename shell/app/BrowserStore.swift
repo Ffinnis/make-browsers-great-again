@@ -1075,6 +1075,7 @@ final class BrowserStore: NSObject {
     }
 
     func sleepIdleTabs(pressure: MemoryPressure = .normal) {
+        prepareForSleep()
         let archived = core.archiveByPolicy()
         destroyViews(archived)
         let sleepers = core.collectSleepers(pressure: pressure)
@@ -1484,6 +1485,7 @@ extension BrowserStore {
     }
 
     func agentActed(on id: UInt64) {
+        core.noteAgentUse(id: id)
         let wasActive = agentActiveTabs.contains(id)
         agentActiveTabs.insert(id)
         agentTimers[id]?.invalidate()

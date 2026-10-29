@@ -989,6 +989,15 @@ impl BrowserCore {
         self.mutate(|s, _| s.policy.memory_limit_mb = megabytes);
     }
 
+    pub fn set_agent_space(&self, space_id: Option<u64>) {
+        self.lock().state.agent_space = space_id;
+    }
+
+    pub fn note_agent_use(&self, id: u64) {
+        let mut inner = self.lock();
+        inner.state.note_use(id, now_ms());
+    }
+
     pub fn collect_over_limit(&self, count: u32) -> Vec<u64> {
         let mut inner = self.lock();
         let sleepers = inner.state.collect_over_limit(count as usize);

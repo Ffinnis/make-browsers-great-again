@@ -412,6 +412,30 @@ fn freezes_only_idle_hidden_today_tabs() {
 }
 
 #[test]
+fn agent_tabs_sleep_after_a_few_idle_minutes_even_when_playing() {
+    let mut s = State::new_default();
+    let agents = s.create_space("Agents", "🤖", 0, s.profiles[0].id);
+    s.agent_space = Some(agents);
+    let sp = home(&s);
+    let stream = s.open_tab(agents, "https://video.example/live", false, 0).unwrap();
+    let busy = s.open_tab(agents, "https://dash.example", false, 0).unwrap();
+    let kept = s.open_tab(agents, "https://kept.example", false, 0).unwrap();
+    let front = s.open_tab(agents, "https://front.example", true, 0).unwrap();
+    let mine = s.open_tab(sp, "https://mine.example", false, 0).unwrap();
+    s.open_tab(sp, "https://visible.example", true, 0).unwrap();
+    for id in [stream, busy, kept, front, mine] {
+        s.set_live(id, true, 0);
+    }
+    s.set_audible(stream, true);
+    s.set_always_awake(kept, true);
+    s.note_use(busy, 4 * 60 * 1000);
+    let sleepers = s.collect_sleepers(model::AGENT_SLEEP_AFTER_MS + 1, Pressure::Normal);
+    assert_eq!(sleepers, vec![stream, front]);
+    assert!(s.tabs[&busy].live && s.tabs[&kept].live && s.tabs[&mine].live);
+    assert_eq!(s.collect_sleepers(4 * 60 * 1000 + model::AGENT_SLEEP_AFTER_MS, Pressure::Normal), vec![busy]);
+}
+
+#[test]
 fn over_the_memory_limit_sleeps_least_recently_used_tabs_first() {
     let mut s = State::new_default();
     let sp = home(&s);
