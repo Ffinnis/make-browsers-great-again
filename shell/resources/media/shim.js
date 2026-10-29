@@ -16,6 +16,7 @@
   var NativeWorker = G.Worker;
   var Handle = G.MediaSourceHandle;
   var Channel = G.MessageChannel;
+  var Trusted = G.trustedTypes;
   var setTimer = function (f, delay) {
     return G.setTimeout(f, delay);
   };
@@ -46,6 +47,7 @@
   var SMALL = 360;
   var SLOW_FPS = 15;
   var RELAY = '__mbga_media_relay__';
+  var WORKER_PATH = '/__mbga_media_worker__.js';
 
   function hook(target, key, make) {
     var d = getDescriptor(target, key);
@@ -673,7 +675,7 @@
       }
       return;
     }
-    if (worker) {
+    if (worker && heard) {
       worker.postMessage(message, transfer || []);
       return;
     }
@@ -701,6 +703,23 @@
     return bytes;
   }
 
+  var scriptPolicy;
+  function scriptURL(url) {
+    if (scriptPolicy === undefined) {
+      scriptPolicy = null;
+      try {
+        if (Trusted && typeof Trusted.createPolicy === 'function') {
+          scriptPolicy = Trusted.createPolicy('mbga-media', {
+            createScriptURL: function (value) {
+              return value;
+            },
+          });
+        }
+      } catch (e) {}
+    }
+    return scriptPolicy ? scriptPolicy.createScriptURL(url) : url;
+  }
+
   function begin(source, wasm) {
     if (broken || !starting) {
       return;
@@ -709,18 +728,34 @@
       fail('the engine did not send the converter', false);
       return;
     }
-    var url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    spawn(source, wasm, false);
+  }
+
+  function spawn(source, wasm, served) {
+    var url = served ? G.location.origin + WORKER_PATH :
+      URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     var revoke = function () {
-      if (url) {
+      if (url && !served) {
         URL.revokeObjectURL(url);
-        url = null;
       }
+      url = null;
+    };
+    var retry = function () {
+      if (served || !/^https?:/.test(G.location.origin)) {
+        return false;
+      }
+      revoke();
+      spawn(source, wasm, true);
+      return true;
     };
     try {
-      worker = new NativeWorker(url, { name: 'MBGA video converter' });
+      worker = new NativeWorker(scriptURL(url), { name: 'MBGA video converter' });
     } catch (e) {
       revoke();
-      fail('this site does not allow the converter to start', true);
+      worker = null;
+      if (!retry()) {
+        fail('this site does not allow the converter to start', true);
+      }
       return;
     }
     heard = false;
@@ -733,6 +768,11 @@
       if (!heard) {
         heard = true;
         clearTimer(silence);
+        var queued = outbox;
+        outbox = [];
+        queued.forEach(function (item) {
+          worker.postMessage(item[0], item[1] || []);
+        });
       }
       if (!data) {
         return;
@@ -748,16 +788,19 @@
     };
     worker.onerror = function (event) {
       event.preventDefault();
+      if (!heard) {
+        clearTimer(silence);
+        worker.terminate();
+        worker = null;
+        if (retry()) {
+          return;
+        }
+      }
       revoke();
       fail(event.message || 'the converter stopped', false);
     };
     var bytes = decodeBase64(wasm);
     worker.postMessage({ type: 'wasm', module: bytes.buffer }, [bytes.buffer]);
-    var queued = outbox;
-    outbox = [];
-    queued.forEach(function (item) {
-      worker.postMessage(item[0], item[1] || []);
-    });
   }
 
   function fail(message, permanent) {

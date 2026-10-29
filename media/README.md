@@ -23,6 +23,13 @@ crate, built to WebAssembly:
   sample rate (and HE-AACv2 in mono); the FLAC header says so.
 - Other tracks pass through untouched.
 
+The worker starts from a `blob:` URL, through a Trusted Types policy
+(`mbga-media`) on pages that require one. Where the page's CSP doesn't
+allow `blob:` workers (YouTube), it fails to load before saying anything,
+and the shim starts it again from `/__mbga_media_worker__.js` on the
+page's own origin, which the engine answers for worker requests with
+worker.js and no CSP of its own.
+
 Fragments keep the input's track IDs, timescales and timestamps, and the
 init segment keeps everything but the sample entries, edit lists included,
 so the engine lays the converted media on the same timeline as it would the
