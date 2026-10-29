@@ -177,7 +177,7 @@ constexpr char kAutoAttachFrames[] =
 constexpr int64_t kWorkerResumeSeconds = 5;
 constexpr char kAutoAttachWorkers[] =
     "{\"autoAttach\":true,\"waitForDebuggerOnStart\":true,\"flatten\":"
-    "true,\"filter\":[{\"type\":\"worker\"}]}";
+    "true,\"filter\":[{\"type\":\"worker\"},{\"type\":\"worklet\"}]}";
 
 NSDictionary* ParseObject(const std::string& json) {
   NSData* data = [NSData dataWithBytes:json.data() length:json.size()];
