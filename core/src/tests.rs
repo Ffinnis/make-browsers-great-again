@@ -386,21 +386,26 @@ fn profile_dirs_are_direct_children_of_engine_root() {
 }
 
 #[test]
-fn freezes_only_idle_hidden_today_tabs() {
+fn freezes_idle_hidden_tabs_unless_they_play_or_notify() {
     let mut s = State::new_default();
     let sp = home(&s);
     s.policy.freeze_after_secs = 60;
-    let pinned = s.open_tab(sp, "https://mail.example", true, 0).unwrap();
+    let pinned = s.open_tab(sp, "https://dashboard.example", true, 0).unwrap();
     s.move_item(pinned, Container::Pinned { space_id: sp, folder_id: None }, 0).unwrap();
+    let mail = s.open_tab(sp, "https://mail.example", true, 0).unwrap();
+    s.move_item(mail, Container::Pinned { space_id: sp, folder_id: None }, 1).unwrap();
+    let favorite = s.open_tab(sp, "https://feed.example", true, 0).unwrap();
+    s.move_item(favorite, Container::Favorites { profile_id: s.profiles[0].id }, 0).unwrap();
     let old = s.open_tab(sp, "https://a.example", true, 1_000).unwrap();
     let audible = s.open_tab(sp, "https://music.example", true, 2_000).unwrap();
     let visible = s.open_tab(sp, "https://b.example", true, 3_000).unwrap();
-    for id in [pinned, old, audible, visible] {
+    for id in [pinned, mail, favorite, old, audible, visible] {
         s.set_live(id, true, 0);
     }
     s.set_audible(audible, true);
+    s.set_notifies_or_calls(mail, true);
     assert!(s.collect_freezers(30_000).is_empty());
-    assert_eq!(s.collect_freezers(70_000), vec![old]);
+    assert_eq!(s.collect_freezers(70_000), vec![pinned, favorite, old]);
     assert!(s.collect_freezers(80_000).is_empty(), "already frozen");
     assert!(s.thaw(old));
     assert!(!s.thaw(old));
@@ -412,12 +417,78 @@ fn freezes_only_idle_hidden_today_tabs() {
 }
 
 #[test]
+fn agent_tabs_sleep_after_a_few_idle_minutes_even_when_playing() {
+    let mut s = State::new_default();
+    let agents = s.create_space("Agents", "🤖", 0, s.profiles[0].id);
+    s.agent_space = Some(agents);
+    let sp = home(&s);
+    let stream = s.open_tab(agents, "https://video.example/live", false, 0).unwrap();
+    let busy = s.open_tab(agents, "https://dash.example", false, 0).unwrap();
+    let kept = s.open_tab(agents, "https://kept.example", false, 0).unwrap();
+    let site = s.open_tab(agents, "https://call.example/room", false, 0).unwrap();
+    let draft = s.open_tab(agents, "https://form.example", false, 0).unwrap();
+    let front = s.open_tab(agents, "https://front.example", true, 0).unwrap();
+    let mine = s.open_tab(sp, "https://mine.example", false, 0).unwrap();
+    s.open_tab(sp, "https://visible.example", true, 0).unwrap();
+    for id in [stream, busy, kept, site, draft, front, mine] {
+        s.set_live(id, true, 0);
+    }
+    s.set_audible(stream, true);
+    s.set_always_awake(kept, true);
+    s.set_keep_awake("https://call.example/", true);
+    s.tabs.get_mut(&draft).unwrap().page.editing = true;
+    s.note_use(busy, 4 * 60 * 1000);
+    let sleepers = s.collect_sleepers(model::AGENT_SLEEP_AFTER_MS + 1, Pressure::Normal);
+    assert_eq!(sleepers, vec![stream, front]);
+    assert!([busy, kept, site, draft, mine].iter().all(|id| s.tabs[id].live));
+    assert_eq!(s.collect_sleepers(4 * 60 * 1000 + model::AGENT_SLEEP_AFTER_MS, Pressure::Normal), vec![busy]);
+}
+
+#[test]
+fn over_the_memory_limit_sleeps_least_recently_used_tabs_first() {
+    let mut s = State::new_default();
+    let sp = home(&s);
+    let other = s.create_space("Work", "💼", 0, s.profiles[0].id);
+    let work_front = s.open_tab(other, "https://work.example", true, 0).unwrap();
+    let oldest = s.open_tab(sp, "https://oldest.example", false, 10).unwrap();
+    let playing = s.open_tab(sp, "https://music.example", false, 20).unwrap();
+    let draft = s.open_tab(sp, "https://draft.example", false, 30).unwrap();
+    let newer = s.open_tab(sp, "https://newer.example", false, 40).unwrap();
+    let visible = s.open_tab(sp, "https://visible.example", true, 50).unwrap();
+    for id in [work_front, oldest, playing, draft, newer, visible] {
+        s.set_live(id, true, 0);
+    }
+    s.set_audible(playing, true);
+    s.tabs.get_mut(&draft).unwrap().page.editing = true;
+    s.policy.memory_limit_mb = 2000;
+    let start = 100_000;
+    assert!(s.collect_over_limit(2000, start).is_empty(), "at the limit");
+    assert_eq!(s.collect_over_limit(2001, start), vec![oldest]);
+    assert!(s.collect_over_limit(5000, start + 44_000).is_empty(), "memory is still coming back");
+    assert_eq!(s.collect_over_limit(5000, start + 45_000), vec![newer, work_front]);
+    assert!(s.collect_over_limit(5000, start + 90_000).is_empty());
+    assert!(s.tabs[&visible].live && s.tabs[&playing].live && s.tabs[&draft].live);
+    s.policy.memory_limit_mb = 0;
+    s.set_live(oldest, true, 0);
+    assert!(s.collect_over_limit(50_000, start + 200_000).is_empty(), "limit off");
+    s.policy.memory_limit_mb = 2000;
+    s.policy.max_live_tabs = 1;
+    s.set_live(newer, true, 0);
+    assert!(!s.collect_sleepers(start + 300_000, Pressure::Normal).is_empty());
+    assert!(
+        s.collect_over_limit(50_000, start + 300_000).is_empty(),
+        "the sleep that just ran is still freeing memory"
+    );
+}
+
+#[test]
 fn old_state_files_get_default_policy_fields() {
     let json = r#"{"sleep_after_secs": 30, "max_live_tabs": 2}"#;
     let p: model::Policy = serde_json::from_str(json).unwrap();
     assert_eq!(p.sleep_after_secs, 30);
     assert_eq!(p.freeze_after_secs, model::Policy::default().freeze_after_secs);
     assert!(!p.strict_site_isolation);
+    assert_eq!(p.memory_limit_mb, 2500);
 }
 
 #[test]

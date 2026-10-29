@@ -80,6 +80,7 @@ pub struct Snapshot {
     pub archive_after_hours: u32,
     pub cleanup_answered: bool,
     pub keep_awake_sites: Vec<String>,
+    pub memory_limit_mb: u32,
 }
 
 #[derive(uniffi::Record, Clone, Debug, PartialEq)]
@@ -521,6 +522,7 @@ impl BrowserCore {
             archive_after_hours: s.policy.archive_after_hours,
             cleanup_answered: s.cleanup_answered,
             keep_awake_sites: s.keep_awake.clone(),
+            memory_limit_mb: s.policy.memory_limit_mb,
         }
     }
 
@@ -977,6 +979,32 @@ impl BrowserCore {
         };
         let mut inner = self.lock();
         let sleepers = inner.state.collect_sleepers(now_ms(), pressure);
+        if !sleepers.is_empty() {
+            inner.revision += 1;
+        }
+        sleepers
+    }
+
+    pub fn set_memory_limit(&self, megabytes: u32) {
+        self.mutate(|s, _| s.policy.memory_limit_mb = megabytes);
+    }
+
+    pub fn set_agent_space(&self, space_id: Option<u64>) {
+        self.lock().state.agent_space = space_id;
+    }
+
+    pub fn note_agent_use(&self, id: u64) {
+        let mut inner = self.lock();
+        inner.state.note_use(id, now_ms());
+    }
+
+    pub fn set_notifies_or_calls(&self, id: u64, notifies_or_calls: bool) {
+        self.lock().state.set_notifies_or_calls(id, notifies_or_calls);
+    }
+
+    pub fn collect_over_limit(&self, used_mb: u32) -> Vec<u64> {
+        let mut inner = self.lock();
+        let sleepers = inner.state.collect_over_limit(used_mb, now_ms());
         if !sleepers.is_empty() {
             inner.revision += 1;
         }
