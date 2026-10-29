@@ -172,7 +172,6 @@ constexpr char kResumeMediaScript[] =
 constexpr char kCodecRequest[] = "__mbga_codec";
 constexpr char kCodecFramePrefix[] = "__mbga_codec_frame:";
 constexpr char kConverterWorker[] = "MBGA video converter";
-constexpr char kConverterWorkerPath[] = "/__mbga_media_worker__.js";
 constexpr char kAutoAttachFrames[] =
     "{\"autoAttach\":true,\"waitForDebuggerOnStart\":false,\"flatten\":"
     "true,\"filter\":[{\"type\":\"iframe\"}]}";
@@ -230,6 +229,15 @@ const std::string& WorkerShimParams() {
   return params;
 }
 
+const std::string& ConverterWorkerPath() {
+  static const std::string path = [] {
+    char token[17];
+    snprintf(token, sizeof(token), "%08x%08x", arc4random(), arc4random());
+    return "/__mbga_media_worker_" + std::string(token) + ".js";
+  }();
+  return path;
+}
+
 std::shared_ptr<const std::string> g_codec_reply;
 CFAbsoluteTime g_codec_reply_used = 0;
 void ReleaseCodecReplyLater();
@@ -245,10 +253,12 @@ std::shared_ptr<const std::string> CodecReply() {
   NSData* wasm = [NSData dataWithContentsOfFile:path];
   NSString* args = @"null,null";
   if (worker && wasm) {
-    NSData* json = [NSJSONSerialization
-        dataWithJSONObject:@[ worker, [wasm base64EncodedStringWithOptions:0] ]
-                   options:0
-                     error:nil];
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@[
+      worker, [wasm base64EncodedStringWithOptions:0],
+      @(ConverterWorkerPath().c_str())
+    ]
+                                                   options:0
+                                                     error:nil];
     args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
     args = [args substringWithRange:NSMakeRange(1, args.length - 2)];
   }
@@ -610,7 +620,7 @@ CefRefPtr<CefResourceRequestHandler> ConverterWorkerHandlerFor(
   }
   CefURLParts parts;
   if (!CefParseURL(request->GetURL(), parts) ||
-      CefString(&parts.path).ToString() != kConverterWorkerPath ||
+      CefString(&parts.path).ToString() != ConverterWorkerPath() ||
       parts.query.length > 0) {
     return nullptr;
   }

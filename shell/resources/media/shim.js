@@ -47,7 +47,6 @@
   var SMALL = 360;
   var SLOW_FPS = 15;
   var RELAY = '__mbga_media_relay__';
-  var WORKER_PATH = '/__mbga_media_worker__.js';
 
   function hook(target, key, make) {
     var d = getDescriptor(target, key);
@@ -276,7 +275,7 @@
 
   function getCodec(callback) {
     if (codec) {
-      callback(codec.source, codec.wasm);
+      callback(codec.source, codec.wasm, codec.path);
       return;
     }
     if (codecWaiters) {
@@ -297,8 +296,8 @@
     }, CODEC_WAITS[attempt]);
     if (isWindow) {
       token = token || Math.random().toString(36).slice(2);
-      var answer = function (source, wasm) {
-        gotCodec(source, wasm);
+      var answer = function (source, wasm, path) {
+        gotCodec(source, wasm, path);
       };
       answer.who = function (frame, nonce) {
         debug(frame + ':' + token + ':' + nonce);
@@ -315,10 +314,11 @@
     }
   }
 
-  function gotCodec(source, wasm) {
+  function gotCodec(source, wasm, path) {
     var good = typeof source === 'string' && typeof wasm === 'string';
+    path = good && typeof path === 'string' ? path : null;
     if (good) {
-      codec = { source: source, wasm: wasm };
+      codec = { source: source, wasm: wasm, path: path };
       clearTimer(codecDrop);
       codecDrop = setTimer(function () {
         codec = null;
@@ -334,7 +334,7 @@
     var waiters = codecWaiters;
     codecWaiters = null;
     waiters.forEach(function (f) {
-      f(good ? source : null, good ? wasm : null);
+      f(good ? source : null, good ? wasm : null, path);
     });
   }
 
@@ -350,7 +350,7 @@
           channel.port1.onmessage = function (event) {
             var data = event.data || {};
             if (data.codec) {
-              gotCodec(data.source, data.wasm);
+              gotCodec(data.source, data.wasm, data.path);
             } else if (data.size) {
               routeSize(data.n, { width: data.width, height: data.height, fps: data.fps || 0 });
             }
@@ -456,9 +456,9 @@
     port.onmessage = function (event) {
       var data = event.data || {};
       if (data.codec === 'ask') {
-        getCodec(function (source, wasm) {
+        getCodec(function (source, wasm, path) {
           if (link.port === port) {
-            port.postMessage({ codec: 1, source: source, wasm: wasm });
+            port.postMessage({ codec: 1, source: source, wasm: wasm, path: path });
           }
         });
       } else if (data.natural) {
@@ -720,7 +720,7 @@
     return scriptPolicy ? scriptPolicy.createScriptURL(url) : url;
   }
 
-  function begin(source, wasm) {
+  function begin(source, wasm, path) {
     if (broken || !starting) {
       return;
     }
@@ -728,11 +728,11 @@
       fail('the engine did not send the converter', false);
       return;
     }
-    spawn(source, wasm, false);
+    spawn(source, wasm, path, false);
   }
 
-  function spawn(source, wasm, served) {
-    var url = served ? G.location.origin + WORKER_PATH :
+  function spawn(source, wasm, path, served) {
+    var url = served ? G.location.origin + path :
       URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     var revoke = function () {
       if (url && !served) {
@@ -741,11 +741,11 @@
       url = null;
     };
     var retry = function () {
-      if (served || !/^https?:/.test(G.location.origin)) {
+      if (served || !path || !/^https?:/.test(G.location.origin)) {
         return false;
       }
       revoke();
-      spawn(source, wasm, true);
+      spawn(source, wasm, path, true);
       return true;
     };
     try {
