@@ -454,10 +454,17 @@ fn over_the_memory_limit_sleeps_least_recently_used_tabs_first() {
     }
     s.set_audible(playing, true);
     s.tabs.get_mut(&draft).unwrap().page.editing = true;
-    assert_eq!(s.collect_over_limit(1), vec![oldest]);
-    assert_eq!(s.collect_over_limit(5), vec![newer, work_front]);
-    assert!(s.collect_over_limit(5).is_empty());
+    s.policy.memory_limit_mb = 2000;
+    let start = 100_000;
+    assert!(s.collect_over_limit(2000, start).is_empty(), "at the limit");
+    assert_eq!(s.collect_over_limit(2001, start), vec![oldest]);
+    assert!(s.collect_over_limit(5000, start + 44_000).is_empty(), "memory is still coming back");
+    assert_eq!(s.collect_over_limit(5000, start + 45_000), vec![newer, work_front]);
+    assert!(s.collect_over_limit(5000, start + 90_000).is_empty());
     assert!(s.tabs[&visible].live && s.tabs[&playing].live && s.tabs[&draft].live);
+    s.policy.memory_limit_mb = 0;
+    s.set_live(oldest, true, 0);
+    assert!(s.collect_over_limit(50_000, start + 200_000).is_empty(), "limit off");
 }
 
 #[test]

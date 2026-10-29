@@ -144,6 +144,8 @@ pub const MAX_CLOSED: usize = 25;
 
 pub const AGENT_SLEEP_AFTER_MS: u64 = 5 * 60 * 1000;
 
+pub const LIMIT_SETTLE_MS: u64 = 45 * 1000;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pressure {
     Normal,
@@ -200,6 +202,8 @@ pub struct State {
     pub normal_space: Option<Id>,
     #[serde(skip)]
     pub agent_space: Option<Id>,
+    #[serde(skip)]
+    pub limit_slept_ms: u64,
 }
 
 fn default_search_template() -> String {
@@ -243,6 +247,7 @@ impl State {
             shown_elsewhere: Vec::new(),
             normal_space: None,
             agent_space: None,
+            limit_slept_ms: 0,
         };
         let profile = s.create_profile("Personal");
         let space = s.create_space("Home", "🏠", SPACE_COLORS[0], profile);
@@ -1092,7 +1097,12 @@ impl State {
         sleepers
     }
 
-    pub fn collect_over_limit(&mut self, count: usize) -> Vec<Id> {
+    pub fn collect_over_limit(&mut self, used_mb: u32, now: u64) -> Vec<Id> {
+        let limit = self.policy.memory_limit_mb;
+        if limit == 0 || used_mb <= limit || now.saturating_sub(self.limit_slept_ms) < LIMIT_SETTLE_MS {
+            return Vec::new();
+        }
+        let count = ((used_mb - limit * 9 / 10) / 150).clamp(1, 6) as usize;
         let visible = self.visible_tab();
         let fronts: HashSet<Id> = self.spaces.iter().filter_map(|s| s.active_tab).collect();
         let mut live: Vec<&Tab> = self
@@ -1113,6 +1123,9 @@ impl State {
             if let Some(tab) = self.tabs.get_mut(id) {
                 tab.live = false;
             }
+        }
+        if !sleepers.is_empty() {
+            self.limit_slept_ms = now;
         }
         sleepers
     }

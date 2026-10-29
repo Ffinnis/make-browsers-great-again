@@ -32,8 +32,6 @@ enum ProcessFootprint {
 }
 
 extension BrowserStore {
-    private static var limitSleptAt = Date.distantPast
-
     var memoryLimitMB: UInt32 { snapshot.memoryLimitMb }
 
     func setMemoryLimit(_ megabytes: UInt32) {
@@ -53,14 +51,9 @@ extension BrowserStore {
     }
 
     func enforceMemoryLimit() {
-        let limit = Int(memoryLimitMB)
-        guard limit > 0, Date().timeIntervalSince(Self.limitSleptAt) >= 45 else { return }
-        let used = ProcessFootprint.megabytes()
-        guard used > limit else { return }
-        let count = min(max((used - limit * 9 / 10) / 150, 1), 6)
-        let sleepers = core.collectOverLimit(count: UInt32(count))
+        guard memoryLimitMB > 0 else { return }
+        let sleepers = core.collectOverLimit(usedMb: UInt32(clamping: ProcessFootprint.megabytes()))
         guard !sleepers.isEmpty else { return }
-        Self.limitSleptAt = Date()
         sleepers.forEach(destroyView)
         setNeedsRefresh()
     }

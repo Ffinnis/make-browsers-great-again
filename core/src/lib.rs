@@ -1002,9 +1002,9 @@ impl BrowserCore {
         self.lock().state.set_notifies_or_calls(id, notifies_or_calls);
     }
 
-    pub fn collect_over_limit(&self, count: u32) -> Vec<u64> {
+    pub fn collect_over_limit(&self, used_mb: u32) -> Vec<u64> {
         let mut inner = self.lock();
-        let sleepers = inner.state.collect_over_limit(count as usize);
+        let sleepers = inner.state.collect_over_limit(used_mb, now_ms());
         if !sleepers.is_empty() {
             inner.revision += 1;
         }
