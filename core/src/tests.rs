@@ -412,12 +412,35 @@ fn freezes_only_idle_hidden_today_tabs() {
 }
 
 #[test]
+fn over_the_memory_limit_sleeps_least_recently_used_tabs_first() {
+    let mut s = State::new_default();
+    let sp = home(&s);
+    let other = s.create_space("Work", "💼", 0, s.profiles[0].id);
+    let work_front = s.open_tab(other, "https://work.example", true, 0).unwrap();
+    let oldest = s.open_tab(sp, "https://oldest.example", false, 10).unwrap();
+    let playing = s.open_tab(sp, "https://music.example", false, 20).unwrap();
+    let draft = s.open_tab(sp, "https://draft.example", false, 30).unwrap();
+    let newer = s.open_tab(sp, "https://newer.example", false, 40).unwrap();
+    let visible = s.open_tab(sp, "https://visible.example", true, 50).unwrap();
+    for id in [work_front, oldest, playing, draft, newer, visible] {
+        s.set_live(id, true, 0);
+    }
+    s.set_audible(playing, true);
+    s.tabs.get_mut(&draft).unwrap().page.editing = true;
+    assert_eq!(s.collect_over_limit(1), vec![oldest]);
+    assert_eq!(s.collect_over_limit(5), vec![newer, work_front]);
+    assert!(s.collect_over_limit(5).is_empty());
+    assert!(s.tabs[&visible].live && s.tabs[&playing].live && s.tabs[&draft].live);
+}
+
+#[test]
 fn old_state_files_get_default_policy_fields() {
     let json = r#"{"sleep_after_secs": 30, "max_live_tabs": 2}"#;
     let p: model::Policy = serde_json::from_str(json).unwrap();
     assert_eq!(p.sleep_after_secs, 30);
     assert_eq!(p.freeze_after_secs, model::Policy::default().freeze_after_secs);
     assert!(!p.strict_site_isolation);
+    assert_eq!(p.memory_limit_mb, 2500);
 }
 
 #[test]

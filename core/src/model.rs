@@ -85,6 +85,7 @@ pub struct Policy {
     pub freeze_after_secs: u64,
     pub strict_site_isolation: bool,
     pub archive_after_hours: u32,
+    pub memory_limit_mb: u32,
 }
 
 impl Default for Policy {
@@ -95,6 +96,7 @@ impl Default for Policy {
             freeze_after_secs: 5 * 60,
             strict_site_isolation: false,
             archive_after_hours: 0,
+            memory_limit_mb: 2500,
         }
     }
 }
@@ -1036,6 +1038,31 @@ impl State {
                 remaining -= 1;
             }
         }
+        for id in &sleepers {
+            if let Some(tab) = self.tabs.get_mut(id) {
+                tab.live = false;
+            }
+        }
+        sleepers
+    }
+
+    pub fn collect_over_limit(&mut self, count: usize) -> Vec<Id> {
+        let visible = self.visible_tab();
+        let fronts: HashSet<Id> = self.spaces.iter().filter_map(|s| s.active_tab).collect();
+        let mut live: Vec<&Tab> = self
+            .tabs
+            .values()
+            .filter(|t| {
+                t.live
+                    && Some(t.id) != visible
+                    && !self.shown_elsewhere.contains(&t.id)
+                    && !t.audible
+                    && !t.page.editing
+                    && !self.stays_awake(t)
+            })
+            .collect();
+        live.sort_by_key(|t| (fronts.contains(&t.id), t.last_used_ms(), t.id));
+        let sleepers: Vec<Id> = live.into_iter().take(count).map(|t| t.id).collect();
         for id in &sleepers {
             if let Some(tab) = self.tabs.get_mut(id) {
                 tab.live = false;
