@@ -16,6 +16,7 @@
   var NativeWorker = G.Worker;
   var Handle = G.MediaSourceHandle;
   var Channel = G.MessageChannel;
+  var Trusted = G.trustedTypes;
   var setTimer = function (f, delay) {
     return G.setTimeout(f, delay);
   };
@@ -274,7 +275,7 @@
 
   function getCodec(callback) {
     if (codec) {
-      callback(codec.source, codec.wasm);
+      callback(codec.source, codec.wasm, codec.path);
       return;
     }
     if (codecWaiters) {
@@ -295,8 +296,8 @@
     }, CODEC_WAITS[attempt]);
     if (isWindow) {
       token = token || Math.random().toString(36).slice(2);
-      var answer = function (source, wasm) {
-        gotCodec(source, wasm);
+      var answer = function (source, wasm, path) {
+        gotCodec(source, wasm, path);
       };
       answer.who = function (frame, nonce) {
         debug(frame + ':' + token + ':' + nonce);
@@ -313,10 +314,11 @@
     }
   }
 
-  function gotCodec(source, wasm) {
+  function gotCodec(source, wasm, path) {
     var good = typeof source === 'string' && typeof wasm === 'string';
+    path = good && typeof path === 'string' ? path : null;
     if (good) {
-      codec = { source: source, wasm: wasm };
+      codec = { source: source, wasm: wasm, path: path };
       clearTimer(codecDrop);
       codecDrop = setTimer(function () {
         codec = null;
@@ -332,7 +334,7 @@
     var waiters = codecWaiters;
     codecWaiters = null;
     waiters.forEach(function (f) {
-      f(good ? source : null, good ? wasm : null);
+      f(good ? source : null, good ? wasm : null, path);
     });
   }
 
@@ -348,7 +350,7 @@
           channel.port1.onmessage = function (event) {
             var data = event.data || {};
             if (data.codec) {
-              gotCodec(data.source, data.wasm);
+              gotCodec(data.source, data.wasm, data.path);
             } else if (data.size) {
               routeSize(data.n, { width: data.width, height: data.height, fps: data.fps || 0 });
             }
@@ -454,9 +456,9 @@
     port.onmessage = function (event) {
       var data = event.data || {};
       if (data.codec === 'ask') {
-        getCodec(function (source, wasm) {
+        getCodec(function (source, wasm, path) {
           if (link.port === port) {
-            port.postMessage({ codec: 1, source: source, wasm: wasm });
+            port.postMessage({ codec: 1, source: source, wasm: wasm, path: path });
           }
         });
       } else if (data.natural) {
@@ -673,7 +675,7 @@
       }
       return;
     }
-    if (worker) {
+    if (worker && heard) {
       worker.postMessage(message, transfer || []);
       return;
     }
@@ -701,7 +703,24 @@
     return bytes;
   }
 
-  function begin(source, wasm) {
+  var scriptPolicy;
+  function scriptURL(url) {
+    if (scriptPolicy === undefined) {
+      scriptPolicy = null;
+      try {
+        if (Trusted && typeof Trusted.createPolicy === 'function') {
+          scriptPolicy = Trusted.createPolicy('mbga-media', {
+            createScriptURL: function (value) {
+              return value;
+            },
+          });
+        }
+      } catch (e) {}
+    }
+    return scriptPolicy ? scriptPolicy.createScriptURL(url) : url;
+  }
+
+  function begin(source, wasm, path) {
     if (broken || !starting) {
       return;
     }
@@ -709,18 +728,34 @@
       fail('the engine did not send the converter', false);
       return;
     }
-    var url = URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
+    spawn(source, wasm, path, false);
+  }
+
+  function spawn(source, wasm, path, served) {
+    var url = served ? G.location.origin + path :
+      URL.createObjectURL(new Blob([source], { type: 'text/javascript' }));
     var revoke = function () {
-      if (url) {
+      if (url && !served) {
         URL.revokeObjectURL(url);
-        url = null;
       }
+      url = null;
+    };
+    var retry = function () {
+      if (served || !path || !/^https?:/.test(G.location.origin)) {
+        return false;
+      }
+      revoke();
+      spawn(source, wasm, path, true);
+      return true;
     };
     try {
-      worker = new NativeWorker(url, { name: 'MBGA video converter' });
+      worker = new NativeWorker(scriptURL(url), { name: 'MBGA video converter' });
     } catch (e) {
       revoke();
-      fail('this site does not allow the converter to start', true);
+      worker = null;
+      if (!retry()) {
+        fail('this site does not allow the converter to start', true);
+      }
       return;
     }
     heard = false;
@@ -733,6 +768,11 @@
       if (!heard) {
         heard = true;
         clearTimer(silence);
+        var queued = outbox;
+        outbox = [];
+        queued.forEach(function (item) {
+          worker.postMessage(item[0], item[1] || []);
+        });
       }
       if (!data) {
         return;
@@ -748,16 +788,19 @@
     };
     worker.onerror = function (event) {
       event.preventDefault();
+      if (!heard) {
+        clearTimer(silence);
+        worker.terminate();
+        worker = null;
+        if (retry()) {
+          return;
+        }
+      }
       revoke();
       fail(event.message || 'the converter stopped', false);
     };
     var bytes = decodeBase64(wasm);
     worker.postMessage({ type: 'wasm', module: bytes.buffer }, [bytes.buffer]);
-    var queued = outbox;
-    outbox = [];
-    queued.forEach(function (item) {
-      worker.postMessage(item[0], item[1] || []);
-    });
   }
 
   function fail(message, permanent) {

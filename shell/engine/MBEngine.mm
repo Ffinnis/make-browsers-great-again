@@ -28,6 +28,7 @@
 #include "include/cef_ssl_status.h"
 #include "include/cef_x509_certificate.h"
 #include "include/wrapper/cef_library_loader.h"
+#include "include/wrapper/cef_stream_resource_handler.h"
 
 @interface MBPermissionPrompt : NSObject
 - (instancetype)initWithMessage:(NSString*)message
@@ -228,6 +229,15 @@ const std::string& WorkerShimParams() {
   return params;
 }
 
+const std::string& ConverterWorkerPath() {
+  static const std::string path = [] {
+    char token[17];
+    snprintf(token, sizeof(token), "%08x%08x", arc4random(), arc4random());
+    return "/__mbga_media_worker_" + std::string(token) + ".js";
+  }();
+  return path;
+}
+
 std::shared_ptr<const std::string> g_codec_reply;
 CFAbsoluteTime g_codec_reply_used = 0;
 void ReleaseCodecReplyLater();
@@ -243,10 +253,12 @@ std::shared_ptr<const std::string> CodecReply() {
   NSData* wasm = [NSData dataWithContentsOfFile:path];
   NSString* args = @"null,null";
   if (worker && wasm) {
-    NSData* json = [NSJSONSerialization
-        dataWithJSONObject:@[ worker, [wasm base64EncodedStringWithOptions:0] ]
-                   options:0
-                     error:nil];
+    NSData* json = [NSJSONSerialization dataWithJSONObject:@[
+      worker, [wasm base64EncodedStringWithOptions:0],
+      @(ConverterWorkerPath().c_str())
+    ]
+                                                   options:0
+                                                     error:nil];
     args = [[NSString alloc] initWithData:json encoding:NSUTF8StringEncoding];
     args = [args substringWithRange:NSMakeRange(1, args.length - 2)];
   }
@@ -581,6 +593,44 @@ CefRefPtr<CefResourceRequestHandler> BridgeHandlerFor(
                                   origin.substr(kExtensionScheme.size()));
 }
 
+class ConverterWorkerHandler : public CefResourceRequestHandler {
+ public:
+  CefRefPtr<CefResourceHandler> GetResourceHandler(
+      CefRefPtr<CefBrowser> browser,
+      CefRefPtr<CefFrame> frame,
+      CefRefPtr<CefRequest> request) override {
+    static const std::string source =
+        MediaResource(@"worker.js").UTF8String ?: "";
+    CefResponse::HeaderMap headers;
+    headers.emplace("Cache-Control", "no-store");
+    return new CefStreamResourceHandler(
+        200, "OK", "text/javascript", headers,
+        CefStreamReader::CreateForData(const_cast<char*>(source.data()),
+                                       source.size()));
+  }
+
+ private:
+  IMPLEMENT_REFCOUNTING(ConverterWorkerHandler);
+};
+
+CefRefPtr<CefResourceRequestHandler> ConverterWorkerHandlerFor(
+    CefRefPtr<CefRequest> request) {
+  if (!g_convert_video || request->GetResourceType() != RT_WORKER) {
+    return nullptr;
+  }
+  CefURLParts parts;
+  if (!CefParseURL(request->GetURL(), parts) ||
+      CefString(&parts.path).ToString() != ConverterWorkerPath() ||
+      parts.query.length > 0) {
+    return nullptr;
+  }
+  std::string scheme = CefString(&parts.scheme).ToString();
+  if (scheme != "https" && scheme != "http") {
+    return nullptr;
+  }
+  return new ConverterWorkerHandler();
+}
+
 class ContextHandler : public CefRequestContextHandler {
  public:
   explicit ContextHandler(std::string path) : path_(std::move(path)) {}
@@ -593,6 +643,10 @@ class ContextHandler : public CefRequestContextHandler {
       bool is_download,
       const CefString& request_initiator,
       bool& disable_default_handling) override {
+    if (CefRefPtr<CefResourceRequestHandler> worker =
+            ConverterWorkerHandlerFor(request)) {
+      return worker;
+    }
     return BridgeHandlerFor(path_, request, request_initiator);
   }
 
@@ -3014,6 +3068,10 @@ class WebClient : public BaseClient,
     if (g_extension_bridge &&
         request->GetURL().ToString().rfind(kBridgeOrigin, 0) == 0) {
       return BridgeHandlerFor(ContextKey(browser), request, request_initiator);
+    }
+    if (CefRefPtr<CefResourceRequestHandler> worker =
+            ConverterWorkerHandlerFor(request)) {
+      return worker;
     }
     return g_request_filter && !is_download ? this : nullptr;
   }
