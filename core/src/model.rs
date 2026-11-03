@@ -39,11 +39,15 @@ pub struct Tab {
     pub frozen: bool,
     #[serde(skip)]
     pub woke_ms: u64,
+    #[serde(skip)]
+    pub notifies_or_calls: bool,
+    #[serde(skip)]
+    pub used_ms: u64,
 }
 
 impl Tab {
     fn last_used_ms(&self) -> u64 {
-        self.last_active_ms.max(self.woke_ms)
+        self.last_active_ms.max(self.woke_ms).max(self.used_ms)
     }
 }
 
@@ -85,6 +89,7 @@ pub struct Policy {
     pub freeze_after_secs: u64,
     pub strict_site_isolation: bool,
     pub archive_after_hours: u32,
+    pub memory_limit_mb: u32,
 }
 
 impl Default for Policy {
@@ -95,6 +100,7 @@ impl Default for Policy {
             freeze_after_secs: 5 * 60,
             strict_site_isolation: false,
             archive_after_hours: 0,
+            memory_limit_mb: 2500,
         }
     }
 }
@@ -135,6 +141,10 @@ pub enum ClosedKind {
 }
 
 pub const MAX_CLOSED: usize = 25;
+
+pub const AGENT_SLEEP_AFTER_MS: u64 = 5 * 60 * 1000;
+
+pub const LIMIT_SETTLE_MS: u64 = 45 * 1000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pressure {
@@ -190,6 +200,10 @@ pub struct State {
     pub shown_elsewhere: Vec<Id>,
     #[serde(skip)]
     pub normal_space: Option<Id>,
+    #[serde(skip)]
+    pub agent_space: Option<Id>,
+    #[serde(skip)]
+    pub limit_slept_ms: u64,
 }
 
 fn default_search_template() -> String {
@@ -232,6 +246,8 @@ impl State {
             closed: Vec::new(),
             shown_elsewhere: Vec::new(),
             normal_space: None,
+            agent_space: None,
+            limit_slept_ms: 0,
         };
         let profile = s.create_profile("Personal");
         let space = s.create_space("Home", "🏠", SPACE_COLORS[0], profile);
@@ -431,6 +447,8 @@ impl State {
                 audible: false,
                 frozen: false,
                 woke_ms: 0,
+                notifies_or_calls: false,
+                used_ms: 0,
             },
         );
         self.space_mut(space_id).expect("space checked above").today.insert(0, id);
@@ -887,18 +905,32 @@ impl State {
         }
     }
 
+    pub fn note_use(&mut self, id: Id, now: u64) {
+        if let Some(t) = self.tabs.get_mut(&id) {
+            t.used_ms = now;
+        }
+    }
+
+    pub fn set_notifies_or_calls(&mut self, id: Id, notifies_or_calls: bool) {
+        if let Some(t) = self.tabs.get_mut(&id) {
+            t.notifies_or_calls = notifies_or_calls;
+        }
+    }
+
     pub fn collect_freezers(&mut self, now: u64) -> Vec<Id> {
         let visible = self.visible_tab();
         let after_ms = self.policy.freeze_after_secs * 1000;
-        let today: Vec<Id> = self.spaces.iter().flat_map(|s| s.today.iter().copied()).collect();
+        let mut ids: Vec<Id> = self.tabs.keys().copied().collect();
+        ids.sort_unstable();
         let keep_awake = &self.keep_awake;
         let elsewhere = &self.shown_elsewhere;
         let mut frozen = Vec::new();
-        for id in today {
+        for id in ids {
             let Some(t) = self.tabs.get_mut(&id) else { continue };
             if t.live
                 && !t.frozen
                 && !t.audible
+                && !t.notifies_or_calls
                 && !t.always_awake
                 && !covers(keep_awake, &site_of(&t.url))
                 && !elsewhere.contains(&id)
@@ -1015,16 +1047,38 @@ impl State {
             Pressure::Critical => HashSet::new(),
             _ => self.spaces.iter().filter_map(|s| s.active_tab).collect(),
         };
+        let agents: HashSet<Id> = self
+            .agent_space
+            .and_then(|id| self.spaces.iter().find(|s| s.id == id))
+            .map(|s| s.today.iter().copied().chain(pinned_ids(&s.pinned)).collect())
+            .unwrap_or_default();
+        let mut sleepers = Vec::new();
+        for &id in &agents {
+            let Some(t) = self.tabs.get(&id) else { continue };
+            if t.live
+                && !t.page.editing
+                && !self.stays_awake(t)
+                && Some(id) != visible
+                && !self.shown_elsewhere.contains(&id)
+                && now.saturating_sub(t.last_used_ms()) >= AGENT_SLEEP_AFTER_MS
+            {
+                sleepers.push(id);
+            }
+        }
+        sleepers.sort_unstable();
         let mut live: Vec<&Tab> = self
             .tabs
             .values()
             .filter(|t| {
-                t.live && Some(t.id) != visible && !self.shown_elsewhere.contains(&t.id) && !fronts.contains(&t.id)
+                t.live
+                    && Some(t.id) != visible
+                    && !self.shown_elsewhere.contains(&t.id)
+                    && !fronts.contains(&t.id)
+                    && !sleepers.contains(&t.id)
             })
             .collect();
         live.sort_by_key(|t| (t.last_used_ms(), t.id));
 
-        let mut sleepers = Vec::new();
         let mut remaining = live.len();
         for t in live {
             if t.audible || t.page.editing || self.stays_awake(t) {
@@ -1041,8 +1095,54 @@ impl State {
                 tab.live = false;
             }
         }
+        if !sleepers.is_empty() {
+            self.limit_slept_ms = now;
+        }
         sleepers
     }
+
+    pub fn collect_over_limit(&mut self, used_mb: u32, now: u64) -> Vec<Id> {
+        let limit = self.policy.memory_limit_mb;
+        if limit == 0 || used_mb <= limit || now.saturating_sub(self.limit_slept_ms) < LIMIT_SETTLE_MS {
+            return Vec::new();
+        }
+        let count = ((used_mb - limit * 9 / 10) / 150).clamp(1, 6) as usize;
+        let visible = self.visible_tab();
+        let fronts: HashSet<Id> = self.spaces.iter().filter_map(|s| s.active_tab).collect();
+        let mut live: Vec<&Tab> = self
+            .tabs
+            .values()
+            .filter(|t| {
+                t.live
+                    && Some(t.id) != visible
+                    && !self.shown_elsewhere.contains(&t.id)
+                    && !t.audible
+                    && !t.page.editing
+                    && !self.stays_awake(t)
+            })
+            .collect();
+        live.sort_by_key(|t| (fronts.contains(&t.id), t.last_used_ms(), t.id));
+        let sleepers: Vec<Id> = live.into_iter().take(count).map(|t| t.id).collect();
+        for id in &sleepers {
+            if let Some(tab) = self.tabs.get_mut(id) {
+                tab.live = false;
+            }
+        }
+        if !sleepers.is_empty() {
+            self.limit_slept_ms = now;
+        }
+        sleepers
+    }
+}
+
+fn pinned_ids(nodes: &[Node]) -> Vec<Id> {
+    nodes
+        .iter()
+        .flat_map(|n| match n {
+            Node::Tab { id } => vec![*id],
+            Node::Folder { children, .. } => pinned_ids(children),
+        })
+        .collect()
 }
 
 #[expect(clippy::option_option, reason = "None: not in the tree; Some(None): at the top level")]

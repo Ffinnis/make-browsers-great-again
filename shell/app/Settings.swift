@@ -1,29 +1,5 @@
 import AppKit
 
-enum SettingsPane: Int, CaseIterable {
-    case general, privacy, passwords, developer, agents
-
-    var title: String {
-        switch self {
-        case .general: "General"
-        case .privacy: "Privacy"
-        case .passwords: "Passwords"
-        case .developer: "Developer"
-        case .agents: "Agents"
-        }
-    }
-
-    var symbol: String {
-        switch self {
-        case .general: "gearshape"
-        case .privacy: "hand.raised"
-        case .passwords: "key"
-        case .developer: "hammer"
-        case .agents: "sparkles"
-        }
-    }
-}
-
 @MainActor
 final class SettingsWindowController: NSWindowController {
     private let tabs = SettingsTabsController()
@@ -219,7 +195,7 @@ private final class SettingsPaneController: NSViewController {
             [NSGridCell.emptyContentView, caption("Beyond this many, the tabs you used longest ago go to sleep first. When your Mac runs low on memory, tabs go to sleep sooner whatever you choose.")],
             [label("Keep awake:"), awake],
             [NSGridCell.emptyContentView, caption("Tabs of these sites, with their subdomains, are never put to sleep, frozen or archived, so mail and chat keep notifying you. Separate them with commas.")],
-        ] + videoRows() + updateRows()
+        ] + memoryRows() + videoRows() + updateRows()
     }
 
     private func videoRows() -> [[NSView]] {
@@ -688,5 +664,22 @@ private final class SettingsPaneController: NSViewController {
         button.addItems(withTitles: titles)
         button.onAction { [weak button] in action(button?.indexOfSelectedItem ?? 0) }
         return button
+    }
+}
+
+private extension SettingsPaneController {
+    func memoryRows() -> [[NSView]] {
+        let limits: [(String, UInt32)] = [
+            ("1.5 GB", 1500), ("2 GB", 2000), ("2.5 GB", 2500), ("3 GB", 3000), ("4 GB", 4000), ("6 GB", 6000), ("No Limit", 0),
+        ]
+        let limit = popUp(limits.map(\.0)) { [store] i in
+            if i < limits.count { store.setMemoryLimit(limits[i].1) }
+        }
+        refreshers.append { [store] in
+            Self.select(limit, store.memoryLimitMB, in: limits) { String(format: "%.1f GB", Double($0) / 1000) }
+        }
+        let about = "When MBGA uses more memory than this, the tabs you used longest ago go to sleep until it's back under. "
+            + "The tab you're on, tabs playing sound, tabs with unsent form input and tabs kept awake stay loaded."
+        return [[label("Memory limit:"), limit], [NSGridCell.emptyContentView, caption(about)]]
     }
 }

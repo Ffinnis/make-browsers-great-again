@@ -83,12 +83,15 @@ How MBGA gets there, roughly in order of impact:
   strongest protection against Spectre-class attacks, at about 30% more
   memory.
 - **Tabs sleep.** A background tab idle for 2 hours, or beyond 24 loaded
-  tabs, is unloaded and reloads when selected. Tabs playing audio or using the
-  camera, microphone or screen stay awake, and you can keep any tab or site
-  awake from its menu. Settings ▸ General changes the limits.
-- **Today tabs freeze.** A Today tab hidden for a minute keeps its state but
-  runs no JavaScript until shown again. Pinned tabs and favorites keep
-  running so their notifications work.
+  tabs, is unloaded and reloads when selected. When MBGA as a whole uses more
+  than 2.5 GB, the tabs used longest ago sleep until it's back under. Tabs in
+  the Agents space sleep 5 minutes after an agent last used them. Tabs
+  playing audio or using the camera, microphone or screen stay awake, and you
+  can keep any tab or site awake from its menu. Settings ▸ General changes the
+  limits.
+- **Hidden tabs freeze.** A tab hidden for 5 minutes keeps its state but runs
+  no JavaScript until shown again. Sites allowed to show notifications or use
+  the camera or microphone keep running, so mail, chat and calls keep working.
 - **Hidden renderers purge** their caches and return free memory.
 - **A leaner engine.** The network service runs in the browser process,
   HTTP/3 is off, Blink and V8 run in low-memory mode, and there is no spare

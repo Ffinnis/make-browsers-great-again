@@ -218,7 +218,7 @@ final class BrowserStore: NSObject {
     private var lastVisibleTab: UInt64?
     private var shownSpace: UInt64?
 
-    private static let open = NSHashTable<BrowserStore>.weakObjects()
+    static let open = NSHashTable<BrowserStore>.weakObjects()
     private(set) weak static var front: BrowserStore?
     var isFront: Bool { Self.front === self }
     private var ownSpace: UInt64
@@ -371,7 +371,7 @@ final class BrowserStore: NSObject {
         setNeedsRefresh()
     }
 
-    private func destroyView(_ id: UInt64) {
+    func destroyView(_ id: UInt64) {
         for store in Self.open.allObjects { store.dropView(id) }
     }
 
@@ -1075,6 +1075,7 @@ final class BrowserStore: NSObject {
     }
 
     func sleepIdleTabs(pressure: MemoryPressure = .normal) {
+        prepareForSleep()
         let archived = core.archiveByPolicy()
         destroyViews(archived)
         let sleepers = core.collectSleepers(pressure: pressure)
@@ -1086,6 +1087,7 @@ final class BrowserStore: NSObject {
             for (id, view) in store.views where id != store.visibleTabID { view.probeMedia() }
         }
         updateCleanupOffer()
+        if pressure == .normal { enforceMemoryLimit() }
     }
 }
 
@@ -1483,6 +1485,7 @@ extension BrowserStore {
     }
 
     func agentActed(on id: UInt64) {
+        core.noteAgentUse(id: id)
         let wasActive = agentActiveTabs.contains(id)
         agentActiveTabs.insert(id)
         agentTimers[id]?.invalidate()
